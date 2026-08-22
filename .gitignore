@@ -1,0 +1,11 @@
+/build*/
+/cmake-build*/
+.cache/
+compile_commands.json
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.exe

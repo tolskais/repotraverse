@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(repotraverse VERSION 0.1.0 LANGUAGES C CXX)
+project(repotraverse VERSION 1.0.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -50,25 +50,64 @@ add_library(nlohmann_json::nlohmann_json ALIAS repotraverse-json)
 target_include_directories(repotraverse-json SYSTEM INTERFACE
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nlohmann_json/include")
 
+# Pinned offline dependencies. SQLite is the disposable local materialized
+# index; xxHash supplies schema-fixed XXH3-128 identifiers.
+find_package(Threads REQUIRED)
+
+add_library(repotraverse-xxhash STATIC third_party/xxhash/xxhash.c)
+target_include_directories(repotraverse-xxhash SYSTEM PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/xxhash")
+set_target_properties(repotraverse-xxhash PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+add_library(repotraverse-sqlite STATIC third_party/sqlite/sqlite3.c)
+target_include_directories(repotraverse-sqlite SYSTEM PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/sqlite")
+target_compile_definitions(repotraverse-sqlite PRIVATE
+    SQLITE_DQS=0
+    SQLITE_DEFAULT_MEMSTATUS=0
+    SQLITE_OMIT_DEPRECATED
+    SQLITE_THREADSAFE=1)
+if(NOT WIN32)
+    target_link_libraries(repotraverse-sqlite PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+endif()
+
 configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/build_info.hpp.in"
     "${CMAKE_CURRENT_BINARY_DIR}/generated/history/build_info.hpp"
     @ONLY)
 
 add_library(history-core
+    src/build_import.cpp
+    src/catalog.cpp
+    src/config.cpp
+    src/experiment.cpp
+    src/file_history.cpp
+    src/git_coordination.cpp
+    src/history_plan.cpp
+    src/http.cpp
     src/ir.cpp
     src/lineage.cpp
+    src/process.cpp
     src/query.cpp)
+target_sources(history-core PRIVATE src/worker.cpp src/telemetry.cpp src/stability.cpp)
 target_include_directories(history-core PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
     "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_link_libraries(history-core
     PUBLIC nlohmann_json::nlohmann_json
+    PRIVATE repotraverse-sqlite repotraverse-xxhash Threads::Threads
     PRIVATE repotraverse-build-options)
+if(WIN32)
+    target_link_libraries(history-core PRIVATE ws2_32 winhttp)
+endif()
 target_compile_features(history-core PUBLIC cxx_std_20)
 
 add_executable(repotraverse app/main.cpp)
 target_link_libraries(repotraverse PRIVATE history-core repotraverse-build-options)
+
+add_executable(repotraverse-compiler-probe probe/main.cpp)
+target_link_libraries(repotraverse-compiler-probe PRIVATE
+    history-core repotraverse-build-options)
 
 if(REPOTRAVERSE_CLANG_PROVIDER STREQUAL "package")
     if(REPOTRAVERSE_LLVM_ROOT)
@@ -127,18 +166,88 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+    find_package(Git REQUIRED)
     add_executable(history-core-tests tests/core_tests.cpp)
     target_link_libraries(history-core-tests PRIVATE
         history-core repotraverse-build-options)
     target_compile_definitions(history-core-tests PRIVATE
         TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
     add_test(NAME history-core-tests COMMAND history-core-tests)
+    add_executable(git-coordination-tests tests/git_coordination_tests.cpp)
+    target_link_libraries(git-coordination-tests PRIVATE
+        history-core repotraverse-build-options)
+    add_test(NAME git-coordination-tests COMMAND git-coordination-tests)
+    add_executable(file-history-tests tests/file_history_tests.cpp)
+    target_link_libraries(file-history-tests PRIVATE history-core repotraverse-build-options)
+    add_test(NAME file-history-tests COMMAND file-history-tests)
+    add_executable(build-import-tests tests/build_import_tests.cpp)
+    target_link_libraries(build-import-tests PRIVATE
+        history-core repotraverse-build-options)
+    target_compile_definitions(build-import-tests PRIVATE
+        TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
+    add_test(NAME build-import-tests COMMAND build-import-tests)
+    add_executable(http-roundtrip-tests tests/http_roundtrip_tests.cpp)
+    target_link_libraries(http-roundtrip-tests PRIVATE
+        history-core repotraverse-build-options)
+    add_test(NAME http-roundtrip-tests COMMAND http-roundtrip-tests)
+    add_executable(catalog-production-tests tests/catalog_production_tests.cpp)
+    target_link_libraries(catalog-production-tests PRIVATE
+        history-core repotraverse-build-options)
+    add_test(NAME catalog-production-tests COMMAND catalog-production-tests)
+    add_executable(process-tests tests/process_tests.cpp)
+    target_link_libraries(process-tests PRIVATE
+        history-core repotraverse-build-options)
+    add_test(NAME process-tests COMMAND process-tests)
+    add_executable(stability-tests tests/stability_tests.cpp)
+    target_link_libraries(stability-tests PRIVATE
+        history-core repotraverse-build-options)
+    add_test(NAME stability-tests COMMAND stability-tests)
+    add_test(NAME compiler-probe-version
+        COMMAND repotraverse-compiler-probe --version)
+    set_tests_properties(compiler-probe-version PROPERTIES
+        PASS_REGULAR_EXPRESSION
+            "repotraverse compiler-probe ${PROJECT_VERSION} artifact v1")
     add_test(NAME repotraverse-version COMMAND repotraverse --version)
     set_tests_properties(repotraverse-version PROPERTIES
         PASS_REGULAR_EXPRESSION
             "repotraverse ${PROJECT_VERSION}.*build mode: ${REPOTRAVERSE_BUILD_MODE}")
+    add_test(
+        NAME public-version-v1
+        COMMAND ${CMAKE_COMMAND}
+            -DREPOTRAVERSE=$<TARGET_FILE:repotraverse>
+            -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/version_consistency.cmake)
+    add_test(
+        NAME history-plan-integration
+        COMMAND ${CMAKE_COMMAND}
+            -DREPOTRAVERSE=$<TARGET_FILE:repotraverse>
+            -DGIT_EXECUTABLE=${GIT_EXECUTABLE}
+            -DBINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/history_plan_integration.cmake)
 
     if(TARGET clang-extractor)
+        add_executable(fake-make tests/fake_make.cpp)
+        target_link_libraries(fake-make PRIVATE history-core repotraverse-build-options)
+        add_executable(fake-arm-compiler tests/fake_arm_compiler.cpp)
+        add_executable(experiment-tests tests/experiment_tests.cpp)
+        target_link_libraries(experiment-tests PRIVATE
+            history-core repotraverse-build-options)
+        target_compile_definitions(experiment-tests PRIVATE
+            EXTRACTOR_PATH="$<TARGET_FILE:clang-extractor>"
+            PROBE_PATH="$<TARGET_FILE:repotraverse-compiler-probe>"
+            FAKE_MAKE_PATH="$<TARGET_FILE:fake-make>"
+            FAKE_ARM_COMPILER_PATH="$<TARGET_FILE:fake-arm-compiler>"
+            GIT_PATH="${GIT_EXECUTABLE}")
+        add_dependencies(experiment-tests clang-extractor
+            repotraverse-compiler-probe fake-make fake-arm-compiler)
+        add_test(NAME experiment-tests COMMAND experiment-tests)
+        add_executable(worker-integration-tests tests/worker_integration.cpp)
+        target_link_libraries(worker-integration-tests PRIVATE
+            history-core repotraverse-build-options)
+        target_compile_definitions(worker-integration-tests PRIVATE
+            EXTRACTOR_PATH="$<TARGET_FILE:clang-extractor>")
+        add_dependencies(worker-integration-tests clang-extractor)
+        add_test(NAME worker-integration-tests COMMAND worker-integration-tests)
         add_test(NAME clang-extractor-version COMMAND clang-extractor --version)
         set_tests_properties(clang-extractor-version PROPERTIES
             PASS_REGULAR_EXPRESSION
@@ -158,10 +267,19 @@ if(BUILD_TESTING)
                 -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
                 -DBINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/extractor_integration.cmake)
+        add_executable(extractor-entities-tests tests/extractor_entities_tests.cpp)
+        target_link_libraries(extractor-entities-tests PRIVATE
+            history-core repotraverse-build-options)
+        target_compile_definitions(extractor-entities-tests PRIVATE
+            EXTRACTOR_PATH="$<TARGET_FILE:clang-extractor>"
+            TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
+        add_dependencies(extractor-entities-tests clang-extractor)
+        add_test(NAME extractor-entities-tests COMMAND extractor-entities-tests)
     endif()
 endif()
 
-install(TARGETS history-core repotraverse
+install(TARGETS history-core repotraverse repotraverse-compiler-probe
+    repotraverse-sqlite repotraverse-xxhash
     RUNTIME DESTINATION bin
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib)
@@ -170,3 +288,18 @@ if(TARGET clang-extractor)
 endif()
 install(FILES third_party/nlohmann_json/LICENSE.MIT
     DESTINATION licenses/nlohmann_json)
+install(FILES third_party/xxhash/LICENSE
+    DESTINATION licenses/xxhash)
+install(FILES third_party/sqlite/README.md
+    DESTINATION licenses/sqlite)
+install(FILES README.md THIRD_PARTY.md docs/lineage-architecture.md
+    docs/operations.md docs/v1-experiment.md
+    DESTINATION docs)
+install(FILES INTERNAL_USE_ONLY.txt DESTINATION .)
+install(FILES config/service.example.json config/experiment.example.json
+    DESTINATION config)
+if(WIN32)
+    install(FILES tools/install-service.ps1 tools/uninstall-service.ps1
+        tools/package-windows.ps1
+        DESTINATION tools)
+endif()

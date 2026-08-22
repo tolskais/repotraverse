@@ -73,7 +73,9 @@ void to_json(nlohmann::json& value, const TransitionFact& item) {
     value = {{"historical_element_id", item.historical_element_id}, {"before_element", item.before_element},
              {"after_element", item.after_element}, {"before_revision", item.before_revision},
              {"after_revision", item.after_revision}, {"continuity", item.continuity},
-             {"content_change", item.content_change}, {"resolution", item.resolution},
+             {"content_change", item.content_change},
+             {"dependencies_changed", item.dependencies_changed},
+             {"resolution", item.resolution},
              {"confidence", item.confidence}};
     if (item.before_location) value["before_location"] = *item.before_location;
     if (item.after_location) value["after_location"] = *item.after_location;
@@ -81,7 +83,10 @@ void to_json(nlohmann::json& value, const TransitionFact& item) {
 void to_json(nlohmann::json& value, const TransitionResult& item) {
     value = {{"before_revision", item.before_revision}, {"after_revision", item.after_revision},
              {"configuration", item.configuration}, {"coverage", item.coverage},
-             {"candidates", item.candidates}, {"facts", item.facts}};
+             {"candidates", item.candidates},
+             {"relation_candidates", item.relation_candidates},
+             {"reviewed_relations", item.reviewed_relations},
+             {"facts", item.facts}};
 }
 
 TransitionResult trace_transition(const EvidenceBundle& before, const EvidenceBundle& after,
@@ -156,6 +161,8 @@ TransitionResult trace_transition(const EvidenceBundle& before, const EvidenceBu
             fact.after_element = next.compiler_id; fact.after_location = next.location;
             fact.historical_element_id = "history-" + stable_hash(old_element.compiler_id);
             fact.continuity = continuity(old_element, next); fact.content_change = content_change(old_element, next);
+            fact.dependencies_changed = old_element.dependency_fingerprint !=
+                                        next.dependency_fingerprint;
             fact.resolution = resolution; fact.confidence = confidence;
         } else {
             fact.historical_element_id = "history-" + stable_hash(old_element.compiler_id);
@@ -174,6 +181,72 @@ TransitionResult trace_transition(const EvidenceBundle& before, const EvidenceBu
         fact.continuity = "added_or_unresolved"; fact.content_change = "unverified";
         fact.confidence = "ambiguous"; result.facts.push_back(std::move(fact));
     }
+    const auto references = [](const ElementSnapshot& element,
+                               const ElementSnapshot& target) {
+        return std::find(element.referenced_compiler_ids.begin(),
+                         element.referenced_compiler_ids.end(),
+                         target.compiler_id) !=
+               element.referenced_compiler_ids.end();
+    };
+    for (const auto& fact : result.facts) {
+        if (fact.before_element.empty() || fact.after_element.empty()) continue;
+        const auto old_it = std::find_if(before.elements.begin(), before.elements.end(),
+            [&](const auto& item) { return item.compiler_id == fact.before_element; });
+        const auto new_it = std::find_if(after.elements.begin(), after.elements.end(),
+            [&](const auto& item) { return item.compiler_id == fact.after_element; });
+        if (old_it == before.elements.end() || new_it == after.elements.end()) continue;
+        for (std::size_t i = 0; i < after.elements.size(); ++i) {
+            if (used[i]) continue;
+            if (references(*new_it, after.elements[i]) &&
+                !references(*old_it, after.elements[i])) {
+                LineageRelation relation;
+                relation.kind = "extract";
+                relation.source_element_ids = {old_it->compiler_id};
+                relation.target_element_ids = {new_it->compiler_id,
+                                               after.elements[i].compiler_id};
+                relation.evidence = {"new_dependency_from_surviving_element",
+                                     "new_target_added_in_transition"};
+                relation.confidence = 0.8;
+                relation.relation_id = stable_hash(
+                    relation.kind + "\n" + nlohmann::json(relation.source_element_ids).dump() +
+                    "\n" + nlohmann::json(relation.target_element_ids).dump());
+                result.relation_candidates.push_back(std::move(relation));
+            }
+        }
+        for (const auto& old_target : before.elements) {
+            const auto removed = std::none_of(result.facts.begin(), result.facts.end(),
+                [&](const auto& candidate) {
+                    return candidate.before_element == old_target.compiler_id &&
+                           !candidate.after_element.empty();
+                });
+            if (removed && references(*old_it, old_target) &&
+                !references(*new_it, old_target)) {
+                LineageRelation relation;
+                relation.kind = "inline";
+                relation.source_element_ids = {old_it->compiler_id,
+                                               old_target.compiler_id};
+                relation.target_element_ids = {new_it->compiler_id};
+                relation.evidence = {"removed_dependency_from_surviving_element",
+                                     "dependency_target_removed_in_transition"};
+                relation.confidence = 0.8;
+                relation.relation_id = stable_hash(
+                    relation.kind + "\n" + nlohmann::json(relation.source_element_ids).dump() +
+                    "\n" + nlohmann::json(relation.target_element_ids).dump());
+                result.relation_candidates.push_back(std::move(relation));
+            }
+        }
+    }
+    std::sort(result.relation_candidates.begin(), result.relation_candidates.end(),
+              [](const auto& left, const auto& right) {
+                  return left.relation_id < right.relation_id;
+              });
+    result.relation_candidates.erase(
+        std::unique(result.relation_candidates.begin(),
+                    result.relation_candidates.end(),
+                    [](const auto& left, const auto& right) {
+                        return left.relation_id == right.relation_id;
+                    }),
+        result.relation_candidates.end());
     std::sort(result.facts.begin(), result.facts.end(), [](const auto& a, const auto& b) {
         return std::tie(a.historical_element_id, a.continuity) < std::tie(b.historical_element_id, b.continuity);
     });

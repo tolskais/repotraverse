@@ -34,6 +34,7 @@ struct TransitionFact {
     std::string after_revision;
     std::string continuity;
     std::string content_change;
+    bool dependencies_changed{};
     std::optional<SourceAnchor> before_location;
     std::optional<SourceAnchor> after_location;
     std::string resolution{"automatic"};
@@ -46,6 +47,8 @@ struct TransitionResult {
     std::string configuration;
     Coverage coverage;
     std::vector<LineageCandidate> candidates;
+    std::vector<LineageRelation> relation_candidates;
+    std::vector<LineageRelation> reviewed_relations;
     std::vector<TransitionFact> facts;
 };
 

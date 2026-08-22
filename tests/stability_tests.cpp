@@ -1,0 +1,83 @@
+#include "history/ir.hpp"
+#include "history/stability.hpp"
+
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <stdexcept>
+
+namespace {
+void require(bool condition, const char *message) {
+  if (!condition)
+    throw std::runtime_error(message);
+}
+
+history::EvidenceBundle bundle(std::string revision, int index) {
+  history::EvidenceBundle result;
+  result.source_revision = std::move(revision);
+  result.configuration = "debug";
+  history::ElementSnapshot stable;
+  stable.compiler_id = "stable";
+  stable.kind = "function";
+  stable.qualified_name = "stable";
+  stable.interface_fingerprint = "interface";
+  stable.implementation_fingerprint = "implementation";
+  stable.dependency_fingerprint = "dependency";
+  stable.location.path = "stable/file.cpp";
+  auto variable = stable;
+  variable.compiler_id = "variable";
+  variable.qualified_name = "variable";
+  variable.location.path = "variable/file.cpp";
+  variable.implementation_fingerprint = std::to_string(index);
+  result.elements = {stable, variable};
+  return result;
+}
+} // namespace
+
+int main() {
+  try {
+    const auto root = std::filesystem::temp_directory_path() /
+                      ("repotraverse-stability-" +
+                       std::to_string(std::chrono::steady_clock::now()
+                                          .time_since_epoch()
+                                          .count()));
+    struct Cleanup {
+      std::filesystem::path path;
+      ~Cleanup() {
+        std::error_code ignored;
+        std::filesystem::remove_all(path, ignored);
+      }
+    } cleanup{root};
+    std::filesystem::create_directories(root);
+    nlohmann::json paths = nlohmann::json::array();
+    for (int index = 0; index < 4; ++index) {
+      const auto path = root / (std::to_string(index) + ".json");
+      std::ofstream(path) << nlohmann::json(bundle("r" + std::to_string(index),
+                                                   index))
+                                  .dump();
+      paths.push_back(path.string());
+    }
+    const auto manifest_path = root / "manifest.json";
+    std::ofstream(manifest_path)
+        << nlohmann::json(
+               {{"schema_version", history::kSchemaVersion},
+                {"series", {{{"configuration", "debug"}, {"bundles", paths}}}},
+                {"partition",
+                 {{"stable", {"stable/*"}}, {"variable", {"variable/*"}}}},
+                {"report", (root / "report.v1.json").string()}})
+               .dump();
+    const auto result = history::run_stability_experiment(manifest_path);
+    require(result.at("classifications").value("stable", 0U) == 1,
+            "stable element classification failed");
+    require(result.at("classifications").value("variable", 0U) == 1,
+            "variable element classification failed");
+    require(std::filesystem::exists(root / "report.v1.csv"),
+            "stability CSV was not written");
+    std::cout << "stability tests passed\n";
+    return 0;
+  } catch (const std::exception &error) {
+    std::cerr << error.what() << '\n';
+    return 1;
+  }
+}

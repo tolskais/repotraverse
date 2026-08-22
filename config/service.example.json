@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "repository_id": "product-main",
+  "catalog": "C:/repotraverse/catalog",
+  "artifact_repository": "C:/repotraverse/artifacts",
+  "source_repository": "C:/source/product",
+  "extractor": "C:/repotraverse/bin/clang-extractor.exe",
+  "scratch_root": "C:/repotraverse/worktrees",
+  "remote": "origin",
+  "listen_address": "127.0.0.1",
+  "port": 7341,
+  "sync_seconds": 30,
+  "lease_seconds": 900,
+  "grace_seconds": 120,
+  "worker_concurrency": 2,
+  "max_task_attempts": 10,
+  "git_timeout_seconds": 300,
+  "extractor_timeout_seconds": 1800,
+  "max_manifest_bytes": 268435456,
+  "trusted_producers": [],
+  "otlp_endpoint": "https://otel-collector.example.internal:4318",
+  "otel_service_name": "repotraverse"
+}

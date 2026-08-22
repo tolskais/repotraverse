@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "repository": "C:/source/product",
+  "repository_id": "product-main",
+  "revision": "main",
+  "output": "C:/repotraverse/experiments/head-main",
+  "artifact_cache": "C:/repotraverse/experiments/artifact-cache-v1",
+  "extractor": "C:/repotraverse/bin/clang-extractor.exe",
+  "extractor_timeout_seconds": 1800,
+  "extractor_concurrency": 8,
+  "max_manifest_bytes": 268435456,
+  "configurations": [
+    {
+      "name": "product-a-debug",
+      "toolchain": "armcc5",
+      "working_directory": ".",
+      "command": ["make.exe", "-j8", "objects"],
+      "prepare_command": ["make.exe", "-j8", "generated-headers"],
+      "compiler_variables": ["CC", "CXX", "ARMCC"],
+      "timeout_seconds": 3600,
+      "environment": {
+        "PRODUCT": "A",
+        "CONFIGURATION": "debug"
+      }
+    }
+  ],
+  "pilot": {
+    "ref": "main",
+    "max_revisions": 20
+  },
+  "partition": {
+    "stable": ["platform/stable/*", "common/*"],
+    "variable": ["products/*", "features/*"],
+    "exclude": ["third_party/*", "generated/*"]
+  },
+  "policy": {
+    "minimum_observable_transitions": 3,
+    "half_life_transitions": 8.0,
+    "half_life_days": 90.0,
+    "stable_threshold": 0.15,
+    "variable_threshold": 0.75,
+    "implementation_weight": 1.0,
+    "interface_weight": 4.0,
+    "dependency_weight": 2.0,
+    "move_weight": 0.2,
+    "rename_weight": 0.2
+  }
+}

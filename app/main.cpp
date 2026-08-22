@@ -4,6 +4,7 @@
 #include <memory>
 #include <string>
 
+#include "history/build_info.hpp"
 #include "history/query.hpp"
 
 namespace {
@@ -16,10 +17,11 @@ nlohmann::json read_json(std::istream& input) {
 
 void usage() {
     std::cerr << "usage:\n"
-              << "  analysis-tool query [--request FILE]\n"
-              << "  analysis-tool status\n"
-              << "  analysis-tool benchmark [--elements N]\n"
-              << "  analysis-tool facts canonicalize [FILE]\n";
+              << "  repotraverse --version\n"
+              << "  repotraverse query [--request FILE]\n"
+              << "  repotraverse status\n"
+              << "  repotraverse benchmark [--elements N]\n"
+              << "  repotraverse facts canonicalize [FILE]\n";
 }
 
 history::EvidenceBundle synthetic_bundle(std::size_t count, bool changed) {
@@ -56,9 +58,18 @@ int main(int argc, char** argv) {
     }
     const std::string command = argv[1];
     try {
+        if (command == "--version") {
+            std::cout << "repotraverse " << history::build::kToolVersion
+                      << " (build mode: " << history::build::kBuildMode
+                      << "; host: " << history::build::kHostArchitecture << ")\n";
+            return 0;
+        }
         if (command == "status") {
             std::cout << history::canonical_json({
                 {"schema_version", history::kSchemaVersion},
+                {"tool_version", history::build::kToolVersion},
+                {"build_mode", history::build::kBuildMode},
+                {"host_architecture", history::build::kHostArchitecture},
                 {"core", "available"},
                 {"query_transport", "one_shot_json"},
                 {"fact_store", "memory"},

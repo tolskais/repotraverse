@@ -18,7 +18,9 @@
 #include "clang/Tooling/Tooling.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Config/llvm-config.h"
 
+#include "history/build_info.hpp"
 #include "history/ir.hpp"
 
 namespace {
@@ -146,7 +148,16 @@ public:
         history::EvidenceBundle bundle;
         bundle.source_revision = revision; bundle.configuration = configuration;
         bundle.context_fingerprint = context_fingerprint;
-        bundle.extractor_fingerprint = "clang-" + clang::getClangFullVersion();
+        const auto clang_version = clang::getClangFullVersion();
+        bundle.extractor_fingerprint =
+            "repotraverse-" + std::string(history::build::kToolVersion) +
+            ";llvm-" LLVM_VERSION_STRING + ";clang-" + clang_version +
+            ";build-" + std::string(history::build::kBuildMode);
+        bundle.producer.tool_version = std::string(history::build::kToolVersion);
+        bundle.producer.llvm_version = LLVM_VERSION_STRING;
+        bundle.producer.clang_version = clang_version;
+        bundle.producer.build_mode = std::string(history::build::kBuildMode);
+        bundle.producer.host_architecture = std::string(history::build::kHostArchitecture);
         bundle.coverage.capabilities = {"function_snapshots", "binding_normalized_bodies", "resolved_dependencies"};
         if (getCompilerInstance().getDiagnostics().hasErrorOccurred()) {
             bundle.coverage.status = "partial"; bundle.coverage.gaps.push_back("compiler diagnostics contain errors");
@@ -165,6 +176,14 @@ public: std::unique_ptr<clang::FrontendAction> create() override { return std::m
 }  // namespace
 
 int main(int argc, const char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--version") {
+        llvm::outs() << "repotraverse clang-extractor "
+                     << history::build::kToolVersion << " (LLVM/Clang "
+                     << LLVM_VERSION_STRING << "/" << clang::getClangFullVersion()
+                     << "; build mode: "
+                     << history::build::kBuildMode << ")\n";
+        return 0;
+    }
     auto parser = clang::tooling::CommonOptionsParser::create(argc, argv, category);
     if (!parser) { llvm::errs() << llvm::toString(parser.takeError()) << '\n'; return 2; }
     clang::tooling::ClangTool tool(parser->getCompilations(), parser->getSourcePathList());

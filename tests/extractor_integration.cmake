@@ -14,7 +14,7 @@ if(NOT result EQUAL 0)
     message(FATAL_ERROR "after extraction failed")
 endif()
 file(WRITE "${request}" "{\"schema_version\":1,\"query\":\"lineage.transition\",\"params\":{\"before\":\"${before}\",\"after\":\"${after}\"}}")
-execute_process(COMMAND "${ANALYSIS_TOOL}" query --request "${request}"
+execute_process(COMMAND "${REPOTRAVERSE}" query --request "${request}"
     OUTPUT_VARIABLE response RESULT_VARIABLE result)
 if(NOT result EQUAL 0)
     message(FATAL_ERROR "lineage query failed: ${response}")
@@ -26,7 +26,7 @@ foreach(expected "moved_and_renamed" "\"content_change\":\"none\"" "\"automatica
     endif()
 endforeach()
 file(WRITE "${request}" "{\"schema_version\":1,\"query\":\"element.history_stats\",\"params\":{\"bundles\":[\"${before}\",\"${after}\"]}}")
-execute_process(COMMAND "${ANALYSIS_TOOL}" query --request "${request}"
+execute_process(COMMAND "${REPOTRAVERSE}" query --request "${request}"
     OUTPUT_VARIABLE response RESULT_VARIABLE result)
 if(NOT result EQUAL 0)
     message(FATAL_ERROR "history statistics query failed: ${response}")

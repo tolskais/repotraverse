@@ -1,0 +1,11 @@
+#pragma once
+
+#include <string_view>
+
+namespace history::build {
+
+inline constexpr std::string_view kToolVersion = "@PROJECT_VERSION@";
+inline constexpr std::string_view kBuildMode = "@REPOTRAVERSE_BUILD_MODE@";
+inline constexpr std::string_view kHostArchitecture = "@CMAKE_SYSTEM_PROCESSOR@";
+
+}  // namespace history::build

@@ -71,11 +71,28 @@ void test_ambiguity_and_assertion() {
                 reviewed->resolution == "reviewed_assertion",
             "accepted assertion did not resolve lineage");
 }
+
+void test_producer_identity_round_trip() {
+    auto original = bundle("a", {element("id", "f", "f.cpp")});
+    original.producer.tool_version = "0.1.0";
+    original.producer.llvm_version = "llvm-test";
+    original.producer.clang_version = "clang-test";
+    original.producer.build_mode = "native";
+    original.producer.host_architecture = "x86_64";
+
+    const auto restored = nlohmann::json(original).get<history::EvidenceBundle>();
+    require(restored.producer.tool_version == "0.1.0", "tool version was lost");
+    require(restored.producer.llvm_version == "llvm-test", "LLVM version was lost");
+    require(restored.producer.clang_version == "clang-test", "Clang version was lost");
+    require(restored.producer.build_mode == "native", "build mode was lost");
+    require(restored.producer.host_architecture == "x86_64", "host architecture was lost");
+}
 }  // namespace
 
 int main() {
     try {
         test_move_and_rename(); test_content_and_local_rename(); test_ambiguity_and_assertion();
+        test_producer_identity_round_trip();
         std::cout << "all tests passed\n"; return 0;
     } catch (const std::exception& error) {
         std::cerr << "test failure: " << error.what() << '\n'; return 1;

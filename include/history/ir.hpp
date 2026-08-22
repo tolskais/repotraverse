@@ -37,12 +37,21 @@ struct ElementSnapshot {
     std::vector<std::string> referenced_compiler_ids;
 };
 
+struct ProducerIdentity {
+    std::string tool_version;
+    std::string llvm_version;
+    std::string clang_version;
+    std::string build_mode;
+    std::string host_architecture;
+};
+
 struct EvidenceBundle {
     std::uint32_t schema_version{kSchemaVersion};
     std::string source_revision;
     std::string configuration;
     std::string context_fingerprint;
     std::string extractor_fingerprint;
+    ProducerIdentity producer;
     Coverage coverage;
     std::vector<ElementSnapshot> elements;
 };
@@ -53,6 +62,8 @@ void to_json(nlohmann::json&, const Coverage&);
 void from_json(const nlohmann::json&, Coverage&);
 void to_json(nlohmann::json&, const ElementSnapshot&);
 void from_json(const nlohmann::json&, ElementSnapshot&);
+void to_json(nlohmann::json&, const ProducerIdentity&);
+void from_json(const nlohmann::json&, ProducerIdentity&);
 void to_json(nlohmann::json&, const EvidenceBundle&);
 void from_json(const nlohmann::json&, EvidenceBundle&);
 

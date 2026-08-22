@@ -1,0 +1,90 @@
+{
+  "version": 5,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "windows-x64-base",
+      "hidden": true,
+      "generator": "Ninja",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_C_COMPILER": "$env{REPOTRAVERSE_LLVM_ROOT}/bin/clang-cl.exe",
+        "CMAKE_CXX_COMPILER": "$env{REPOTRAVERSE_LLVM_ROOT}/bin/clang-cl.exe",
+        "REPOTRAVERSE_CLANG_PROVIDER": "package",
+        "REPOTRAVERSE_LLVM_ROOT": "$env{REPOTRAVERSE_LLVM_ROOT}",
+        "BUILD_TESTING": true
+      }
+    },
+    {
+      "name": "windows-x64-generic",
+      "displayName": "Windows x64 offline generic build",
+      "inherits": "windows-x64-base",
+      "binaryDir": "${sourceDir}/out/build/windows-x64-generic",
+      "cacheVariables": {
+        "REPOTRAVERSE_NATIVE_OPTIMIZATION": false
+      }
+    },
+    {
+      "name": "windows-x64-native",
+      "displayName": "Windows x64 offline native build",
+      "inherits": "windows-x64-base",
+      "binaryDir": "${sourceDir}/out/build/windows-x64-native",
+      "cacheVariables": {
+        "REPOTRAVERSE_NATIVE_OPTIMIZATION": true
+      }
+    },
+    {
+      "name": "windows-x64-core-only",
+      "displayName": "Windows x64 core-only build",
+      "inherits": "windows-x64-base",
+      "binaryDir": "${sourceDir}/out/build/windows-x64-core-only",
+      "cacheVariables": {
+        "REPOTRAVERSE_CLANG_PROVIDER": "disabled",
+        "REPOTRAVERSE_NATIVE_OPTIMIZATION": false
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "windows-x64-generic-release",
+      "configurePreset": "windows-x64-generic",
+      "jobs": 2
+    },
+    {
+      "name": "windows-x64-native-release",
+      "configurePreset": "windows-x64-native",
+      "jobs": 2
+    },
+    {
+      "name": "windows-x64-core-only-release",
+      "configurePreset": "windows-x64-core-only",
+      "jobs": 2
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "windows-x64-generic",
+      "configurePreset": "windows-x64-generic",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "windows-x64-native",
+      "configurePreset": "windows-x64-native",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "windows-x64-core-only",
+      "configurePreset": "windows-x64-core-only",
+      "output": { "outputOnFailure": true }
+    }
+  ]
+}

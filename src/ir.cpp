@@ -46,10 +46,24 @@ void from_json(const nlohmann::json& value, ElementSnapshot& element) {
     optional(value, "dependency_fingerprint", element.dependency_fingerprint);
     optional(value, "location", element.location); optional(value, "referenced_compiler_ids", element.referenced_compiler_ids);
 }
+void to_json(nlohmann::json& value, const ProducerIdentity& producer) {
+    value = {{"tool_version", producer.tool_version}, {"llvm_version", producer.llvm_version},
+             {"clang_version", producer.clang_version},
+             {"build_mode", producer.build_mode},
+             {"host_architecture", producer.host_architecture}};
+}
+void from_json(const nlohmann::json& value, ProducerIdentity& producer) {
+    optional(value, "tool_version", producer.tool_version);
+    optional(value, "llvm_version", producer.llvm_version);
+    optional(value, "clang_version", producer.clang_version);
+    optional(value, "build_mode", producer.build_mode);
+    optional(value, "host_architecture", producer.host_architecture);
+}
 void to_json(nlohmann::json& value, const EvidenceBundle& bundle) {
     value = {{"schema_version", bundle.schema_version}, {"source_revision", bundle.source_revision},
              {"configuration", bundle.configuration}, {"context_fingerprint", bundle.context_fingerprint},
-             {"extractor_fingerprint", bundle.extractor_fingerprint}, {"coverage", bundle.coverage},
+             {"extractor_fingerprint", bundle.extractor_fingerprint}, {"producer", bundle.producer},
+             {"coverage", bundle.coverage},
              {"elements", bundle.elements}};
 }
 void from_json(const nlohmann::json& value, EvidenceBundle& bundle) {
@@ -58,6 +72,7 @@ void from_json(const nlohmann::json& value, EvidenceBundle& bundle) {
     optional(value, "source_revision", bundle.source_revision); optional(value, "configuration", bundle.configuration);
     optional(value, "context_fingerprint", bundle.context_fingerprint);
     optional(value, "extractor_fingerprint", bundle.extractor_fingerprint);
+    optional(value, "producer", bundle.producer);
     optional(value, "coverage", bundle.coverage); optional(value, "elements", bundle.elements);
 }
 std::string stable_hash(std::string_view input) {

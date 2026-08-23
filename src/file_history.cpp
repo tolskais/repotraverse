@@ -2,6 +2,7 @@
 #include "history/history_plan.hpp"
 #include "history/ir.hpp"
 #include "history/process.hpp"
+#include "history/revision_workspace.hpp"
 #include <algorithm>
 #include <chrono>
 #include <fstream>
@@ -442,30 +443,34 @@ nlohmann::json plan_file_history(Catalog &catalog,
       return;
     }
     if (options.scope == "semantic") {
-      const auto mapped = std::any_of(contexts.begin(), contexts.end(),
-                                      [](const CompileContext &context) {
-        return std::find(context.coverage.capabilities.begin(),
-                         context.coverage.capabilities.end(),
-                         "project_dependency_map") !=
-               context.coverage.capabilities.end();
-      });
+      const auto mapped = std::any_of(
+          contexts.begin(), contexts.end(), [](const CompileContext &context) {
+            return std::find(context.coverage.capabilities.begin(),
+                             context.coverage.capabilities.end(),
+                             "project_dependency_map") !=
+                   context.coverage.capabilities.end();
+          });
       semantic_map_missing = semantic_map_missing || !mapped;
     }
     std::map<std::string, std::pair<CompileContext, std::vector<std::string>>>
         groups;
     for (const auto &context : contexts) {
-      auto &group = groups[context.context_id];
+      auto &group =
+          groups[context.context_id + "\n" + context.build_variant.variant_id];
       group.first = context;
       group.second.push_back(context.configuration);
     }
-    for (const auto &[context_id, group] : groups) {
+    for (const auto &[group_id, group] : groups) {
+      (void)group_id;
       const auto &context = group.first;
+      const auto &context_id = context.context_id;
       nlohmann::json identity = {
           {"task_type", "tu.extract"},
           {"repository_id", options.repository_id},
           {"source_commit", revision},
           {"translation_unit", context.translation_unit},
           {"context_id", context_id},
+          {"build_variant", context.build_variant},
           {"extractor_identity", options.extractor_identity},
           {"extractor_schema", kSchemaVersion}};
       const auto id = stable_hash(identity.dump());
@@ -483,7 +488,19 @@ nlohmann::json plan_file_history(Catalog &catalog,
           {"requested_file", endpoint_path},
           {"context_id", context_id},
           {"configurations", group.second},
+          {"build_variant", context.build_variant},
           {"frontend_arguments", context.frontend_arguments},
+          {"materialization",
+           MaterializationManifest{
+               context.project_files,
+               std::find(context.coverage.capabilities.begin(),
+                         context.coverage.capabilities.end(),
+                         "project_dependency_map") !=
+                   context.coverage.capabilities.end(),
+               context.project_files.empty()
+                   ? std::vector<std::string>{"project dependency closure is "
+                                              "unavailable"}
+                   : std::vector<std::string>{}}},
           {"extractor_schema", kSchemaVersion}};
       if (catalog.fact_for_task(id))
         ++complete;
@@ -517,9 +534,10 @@ nlohmann::json plan_file_history(Catalog &catalog,
     current_revision.pop_back();
   schedule_endpoint(current_revision, options.path);
   if (options.scope == "semantic" && semantic_map_missing)
-    gaps.push_back({{"kind", "semantic_dependency_map_incomplete"},
-                    {"message",
-                     "one or more build contexts lack captured project dependencies"}});
+    gaps.push_back(
+        {{"kind", "semantic_dependency_map_incomplete"},
+         {"message",
+          "one or more build contexts lack captured project dependencies"}});
   const auto begin = std::min(options.offset, selected.size());
   const auto end =
       std::min(begin + std::clamp<std::size_t>(options.page_size, 1, 500),

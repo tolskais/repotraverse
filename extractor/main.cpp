@@ -1,10 +1,11 @@
 #include <algorithm>
 #include <filesystem>
-#include <map>
 #include <limits>
+#include <map>
 #include <memory>
 #include <set>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "clang/AST/ASTConsumer.h"
@@ -34,6 +35,8 @@ llvm::cl::opt<std::string> revision("source-revision",
                                     llvm::cl::cat(category));
 llvm::cl::opt<std::string> configuration("configuration",
                                          llvm::cl::init("default"),
+                                         llvm::cl::cat(category));
+llvm::cl::opt<std::string> build_variant("build-variant", llvm::cl::init("{}"),
                                          llvm::cl::cat(category));
 llvm::cl::opt<std::string> context_fingerprint("context-fingerprint",
                                                llvm::cl::init("unspecified"),
@@ -80,13 +83,14 @@ std::string logical_id(const clang::NamedDecl *declaration,
                                                                   : "external";
   const auto domain =
       linkage == std::string{"internal"} ? translation_unit : std::string{};
-  return history::stable_hash(repository_id.getValue() + "\n" + linkage +
-                              "\n" + domain + "\n" + compiler_id);
+  return history::stable_hash(repository_id.getValue() + "\n" + linkage + "\n" +
+                              domain + "\n" + compiler_id);
 }
 
 std::string type_reference(clang::QualType type,
                            const std::string &translation_unit) {
-  if (type.isNull()) return {};
+  if (type.isNull())
+    return {};
   if (const auto *typedef_type = type->getAs<clang::TypedefType>())
     return logical_id(typedef_type->getDecl(), translation_unit);
   if (const auto *tag = type->getAsTagDecl())
@@ -162,12 +166,15 @@ public:
                    llvm::dyn_cast<clang::MemberExpr>(statement)) {
       const auto id = logical_id(member->getMemberDecl(), translation_unit_);
       value += ":member:" + id;
-      if (!id.empty()) references_.insert(id);
+      if (!id.empty())
+        references_.insert(id);
     } else if (const auto *constructed =
                    llvm::dyn_cast<clang::CXXConstructExpr>(statement)) {
-      const auto id = logical_id(constructed->getConstructor(), translation_unit_);
+      const auto id =
+          logical_id(constructed->getConstructor(), translation_unit_);
       value += ":construct:" + id;
-      if (!id.empty()) references_.insert(id);
+      if (!id.empty())
+        references_.insert(id);
     } else if (const auto *binary =
                    llvm::dyn_cast<clang::BinaryOperator>(statement)) {
       value += ":" + binary->getOpcodeStr().str();
@@ -206,7 +213,12 @@ struct State {
     std::string compiler_id;
     history::SourceAnchor location;
   };
+  struct DeclarationSite {
+    std::string compiler_id;
+    history::SourceAnchor location;
+  };
   std::vector<history::ElementSnapshot> elements;
+  std::vector<DeclarationSite> declaration_sites;
   std::vector<MacroUse> macro_uses;
 };
 
@@ -239,17 +251,20 @@ public:
     const auto *info = directive ? directive->getMacroInfo() : nullptr;
     if (!info || !project_owned(sources_, info->getDefinitionLoc()))
       return;
-    const auto spelling = name.getIdentifierInfo()
-                              ? name.getIdentifierInfo()->getName().str()
-                              : clang::Lexer::getSpelling(name, sources_,
-                                                          preprocessor_.getLangOpts());
+    const auto spelling =
+        name.getIdentifierInfo()
+            ? name.getIdentifierInfo()->getName().str()
+            : clang::Lexer::getSpelling(name, sources_,
+                                        preprocessor_.getLangOpts());
     const auto location = sources_.getPresumedLoc(
         sources_.getExpansionLoc(info->getDefinitionLoc()));
-    std::string shape = info->isFunctionLike() ? "function_like\n" : "object_like\n";
+    std::string shape =
+        info->isFunctionLike() ? "function_like\n" : "object_like\n";
     shape += "parameters=" + std::to_string(info->getNumParams()) + "\n";
     for (const auto &token : info->tokens())
       shape += clang::Lexer::getSpelling(token, sources_,
-                                         preprocessor_.getLangOpts()) + " ";
+                                         preprocessor_.getLangOpts()) +
+               " ";
     history::ElementSnapshot element;
     element.kind = "macro";
     element.qualified_name = spelling;
@@ -273,20 +288,21 @@ public:
     state_.elements.push_back(std::move(element));
   }
 
-  void MacroExpands(const clang::Token &, const clang::MacroDefinition &definition,
+  void MacroExpands(const clang::Token &,
+                    const clang::MacroDefinition &definition,
                     clang::SourceRange range,
                     const clang::MacroArgs *) override {
     const auto *info = definition.getMacroInfo();
     const auto found = macro_ids_.find(info);
-    if (found == macro_ids_.end() ||
-        !project_owned(sources_, range.getBegin()))
+    if (found == macro_ids_.end() || !project_owned(sources_, range.getBegin()))
       return;
     history::SourceAnchor location;
-    const auto begin = sources_.getPresumedLoc(
-        sources_.getExpansionLoc(range.getBegin()));
-    const auto end = sources_.getPresumedLoc(
-        sources_.getExpansionLoc(range.getEnd()));
-    if (!begin.isValid()) return;
+    const auto begin =
+        sources_.getPresumedLoc(sources_.getExpansionLoc(range.getBegin()));
+    const auto end =
+        sources_.getPresumedLoc(sources_.getExpansionLoc(range.getEnd()));
+    if (!begin.isValid())
+      return;
     location.path = normalized_project_path(begin.getFilename());
     location.begin_line = begin.getLine();
     location.begin_column = begin.getColumn();
@@ -311,23 +327,33 @@ public:
     const auto &sources = context_.getSourceManager();
     const auto location = sources.getExpansionLoc(declaration->getLocation());
     const auto filename = sources.getFilename(location).str();
-    if (!declaration->isThisDeclarationADefinition() ||
-        declaration->isImplicit() ||
-        !project_owned(sources, declaration->getLocation()) ||
-        !seen_.insert(declaration->getCanonicalDecl()).second)
+    if (declaration->isImplicit() ||
+        !project_owned(sources, declaration->getLocation()))
+      return true;
+    if (!declaration->isThisDeclarationADefinition()) {
+      auto site = anchor(context_, declaration->getSourceRange());
+      site.role = "declaration";
+      state_.declaration_sites.push_back(
+          {usr(declaration->getCanonicalDecl()), std::move(site)});
+      return true;
+    }
+    if (!seen_.insert(declaration->getCanonicalDecl()).second)
       return true;
     history::ElementSnapshot element;
     element.compiler_id = usr(declaration->getCanonicalDecl());
     const bool method = llvm::isa<clang::CXXMethodDecl>(declaration);
-    const bool templated = declaration->getDescribedFunctionTemplate() != nullptr;
-    element.kind = templated ? (method ? "method_template" : "function_template")
-                             : (method ? "method" : "function");
+    const bool templated =
+        declaration->getDescribedFunctionTemplate() != nullptr;
+    element.kind = templated
+                       ? (method ? "method_template" : "function_template")
+                       : (method ? "method" : "function");
     if (declaration->getTemplateSpecializationKind() != clang::TSK_Undeclared)
       element.kind = method ? "method_template_specialization"
                             : "function_template_specialization";
-    if (const auto *method_decl = llvm::dyn_cast<clang::CXXMethodDecl>(declaration))
-      element.parent_element_id =
-          logical_id(method_decl->getParent(), normalized_project_path(filename));
+    if (const auto *method_decl =
+            llvm::dyn_cast<clang::CXXMethodDecl>(declaration))
+      element.parent_element_id = logical_id(method_decl->getParent(),
+                                             normalized_project_path(filename));
     element.qualified_name = declaration->getQualifiedNameAsString();
     element.linkage =
         declaration->getFormalLinkage() == clang::Linkage::Internal
@@ -345,11 +371,12 @@ public:
     element.implementation_fingerprint =
         history::stable_hash(body.build(declaration->getBody()));
     element.referenced_compiler_ids = body.references();
-    const auto translation_unit = normalized_project_path(
-        sources.getFilename(main_location).str());
+    const auto translation_unit =
+        normalized_project_path(sources.getFilename(main_location).str());
     const auto add_type = [&](clang::QualType type) {
       const auto id = type_reference(type, translation_unit);
-      if (!id.empty()) element.referenced_compiler_ids.push_back(id);
+      if (!id.empty())
+        element.referenced_compiler_ids.push_back(id);
     };
     add_type(declaration->getReturnType());
     for (const auto *parameter : declaration->parameters())
@@ -365,13 +392,15 @@ public:
       dependencies += id + "\n";
     element.dependency_fingerprint = history::stable_hash(dependencies);
     element.location = anchor(context_, declaration->getSourceRange());
+    element.location.role = "definition";
     state_.elements.push_back(std::move(element));
     return true;
   }
 
   bool VisitRecordDecl(clang::RecordDecl *declaration) {
     if (!declaration->isCompleteDefinition() || declaration->isImplicit() ||
-        !project_owned(context_.getSourceManager(), declaration->getLocation()) ||
+        !project_owned(context_.getSourceManager(),
+                       declaration->getLocation()) ||
         !seen_.insert(declaration->getCanonicalDecl()).second)
       return true;
     history::ElementSnapshot element;
@@ -381,8 +410,8 @@ public:
     else if (llvm::isa<clang::ClassTemplateSpecializationDecl>(declaration))
       element.kind = "record_template_specialization";
     else
-      element.kind = declaration->getDescribedTemplate() ? "record_template"
-                                                         : "record";
+      element.kind =
+          declaration->getDescribedTemplate() ? "record_template" : "record";
     element.qualified_name = declaration->getQualifiedNameAsString();
     element.interface_fingerprint = history::stable_hash(
         element.kind + "\n" + declaration->getKindName().str() + "\n" +
@@ -396,12 +425,14 @@ public:
       members += field->getNameAsString() + ":" +
                  field->getType().getCanonicalType().getAsString() + "\n";
       const auto id = type_reference(field->getType(), translation_unit);
-      if (!id.empty()) element.referenced_compiler_ids.push_back(id);
+      if (!id.empty())
+        element.referenced_compiler_ids.push_back(id);
     }
     if (const auto *record = llvm::dyn_cast<clang::CXXRecordDecl>(declaration))
       for (const auto &base : record->bases()) {
         const auto id = type_reference(base.getType(), translation_unit);
-        if (!id.empty()) element.referenced_compiler_ids.push_back(id);
+        if (!id.empty())
+          element.referenced_compiler_ids.push_back(id);
       }
     std::sort(element.referenced_compiler_ids.begin(),
               element.referenced_compiler_ids.end());
@@ -419,7 +450,8 @@ public:
 
   bool VisitFieldDecl(clang::FieldDecl *declaration) {
     if (declaration->isImplicit() ||
-        !project_owned(context_.getSourceManager(), declaration->getLocation()) ||
+        !project_owned(context_.getSourceManager(),
+                       declaration->getLocation()) ||
         !seen_.insert(declaration->getCanonicalDecl()).second)
       return true;
     history::ElementSnapshot element;
@@ -438,9 +470,11 @@ public:
         declaration->getType(),
         normalized_project_path(
             context_.getSourceManager().getFilename(main_location).str()));
-    if (!id.empty()) element.referenced_compiler_ids.push_back(id);
+    if (!id.empty())
+      element.referenced_compiler_ids.push_back(id);
     element.implementation_fingerprint = history::stable_hash(
-        declaration->hasInClassInitializer() ? "has_initializer" : "no_initializer");
+        declaration->hasInClassInitializer() ? "has_initializer"
+                                             : "no_initializer");
     element.dependency_fingerprint = history::stable_hash(id);
     element.location = anchor(context_, declaration->getSourceRange());
     state_.elements.push_back(std::move(element));
@@ -449,7 +483,8 @@ public:
 
   bool VisitEnumDecl(clang::EnumDecl *declaration) {
     if (!declaration->isCompleteDefinition() ||
-        !project_owned(context_.getSourceManager(), declaration->getLocation()) ||
+        !project_owned(context_.getSourceManager(),
+                       declaration->getLocation()) ||
         !seen_.insert(declaration->getCanonicalDecl()).second)
       return true;
     history::ElementSnapshot element;
@@ -472,7 +507,8 @@ public:
   }
 
   bool VisitEnumConstantDecl(clang::EnumConstantDecl *declaration) {
-    if (!project_owned(context_.getSourceManager(), declaration->getLocation()) ||
+    if (!project_owned(context_.getSourceManager(),
+                       declaration->getLocation()) ||
         !seen_.insert(declaration->getCanonicalDecl()).second)
       return true;
     history::ElementSnapshot element;
@@ -497,13 +533,14 @@ public:
   }
 
   bool VisitTypedefNameDecl(clang::TypedefNameDecl *declaration) {
-    if (!project_owned(context_.getSourceManager(), declaration->getLocation()) ||
+    if (!project_owned(context_.getSourceManager(),
+                       declaration->getLocation()) ||
         !seen_.insert(declaration->getCanonicalDecl()).second)
       return true;
     history::ElementSnapshot element;
     element.compiler_id = usr(declaration->getCanonicalDecl());
-    element.kind = llvm::isa<clang::TypeAliasDecl>(declaration) ? "type_alias"
-                                                                : "typedef";
+    element.kind =
+        llvm::isa<clang::TypeAliasDecl>(declaration) ? "type_alias" : "typedef";
     element.qualified_name = declaration->getQualifiedNameAsString();
     element.interface_fingerprint = history::stable_hash(
         declaration->getUnderlyingType().getCanonicalType().getAsString());
@@ -534,7 +571,8 @@ private:
 class Action final : public clang::ASTFrontendAction {
 public:
   std::unique_ptr<clang::ASTConsumer>
-  CreateASTConsumer(clang::CompilerInstance &compiler, llvm::StringRef) override {
+  CreateASTConsumer(clang::CompilerInstance &compiler,
+                    llvm::StringRef) override {
     compiler.getPreprocessor().addPPCallbacks(
         std::make_unique<MacroTracker>(compiler.getPreprocessor(), state_));
     return std::make_unique<Consumer>(state_);
@@ -547,6 +585,8 @@ public:
     manifest.source_blob = source_blob;
     manifest.context_id = context_fingerprint;
     manifest.configuration = configuration;
+    manifest.build_variant = nlohmann::json::parse(build_variant.getValue())
+                                 .get<history::BuildVariant>();
     const auto clang_version = clang::getClangFullVersion();
     manifest.extractor_fingerprint =
         "repotraverse-" + std::string(history::build::kToolVersion) +
@@ -558,10 +598,15 @@ public:
     manifest.producer.build_mode = std::string(history::build::kBuildMode);
     manifest.producer.host_architecture =
         std::string(history::build::kHostArchitecture);
-    manifest.coverage.capabilities = {
-        "logical_elements", "semantic_variants", "tu_observations",
-        "binding_normalized_bodies", "resolved_dependencies", "types",
-        "fields", "templates", "macros"};
+    manifest.coverage.capabilities = {"logical_elements",
+                                      "semantic_variants",
+                                      "tu_observations",
+                                      "binding_normalized_bodies",
+                                      "resolved_dependencies",
+                                      "types",
+                                      "fields",
+                                      "templates",
+                                      "macros"};
     if (getCompilerInstance().getDiagnostics().hasErrorOccurred()) {
       manifest.coverage.status = "partial";
       manifest.coverage.gaps.push_back("compiler diagnostics contain errors");
@@ -583,9 +628,9 @@ public:
       const auto domain = element.linkage == "internal"
                               ? manifest.translation_unit
                               : std::string{};
-      element.element_id = history::stable_hash(
-          manifest.repository_id + "\n" + element.linkage + "\n" + domain +
-          "\n" + element.compiler_id);
+      element.element_id =
+          history::stable_hash(manifest.repository_id + "\n" + element.linkage +
+                               "\n" + domain + "\n" + element.compiler_id);
       history::SemanticVariant variant;
       variant.element_id = element.element_id;
       variant.interface_fingerprint = snapshot.interface_fingerprint;
@@ -604,11 +649,47 @@ public:
           {element.element_id, variant.variant_id, std::move(location)});
     }
     std::map<std::string, std::string> element_by_compiler;
+    std::map<std::string, std::string> variant_by_element;
     for (const auto &element : manifest.elements)
       element_by_compiler[element.compiler_id] = element.element_id;
+    for (auto &variant : manifest.variants) {
+      std::vector<std::string> resolved;
+      for (const auto &reference : variant.referenced_element_ids)
+        if (const auto found = element_by_compiler.find(reference);
+            found != element_by_compiler.end())
+          resolved.push_back(found->second);
+      std::sort(resolved.begin(), resolved.end());
+      resolved.erase(std::unique(resolved.begin(), resolved.end()),
+                     resolved.end());
+      variant.referenced_element_ids = std::move(resolved);
+    }
+    for (const auto &variant : manifest.variants)
+      variant_by_element[variant.element_id] = variant.variant_id;
+    std::set<std::tuple<std::string, std::string, std::uint32_t,
+                        std::uint32_t>>
+        observed_locations;
+    for (const auto &observation : manifest.observations)
+      observed_locations.emplace(
+          observation.element_id, observation.location.path,
+          observation.location.begin_line, observation.location.begin_column);
+    for (auto &site : state_.declaration_sites) {
+      const auto element = element_by_compiler.find(site.compiler_id);
+      if (element == element_by_compiler.end())
+        continue;
+      site.location.path = normalized_project_path(site.location.path);
+      if (!observed_locations
+               .emplace(element->second, site.location.path,
+                        site.location.begin_line, site.location.begin_column)
+               .second)
+        continue;
+      manifest.observations.push_back(
+          {element->second, variant_by_element.at(element->second),
+           std::move(site.location)});
+    }
     for (const auto &use : state_.macro_uses) {
       const auto macro = element_by_compiler.find(use.compiler_id);
-      if (macro == element_by_compiler.end()) continue;
+      if (macro == element_by_compiler.end())
+        continue;
       std::string containing;
       std::uint64_t best_span = std::numeric_limits<std::uint64_t>::max();
       for (const auto &observation : manifest.observations) {
@@ -630,6 +711,7 @@ public:
     nlohmann::json identity = {{"repository", manifest.repository_id},
                                {"revision", manifest.source_revision},
                                {"configuration", manifest.configuration},
+                               {"build_variant", manifest.build_variant},
                                {"tu", manifest.translation_unit},
                                {"blob", manifest.source_blob},
                                {"context", manifest.context_id},

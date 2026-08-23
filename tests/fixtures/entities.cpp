@@ -12,4 +12,7 @@ template <typename T> struct Box<T *> {
 enum class Mode { idle = 1, active = 2 };
 using Count = int;
 
+int declared(int value);
+int declared(int value) { return value; }
+
 template struct Box<int>;

@@ -10,14 +10,14 @@ void require(bool condition, const char *message) {
   if (!condition)
     throw std::runtime_error(message);
 }
-}
+} // namespace
 
 int main() {
-  const auto root = std::filesystem::temp_directory_path() /
-                    ("repotraverse-production-catalog-" +
-                     std::to_string(std::chrono::steady_clock::now()
-                                        .time_since_epoch()
-                                        .count()));
+  const auto root =
+      std::filesystem::temp_directory_path() /
+      ("repotraverse-production-catalog-" +
+       std::to_string(
+           std::chrono::steady_clock::now().time_since_epoch().count()));
   struct Cleanup {
     std::filesystem::path path;
     ~Cleanup() {
@@ -27,10 +27,9 @@ int main() {
   } cleanup{root};
   try {
     history::Catalog catalog(root);
-    const nlohmann::json request = {
-        {"schema_version", history::kSchemaVersion},
-        {"query", "analysis.coverage"},
-        {"params", {{"bundle", "fixture.json"}}}};
+    const nlohmann::json request = {{"schema_version", history::kSchemaVersion},
+                                    {"query", "analysis.coverage"},
+                                    {"params", {{"bundle", "fixture.json"}}}};
     const auto first = catalog.create_request(request);
     require(first == catalog.create_request(request),
             "request creation is not idempotent");
@@ -41,8 +40,8 @@ int main() {
 
     catalog.schedule_task("0123456789abcdef0123456789abcdef",
                           {{"request_id", first}, {"identity", {}}});
-    const auto retried = catalog.fail_task(
-        "0123456789abcdef0123456789abcdef", "diagnostic", 1);
+    const auto retried =
+        catalog.fail_task("0123456789abcdef0123456789abcdef", "diagnostic", 1);
     require(retried.at("state") == "quarantined",
             "permanent task was not quarantined");
     require(!catalog.next_pending_task(),
@@ -88,8 +87,8 @@ int main() {
     target_variant.element_id = target.element_id;
     source_variant.referenced_element_ids = {target.element_id};
     for (auto *variant : {&source_variant, &target_variant})
-      variant->variant_id = history::stable_hash(
-          variant->element_id + "\n\n\n");
+      variant->variant_id =
+          history::stable_hash(variant->element_id + "\n\n\n");
     history::SourceAnchor source_location, target_location;
     source_location.path = target_location.path = "source.cpp";
     manifest.elements = {source, target};
@@ -101,6 +100,7 @@ int main() {
         {"repository", manifest.repository_id},
         {"revision", manifest.source_revision},
         {"configuration", manifest.configuration},
+        {"build_variant", manifest.build_variant},
         {"tu", manifest.translation_unit},
         {"blob", manifest.source_blob},
         {"context", manifest.context_id},
@@ -109,8 +109,8 @@ int main() {
     manifest.manifest_id = history::stable_hash(identity.dump());
     catalog.store_fact("semantic-fact", "semantic-task",
                        {{"result", nlohmann::json(manifest)}}, "commit");
-    const auto dependents = catalog.semantic_dependents(
-        "main", "revision", {target.element_id});
+    const auto dependents =
+        catalog.semantic_dependents("main", "revision", {target.element_id});
     require(dependents.at("dependents").size() == 1 &&
                 dependents.at("dependents").front().at("element_id") ==
                     source.element_id,

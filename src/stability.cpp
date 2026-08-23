@@ -8,6 +8,7 @@
 #include <cmath>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -26,8 +27,8 @@ bool wildcard(std::string_view pattern, std::string_view value) {
         current[index] = previous[index] || current[index - 1];
     } else {
       for (std::size_t index = 1; index <= value.size(); ++index)
-        current[index] = previous[index - 1] &&
-                         (token == '?' || token == value[index - 1]);
+        current[index] =
+            previous[index - 1] && (token == '?' || token == value[index - 1]);
     }
     previous.swap(current);
   }
@@ -97,7 +98,8 @@ void persist_csv(const std::filesystem::path &path,
             "kind,path,classification,developer_label,volatility_score,"
             "implementation_score,interface_instability_score,"
             "structural_volatility_score,observable_transitions,change_units,"
-            "authors,dependency_changes\n";
+            "authors,dependency_changes,file_git_touches,added_at,"
+            "last_observed_at,removed_at,last_semantic_change\n";
   for (const auto &row : rows) {
     output << csv(row.value("historical_element_id", std::string{})) << ','
            << csv(row.value("configuration", std::string{})) << ','
@@ -112,9 +114,13 @@ void persist_csv(const std::filesystem::path &path,
            << row.value("interface_instability_score", 0.0) << ','
            << row.value("structural_volatility_score", 0.0) << ','
            << row.value("observable_transitions", 0U) << ','
-           << row.value("change_units", 0U) << ','
-           << row.value("authors", 0U) << ','
-           << row.value("dependency_changes", 0U) << '\n';
+           << row.value("change_units", 0U) << ',' << row.value("authors", 0U)
+           << ',' << row.value("dependency_changes", 0U) << ','
+           << row.value("file_git_touches", 0U) << ','
+           << csv(row.value("added_at", std::string{})) << ','
+           << csv(row.value("last_observed_at", std::string{})) << ','
+           << csv(row.value("removed_at", std::string{})) << ','
+           << csv(row.value("last_semantic_change", std::string{})) << '\n';
   }
   if (!output)
     throw std::runtime_error("cannot persist stability CSV report");
@@ -122,8 +128,8 @@ void persist_csv(const std::filesystem::path &path,
 
 } // namespace
 
-nlohmann::json run_stability_experiment(
-    const std::filesystem::path &manifest_path) {
+nlohmann::json
+run_stability_experiment(const std::filesystem::path &manifest_path) {
   const auto manifest = load_json(manifest_path);
   if (manifest.value("schema_version", 0U) != kSchemaVersion ||
       !manifest.contains("series") || !manifest.at("series").is_array() ||
@@ -143,15 +149,17 @@ nlohmann::json run_stability_experiment(
   const auto move_weight = policy.value("move_weight", 0.2);
   const auto rename_weight = policy.value("rename_weight", 0.2);
   if (minimum_transitions == 0 || half_life <= 0 || half_life_days <= 0 ||
-      stable_threshold < 0 ||
-      variable_threshold <= stable_threshold)
+      stable_threshold < 0 || variable_threshold <= stable_threshold)
     throw std::runtime_error("invalid stability policy");
 
   MemoryFactStore store;
-  const auto revision_authors = manifest.value(
-      "revision_authors", std::map<std::string, std::string>{});
-  const auto revision_times = manifest.value(
-      "revision_times", std::map<std::string, std::int64_t>{});
+  const auto revision_authors =
+      manifest.value("revision_authors", std::map<std::string, std::string>{});
+  const auto revision_times =
+      manifest.value("revision_times", std::map<std::string, std::int64_t>{});
+  const auto revision_file_touches =
+      manifest.value("revision_file_touches",
+                     std::map<std::string, std::vector<std::string>>{});
   std::int64_t latest_time = 0;
   for (const auto &[revision, time] : revision_times)
     latest_time = std::max(latest_time, time);
@@ -163,7 +171,8 @@ nlohmann::json run_stability_experiment(
   for (const auto &series : manifest.at("series")) {
     if (!series.contains("bundles") || !series.at("bundles").is_array() ||
         series.at("bundles").size() < 2)
-      throw std::runtime_error("each stability series requires at least two bundles");
+      throw std::runtime_error(
+          "each stability series requires at least two bundles");
     std::vector<EvidenceBundle> bundles;
     for (const auto &path : series.at("bundles"))
       bundles.push_back(store.load(path.get<std::string>()));
@@ -180,14 +189,15 @@ nlohmann::json run_stability_experiment(
         parent[std::max(a, b)] = std::min(a, b);
     };
     std::vector<TransitionResult> transitions;
-    bool complete = std::all_of(
-        bundles.begin(), bundles.end(), [](const auto &bundle) {
+    bool complete = series.value("coverage_complete", true) &&
+        std::all_of(bundles.begin(), bundles.end(), [](const auto &bundle) {
           return bundle.coverage.status == "complete";
         });
     for (std::size_t index = 0; index + 1 < bundles.size(); ++index) {
-      transitions.push_back(trace_transition(bundles[index], bundles[index + 1]));
-      complete = complete &&
-                 bundles[index].configuration == bundles[index + 1].configuration;
+      transitions.push_back(
+          trace_transition(bundles[index], bundles[index + 1]));
+      complete = complete && bundles[index].configuration ==
+                                 bundles[index + 1].configuration;
       for (const auto &fact : transitions.back().facts)
         if (!fact.before_element.empty() && !fact.after_element.empty() &&
             fact.confidence != "ambiguous")
@@ -195,21 +205,45 @@ nlohmann::json run_stability_experiment(
     }
     struct Metrics {
       std::size_t observations{}, implementation_changes{}, interface_changes{},
-          dependency_changes{}, moves{}, renames{}, ambiguous{};
+          dependency_changes{}, moves{}, renames{}, ambiguous{},
+          file_git_touches{};
       double implementation_score{}, interface_score{}, structural_score{};
       std::set<std::size_t> changed_transitions;
       std::set<std::string> authors;
-      std::string name, kind, path;
+      std::string name, kind, path, added_at, last_observed_at, removed_at,
+          last_semantic_change, interface_fingerprint,
+          implementation_fingerprint, dependency_fingerprint;
+      std::size_t first_index{std::numeric_limits<std::size_t>::max()},
+          last_index{};
     };
     std::map<std::string, Metrics> metrics;
-    for (const auto &bundle : bundles)
+    for (std::size_t bundle_index = 0; bundle_index < bundles.size();
+         ++bundle_index) {
+      const auto &bundle = bundles[bundle_index];
+      std::set<std::string> touched_files;
+      if (const auto touched =
+              revision_file_touches.find(bundle.source_revision);
+          touched != revision_file_touches.end())
+        touched_files.insert(touched->second.begin(), touched->second.end());
       for (const auto &element : bundle.elements) {
         auto &item = metrics[find(find, element.compiler_id)];
         ++item.observations;
         item.name = element.qualified_name;
         item.kind = element.kind;
         item.path = element.location.path;
+        item.interface_fingerprint = element.interface_fingerprint;
+        item.implementation_fingerprint = element.implementation_fingerprint;
+        item.dependency_fingerprint = element.dependency_fingerprint;
+        if (item.first_index == std::numeric_limits<std::size_t>::max()) {
+          item.first_index = bundle_index;
+          item.added_at = bundle.source_revision;
+        }
+        item.last_index = bundle_index;
+        item.last_observed_at = bundle.source_revision;
+        if (touched_files.contains(element.location.path))
+          ++item.file_git_touches;
       }
+    }
     for (std::size_t index = 0; index < transitions.size(); ++index) {
       const auto age = static_cast<double>(transitions.size() - index - 1);
       const auto transition_recency = std::pow(0.5, age / half_life);
@@ -263,6 +297,7 @@ nlohmann::json run_stability_experiment(
           changed_fact = true;
         }
         if (changed_fact) {
+          item.last_semantic_change = fact.after_revision;
           item.changed_transitions.insert(index);
           if (const auto author = revision_authors.find(fact.after_revision);
               author != revision_authors.end())
@@ -271,11 +306,14 @@ nlohmann::json run_stability_experiment(
       }
     }
     for (const auto &[root, item] : metrics) {
+      auto removed_at = item.removed_at;
+      if (item.last_index + 1 < bundles.size())
+        removed_at = bundles[item.last_index + 1].source_revision;
       const auto observable = item.observations > 0 ? item.observations - 1 : 0;
       const auto score = observable == 0
                              ? 0.0
-                             : (item.implementation_score + item.interface_score +
-                                item.structural_score) /
+                             : (item.implementation_score +
+                                item.interface_score + item.structural_score) /
                                    static_cast<double>(observable);
       std::vector<std::string> evidence_gaps;
       if (!complete)
@@ -289,10 +327,12 @@ nlohmann::json run_stability_experiment(
         classification = "stable";
       else if (evidence_gaps.empty() && score >= variable_threshold)
         classification = "variable";
-      const auto expected = developer_label(manifest.at("partition"), item.path);
+      const auto expected =
+          developer_label(manifest.at("partition"), item.path);
       nlohmann::json row = {
           {"historical_element_id", "history-" + stable_hash(root)},
           {"configuration", series.value("configuration", std::string{})},
+          {"build_variant", series.value("build_variant", BuildVariant{})},
           {"translation_unit", series.value("translation_unit", std::string{})},
           {"current_name", item.name},
           {"kind", item.kind},
@@ -308,11 +348,23 @@ nlohmann::json run_stability_experiment(
           {"implementation_changes", item.implementation_changes},
           {"interface_changes", item.interface_changes},
           {"dependency_changes", item.dependency_changes},
+          {"file_git_touches", item.file_git_touches},
+          {"direct_git_touches", nullptr},
           {"moves", item.moves},
           {"renames", item.renames},
           {"ambiguous_transitions", item.ambiguous},
           {"change_units", item.changed_transitions.size()},
           {"authors", item.authors.size()},
+          {"added_at", item.added_at},
+          {"last_observed_at", item.last_observed_at},
+          {"removed_at", removed_at},
+          {"last_semantic_change", item.last_semantic_change},
+          {"fact_coverage",
+           {{"file_git_touches", "observed"},
+            {"direct_git_touches", "unavailable"}}},
+          {"semantic_state", stable_hash(item.interface_fingerprint + "\n" +
+                                         item.implementation_fingerprint +
+                                         "\n" + item.dependency_fingerprint)},
           {"evidence_gaps", evidence_gaps}};
       rows.push_back(row);
       ++classifications[classification];
@@ -322,6 +374,46 @@ nlohmann::json run_stability_experiment(
       if (expected == "variable" && classification == "stable")
         islands.push_back(row);
     }
+  }
+  struct VariantState {
+    nlohmann::json build_variant;
+    std::set<std::string> semantic_states, translation_units;
+  };
+  std::map<std::string, std::map<std::string, VariantState>> variant_states;
+  for (const auto &row : rows) {
+    const auto variant = row.value("build_variant", BuildVariant{});
+    if (variant.variant_id.empty())
+      continue;
+    auto &state =
+        variant_states[row.at("historical_element_id")][variant.variant_id];
+    state.build_variant = variant;
+    state.semantic_states.insert(row.value("semantic_state", std::string{}));
+    const auto tu = row.value("translation_unit", std::string{});
+    if (!tu.empty())
+      state.translation_units.insert(tu);
+  }
+  nlohmann::json cross_variant_facts = nlohmann::json::array();
+  for (const auto &[element_id, variants] : variant_states) {
+    if (variants.size() < 2)
+      continue;
+    std::set<std::string> all_states;
+    bool intra_variant_divergence = false;
+    nlohmann::json observations = nlohmann::json::array();
+    for (const auto &[variant_id, state] : variants) {
+      all_states.insert(state.semantic_states.begin(),
+                        state.semantic_states.end());
+      intra_variant_divergence =
+          intra_variant_divergence || state.semantic_states.size() > 1;
+      observations.push_back({{"variant_id", variant_id},
+                              {"build_variant", state.build_variant},
+                              {"semantic_states", state.semantic_states},
+                              {"translation_units", state.translation_units}});
+    }
+    cross_variant_facts.push_back(
+        {{"historical_element_id", element_id},
+         {"cross_variant_divergence", all_states.size() > 1},
+         {"intra_variant_divergence", intra_variant_divergence},
+         {"observations", std::move(observations)}});
   }
   nlohmann::json result = {
       {"schema_version", kSchemaVersion},
@@ -341,6 +433,7 @@ nlohmann::json run_stability_experiment(
       {"agreement", agreement},
       {"variation_leakage", std::move(leakage)},
       {"stable_islands", std::move(islands)},
+      {"cross_variant_facts", std::move(cross_variant_facts)},
       {"elements", std::move(rows)}};
   if (manifest.contains("report")) {
     const auto report =

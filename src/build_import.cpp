@@ -110,8 +110,8 @@ expand_response_files(const std::vector<std::string> &arguments,
       gap(coverage, "response file requires repository path: " + argument);
       continue;
     }
-    const auto relative = safe_relative(working_directory / name,
-                                        "response file");
+    const auto relative =
+        safe_relative(working_directory / name, "response file");
     std::string content;
     if (const auto found = embedded.find(name); found != embedded.end()) {
       content = found->second;
@@ -142,12 +142,14 @@ normalize(const std::vector<std::string> &captured,
           const std::filesystem::path &repository,
           const std::map<std::string, std::string> &response_files,
           Coverage &coverage) {
-  const auto input = expand_response_files(captured, working_directory,
-                                           repository, response_files, coverage);
+  const auto input = expand_response_files(
+      captured, working_directory, repository, response_files, coverage);
   std::vector<std::string> out;
-  const auto path_pair = [&](const std::string &option, const std::string &value) {
+  const auto path_pair = [&](const std::string &option,
+                             const std::string &value) {
     out.push_back(option);
-    out.push_back(semantic_path(value, working_directory, repository, coverage));
+    out.push_back(
+        semantic_path(value, working_directory, repository, coverage));
   };
   for (std::size_t i = 0; i < input.size(); ++i) {
     const auto &a = input[i];
@@ -161,8 +163,7 @@ normalize(const std::vector<std::string> &captured,
         a.starts_with("-O") || a.starts_with("-g") ||
         a.starts_with("--diag_") || a.starts_with("--remarks") ||
         a.starts_with("--depend=") || a.starts_with("--list=") ||
-        a.starts_with("--output=") ||
-        (a.starts_with("-o") && a.size() > 2))
+        a.starts_with("--output=") || (a.starts_with("-o") && a.size() > 2))
       continue;
     if ((a == "--cpu" || a == "--fpu") && i + 1 < input.size()) {
       out.push_back(std::string(a == "--cpu" ? "-mcpu=" : "-mfpu=") +
@@ -229,14 +230,14 @@ normalize(const std::vector<std::string> &captured,
     }
     if (a.starts_with("-I") && a.size() > 2) {
       out.push_back("-I" + semantic_path(a.substr(2), working_directory,
-                                          repository, coverage));
+                                         repository, coverage));
       continue;
     }
-    if (a.starts_with("-D") || a.starts_with("-U") ||
-        a.starts_with("-std=") || a.starts_with("--target=") ||
-        a == "-mthumb" || a == "-marm" || a == "-mbig-endian" ||
-        a == "-mlittle-endian" || a.starts_with("-mcpu=") ||
-        a.starts_with("-mfpu=") || a.starts_with("-mfloat-abi=")) {
+    if (a.starts_with("-D") || a.starts_with("-U") || a.starts_with("-std=") ||
+        a.starts_with("--target=") || a == "-mthumb" || a == "-marm" ||
+        a == "-mbig-endian" || a == "-mlittle-endian" ||
+        a.starts_with("-mcpu=") || a.starts_with("-mfpu=") ||
+        a.starts_with("-mfloat-abi=")) {
       out.push_back(a);
       continue;
     }
@@ -254,7 +255,8 @@ std::vector<nlohmann::json> load_records(const std::filesystem::path &input) {
   std::vector<nlohmann::json> records;
   if (std::filesystem::is_directory(input)) {
     std::vector<std::filesystem::path> files;
-    for (const auto &entry : std::filesystem::recursive_directory_iterator(input))
+    for (const auto &entry :
+         std::filesystem::recursive_directory_iterator(input))
       if (entry.is_regular_file() && entry.path().extension() == ".json")
         files.push_back(entry.path());
     std::sort(files.begin(), files.end());
@@ -287,7 +289,8 @@ nlohmann::json import_build_log(Catalog &catalog,
   std::set<std::string> configurations, contexts, translation_units;
   for (const auto &record : load_records(input)) {
     if (record.value("schema_version", 0U) != kSchemaVersion)
-      throw std::runtime_error("captured build record requires schema_version 1");
+      throw std::runtime_error(
+          "captured build record requires schema_version 1");
     CompileContext context;
     context.configuration = record.at("configuration").get<std::string>();
     context.source_revision = record.at("source_revision").get<std::string>();
@@ -299,14 +302,31 @@ nlohmann::json import_build_log(Catalog &catalog,
             .generic_string();
     const auto tu = safe_relative(context.translation_unit, "translation unit");
     if (context.configuration.empty() || context.configuration.size() > 256 ||
-        context.source_revision.empty() || context.source_revision.starts_with('-') ||
+        context.source_revision.empty() ||
+        context.source_revision.starts_with('-') ||
         context.translation_unit.empty() ||
         (context.toolchain != "armcc5" && context.toolchain != "armclang6"))
-      throw std::runtime_error("captured build record has invalid identity fields");
+      throw std::runtime_error(
+          "captured build record has invalid identity fields");
     context.translation_unit = tu.generic_string();
     context.adapter_version =
         context.toolchain == "armcc5" ? "armcc5_v1" : "armclang6_v1";
     context.target = record.value("target", BuildTarget{});
+    context.build_variant = record.value("build_variant", BuildVariant{});
+    if (context.build_variant.product.empty())
+      context.build_variant.product = "unspecified";
+    if (context.build_variant.target.empty())
+      context.build_variant.target =
+          !context.target.target_id.empty()       ? context.target.target_id
+          : !context.target.target_triple.empty() ? context.target.target_triple
+                                                  : "unspecified";
+    if (context.build_variant.configuration.empty())
+      context.build_variant.configuration = context.configuration;
+    context.build_variant.variant_id = stable_hash(
+        nlohmann::json({{"product", context.build_variant.product},
+                        {"target", context.build_variant.target},
+                        {"configuration", context.build_variant.configuration}})
+            .dump());
     context.project_files =
         record.value("project_files",
                      record.value("dependencies", std::vector<std::string>{}));
@@ -316,12 +336,12 @@ nlohmann::json import_build_log(Catalog &catalog,
       context.coverage.capabilities.push_back("project_dependency_map");
     else
       gap(context.coverage, "project dependency map was not captured");
-    context.frontend_arguments = normalize(
-        record.at("arguments").get<std::vector<std::string>>(),
-        context.working_directory, repository,
-        record.value("response_file_contents",
-                     std::map<std::string, std::string>{}),
-        context.coverage);
+    context.frontend_arguments =
+        normalize(record.at("arguments").get<std::vector<std::string>>(),
+                  context.working_directory, repository,
+                  record.value("response_file_contents",
+                               std::map<std::string, std::string>{}),
+                  context.coverage);
     if (context.frontend_arguments.size() > 4096 ||
         std::any_of(context.frontend_arguments.begin(),
                     context.frontend_arguments.end(), [](const auto &argument) {
@@ -329,7 +349,8 @@ nlohmann::json import_build_log(Catalog &catalog,
                     }))
       throw std::runtime_error("captured frontend arguments exceed limits");
     for (auto &project_file : context.project_files)
-      project_file = safe_relative(project_file, "project path").generic_string();
+      project_file =
+          safe_relative(project_file, "project path").generic_string();
     const nlohmann::json identity = {
         {"translation_unit", context.translation_unit},
         {"working_directory", context.working_directory},

@@ -71,6 +71,25 @@ if(NOT WIN32)
     target_link_libraries(repotraverse-sqlite PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
 endif()
 
+# Pinned Tree-sitter v0.26.11 with the generated C v0.24.2 and C++ v0.23.4
+# parsers. Only the embeddable runtime and generated parser sources are built;
+# configuration never invokes the Tree-sitter CLI or accesses the network.
+add_library(repotraverse-tree-sitter STATIC
+    third_party/tree_sitter/lib/src/lib.c
+    third_party/tree_sitter_c/src/parser.c
+    third_party/tree_sitter_cpp/src/parser.c
+    third_party/tree_sitter_cpp/src/scanner.c)
+target_include_directories(repotraverse-tree-sitter SYSTEM PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/tree_sitter/lib/include")
+target_include_directories(repotraverse-tree-sitter SYSTEM PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/tree_sitter/lib/src"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/tree_sitter_c/src"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/tree_sitter_cpp/src")
+set_target_properties(repotraverse-tree-sitter PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+    C_STANDARD 11
+    C_STANDARD_REQUIRED ON)
+
 configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/build_info.hpp.in"
     "${CMAKE_CURRENT_BINARY_DIR}/generated/history/build_info.hpp"
@@ -79,6 +98,7 @@ configure_file(
 add_library(history-core
     src/build_import.cpp
     src/catalog.cpp
+    src/change_evidence.cpp
     src/config.cpp
     src/experiment.cpp
     src/file_history.cpp
@@ -88,14 +108,17 @@ add_library(history-core
     src/ir.cpp
     src/lineage.cpp
     src/process.cpp
+    src/progressive.cpp
     src/query.cpp)
-target_sources(history-core PRIVATE src/worker.cpp src/telemetry.cpp src/stability.cpp)
+target_sources(history-core PRIVATE src/worker.cpp src/telemetry.cpp src/stability.cpp
+    src/revision_workspace.cpp)
 target_include_directories(history-core PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
     "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_link_libraries(history-core
     PUBLIC nlohmann_json::nlohmann_json
-    PRIVATE repotraverse-sqlite repotraverse-xxhash Threads::Threads
+    PRIVATE repotraverse-sqlite repotraverse-xxhash repotraverse-tree-sitter
+        Threads::Threads
     PRIVATE repotraverse-build-options)
 if(WIN32)
     target_link_libraries(history-core PRIVATE ws2_32 winhttp)
@@ -202,6 +225,24 @@ if(BUILD_TESTING)
     target_link_libraries(stability-tests PRIVATE
         history-core repotraverse-build-options)
     add_test(NAME stability-tests COMMAND stability-tests)
+    add_executable(revision-workspace-tests tests/revision_workspace_tests.cpp)
+    target_link_libraries(revision-workspace-tests PRIVATE
+        history-core repotraverse-build-options)
+    target_compile_definitions(revision-workspace-tests PRIVATE
+        GIT_PATH="${GIT_EXECUTABLE}")
+    add_test(NAME revision-workspace-tests COMMAND revision-workspace-tests)
+    add_executable(progressive-tests tests/progressive_tests.cpp)
+    target_link_libraries(progressive-tests PRIVATE
+        history-core repotraverse-build-options)
+    target_compile_definitions(progressive-tests PRIVATE
+        GIT_PATH="${GIT_EXECUTABLE}")
+    add_test(NAME progressive-tests COMMAND progressive-tests)
+    add_executable(change-evidence-tests tests/change_evidence_tests.cpp)
+    target_link_libraries(change-evidence-tests PRIVATE
+        history-core repotraverse-build-options)
+    target_compile_definitions(change-evidence-tests PRIVATE
+        GIT_PATH="${GIT_EXECUTABLE}")
+    add_test(NAME change-evidence-tests COMMAND change-evidence-tests)
     add_test(NAME compiler-probe-version
         COMMAND repotraverse-compiler-probe --version)
     set_tests_properties(compiler-probe-version PROPERTIES
@@ -279,7 +320,7 @@ if(BUILD_TESTING)
 endif()
 
 install(TARGETS history-core repotraverse repotraverse-compiler-probe
-    repotraverse-sqlite repotraverse-xxhash
+    repotraverse-sqlite repotraverse-xxhash repotraverse-tree-sitter
     RUNTIME DESTINATION bin
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib)
@@ -292,6 +333,13 @@ install(FILES third_party/xxhash/LICENSE
     DESTINATION licenses/xxhash)
 install(FILES third_party/sqlite/README.md
     DESTINATION licenses/sqlite)
+install(FILES third_party/tree_sitter/LICENSE third_party/tree_sitter/VERSION
+    DESTINATION licenses/tree_sitter)
+install(FILES third_party/tree_sitter_c/LICENSE third_party/tree_sitter_c/VERSION
+    DESTINATION licenses/tree_sitter_c)
+install(FILES third_party/tree_sitter_cpp/LICENSE
+    third_party/tree_sitter_cpp/VERSION
+    DESTINATION licenses/tree_sitter_cpp)
 install(FILES README.md THIRD_PARTY.md docs/lineage-architecture.md
     docs/operations.md docs/v1-experiment.md
     DESTINATION docs)

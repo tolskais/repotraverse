@@ -4,8 +4,8 @@
 #include <memory>
 #include <stdexcept>
 
-#include "history/query.hpp"
 #include "history/config.hpp"
+#include "history/query.hpp"
 
 namespace {
 void require(bool condition, const char *message) {
@@ -102,6 +102,74 @@ void test_ambiguity_and_assertion() {
           "accepted assertion did not resolve lineage");
 }
 
+void test_synthetic_lineage_capability_boundary() {
+  struct Scenario {
+    const char *name;
+    history::ElementSnapshot before, after;
+    const char *continuity;
+    const char *content_change;
+    const char *confidence;
+  };
+  const std::vector<Scenario> resolved = {
+      {"body change", element("same", "f", "a.cpp", "i", "old"),
+       element("same", "f", "a.cpp", "i", "new"), "same", "implementation",
+       "exact"},
+      {"signature change", element("same", "f", "a.cpp", "old", "b"),
+       element("same", "f", "a.cpp", "new", "b"), "same", "interface", "exact"},
+      {"dependency change", element("same", "f", "a.cpp", "i", "b", "x"),
+       element("same", "f", "a.cpp", "i", "b", "y"), "same", "none", "exact"},
+      {"pure rename", element("old", "f", "a.cpp"),
+       element("new", "g", "a.cpp"), "renamed", "none", "high"},
+      {"pure move", element("old", "f", "a.cpp"), element("new", "f", "b.cpp"),
+       "moved", "none", "high"}};
+  for (const auto &scenario : resolved) {
+    const auto result = history::trace_transition(
+        bundle("before", {scenario.before}), bundle("after", {scenario.after}));
+    require(result.facts.size() == 1, scenario.name);
+    require(result.facts.front().continuity == scenario.continuity,
+            scenario.name);
+    require(result.facts.front().content_change == scenario.content_change,
+            scenario.name);
+    require(result.facts.front().confidence == scenario.confidence,
+            scenario.name);
+  }
+
+  const auto rename_and_modify = history::trace_transition(
+      bundle("before", {element("old", "parse", "parser.cpp", "i", "old")}),
+      bundle("after",
+             {element("new", "parseToken", "parser.cpp", "i", "new")}));
+  const auto unresolved = std::find_if(
+      rename_and_modify.facts.begin(), rename_and_modify.facts.end(),
+      [](const auto &fact) { return fact.before_element == "old"; });
+  require(unresolved != rename_and_modify.facts.end() &&
+              unresolved->continuity == "deleted_or_unresolved" &&
+              unresolved->confidence == "ambiguous",
+          "rename plus modification capability boundary changed");
+
+  const auto deleted = history::trace_transition(
+      bundle("before", {element("old", "f", "a.cpp")}), bundle("after", {}));
+  require(deleted.facts.front().continuity == "deleted_or_unresolved",
+          "deletion must remain explicitly unresolved");
+}
+
+void test_build_variant_identity_round_trip() {
+  history::CompileContext context;
+  context.configuration = "product-a-debug";
+  context.build_variant.product = "product-a";
+  context.build_variant.target = "cortex-r5";
+  context.build_variant.configuration = "debug";
+  context.build_variant.variant_id =
+      history::stable_hash(nlohmann::json({{"product", "product-a"},
+                                           {"target", "cortex-r5"},
+                                           {"configuration", "debug"}})
+                               .dump());
+  const auto restored = nlohmann::json(context).get<history::CompileContext>();
+  require(restored.build_variant.variant_id ==
+                  context.build_variant.variant_id &&
+              restored.build_variant.target == "cortex-r5",
+          "build variant identity was not preserved");
+}
+
 void test_producer_identity_round_trip() {
   auto original = bundle("a", {element("id", "f", "f.cpp")});
   original.producer.tool_version = "0.1.0";
@@ -133,14 +201,17 @@ void test_production_config_validation() {
        {"catalog", "catalog"},
        {"artifact_repository", "artifacts"}});
   require(config.listen_address == "127.0.0.1", "loopback default changed");
+  require(config.workspace_mode == "auto" &&
+              config.workspace_max_revisions == 2 &&
+              config.workspace_max_bytes == 0,
+          "disk-bounded workspace defaults changed");
   bool rejected = false;
   try {
-    history::parse_service_config(
-        {{"schema_version", history::kSchemaVersion},
-         {"repository_id", "device-main"},
-         {"catalog", "catalog"},
-         {"artifact_repository", "artifacts"},
-         {"listen_address", "0.0.0.0"}});
+    history::parse_service_config({{"schema_version", history::kSchemaVersion},
+                                   {"repository_id", "device-main"},
+                                   {"catalog", "catalog"},
+                                   {"artifact_repository", "artifacts"},
+                                   {"listen_address", "0.0.0.0"}});
   } catch (const std::invalid_argument &) {
     rejected = true;
   }
@@ -152,9 +223,9 @@ void test_reviewed_extract_candidate() {
   auto after_caller = element("caller", "caller", "source.cpp", "i", "new");
   after_caller.referenced_compiler_ids = {"helper"};
   auto helper = element("helper", "helper", "source.cpp", "h", "body");
-  const auto result = history::trace_transition(
-      bundle("before", {before_caller}),
-      bundle("after", {after_caller, helper}));
+  const auto result =
+      history::trace_transition(bundle("before", {before_caller}),
+                                bundle("after", {after_caller, helper}));
   require(result.relation_candidates.size() == 1,
           "extract relation candidate was not emitted");
   require(result.relation_candidates.front().kind == "extract" &&
@@ -168,6 +239,8 @@ int main() {
     test_move_and_rename();
     test_content_and_local_rename();
     test_ambiguity_and_assertion();
+    test_synthetic_lineage_capability_boundary();
+    test_build_variant_identity_round_trip();
     test_producer_identity_round_trip();
     test_schema_hash();
     test_production_config_validation();

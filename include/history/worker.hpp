@@ -1,8 +1,9 @@
 #pragma once
 #include "history/catalog.hpp"
 #include "history/git_coordination.hpp"
-#include <filesystem>
+#include "history/revision_workspace.hpp"
 #include <chrono>
+#include <filesystem>
 #include <mutex>
 #include <nlohmann/json.hpp>
 namespace history {
@@ -12,6 +13,7 @@ struct WorkerOptions {
   std::uint32_t max_attempts{10};
   std::chrono::seconds extractor_timeout{1800};
   std::uint64_t max_manifest_bytes{256ULL * 1024ULL * 1024ULL};
+  std::shared_ptr<RevisionWorkspacePool> workspace_pool;
 };
 class BackgroundWorker {
 public:

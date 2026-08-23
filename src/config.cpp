@@ -32,16 +32,30 @@ ServiceConfig parse_service_config(const nlohmann::json &value) {
   if (!value.is_object())
     throw std::invalid_argument("service configuration must be an object");
   static const std::set<std::string> known = {
-      "schema_version",          "repository_id",
-      "catalog",                 "artifact_repository",
-      "source_repository",       "extractor",
-      "scratch_root",            "remote",
-      "listen_address",          "port",
-      "sync_seconds",            "lease_seconds",
-      "grace_seconds",           "worker_concurrency",
-      "max_task_attempts",       "git_timeout_seconds",
-      "extractor_timeout_seconds", "max_manifest_bytes",
-      "trusted_producers",         "otlp_endpoint",
+      "schema_version",
+      "repository_id",
+      "catalog",
+      "artifact_repository",
+      "source_repository",
+      "extractor",
+      "scratch_root",
+      "remote",
+      "listen_address",
+      "port",
+      "sync_seconds",
+      "lease_seconds",
+      "grace_seconds",
+      "worker_concurrency",
+      "max_task_attempts",
+      "git_timeout_seconds",
+      "extractor_timeout_seconds",
+      "max_manifest_bytes",
+      "workspace_mode",
+      "workspace_max_revisions",
+      "workspace_max_bytes",
+      "workspace_free_space_reserve_bytes",
+      "trusted_producers",
+      "otlp_endpoint",
       "otel_service_name"};
   for (const auto &[key, ignored] : value.items()) {
     (void)ignored;
@@ -52,23 +66,26 @@ ServiceConfig parse_service_config(const nlohmann::json &value) {
   ServiceConfig result;
   result.schema_version = value.value("schema_version", 0U);
   if (result.schema_version != kSchemaVersion)
-    throw std::invalid_argument("service configuration requires schema_version 1");
+    throw std::invalid_argument(
+        "service configuration requires schema_version 1");
   result.repository_id = value.value("repository_id", std::string{});
   if (!valid_name(result.repository_id))
-    throw std::invalid_argument("service config requires a valid repository_id");
+    throw std::invalid_argument(
+        "service config requires a valid repository_id");
   result.catalog = value.value("catalog", std::string{});
   result.artifact_repository =
       value.value("artifact_repository", std::string{});
   result.source_repository = value.value("source_repository", std::string{});
   result.extractor = value.value("extractor", std::string{});
-  result.scratch_root = value.value(
-      "scratch_root", (result.catalog / "scratch").string());
+  result.scratch_root =
+      value.value("scratch_root", (result.catalog / "scratch").string());
   if (result.catalog.empty() || result.artifact_repository.empty())
     throw std::invalid_argument(
         "service config requires catalog and artifact_repository");
   result.remote = value.value("remote", std::string{"origin"});
   if (!valid_name(result.remote) || result.remote.starts_with('-'))
-    throw std::invalid_argument("service config contains an invalid Git remote");
+    throw std::invalid_argument(
+        "service config contains an invalid Git remote");
   result.listen_address =
       value.value("listen_address", std::string{"127.0.0.1"});
   if (result.listen_address != "127.0.0.1")
@@ -86,11 +103,19 @@ ServiceConfig parse_service_config(const nlohmann::json &value) {
       bounded<std::uint32_t>(value, "max_task_attempts", 10, 1, 100);
   result.git_timeout_seconds =
       bounded<std::uint32_t>(value, "git_timeout_seconds", 300, 1, 3600);
-  result.extractor_timeout_seconds = bounded<std::uint32_t>(
-      value, "extractor_timeout_seconds", 1800, 1, 7200);
+  result.extractor_timeout_seconds =
+      bounded<std::uint32_t>(value, "extractor_timeout_seconds", 1800, 1, 7200);
   result.max_manifest_bytes = bounded<std::uint64_t>(
       value, "max_manifest_bytes", 256ULL * 1024ULL * 1024ULL,
       1024ULL * 1024ULL, 1024ULL * 1024ULL * 1024ULL);
+  result.workspace_mode = value.value("workspace_mode", std::string{"auto"});
+  if (result.workspace_mode != "auto")
+    throw std::invalid_argument("workspace_mode currently requires auto");
+  result.workspace_max_revisions =
+      bounded<std::uint32_t>(value, "workspace_max_revisions", 2, 1, 64);
+  result.workspace_max_bytes = value.value("workspace_max_bytes", 0ULL);
+  result.workspace_free_space_reserve_bytes = value.value(
+      "workspace_free_space_reserve_bytes", 5ULL * 1024ULL * 1024ULL * 1024ULL);
   if (value.contains("trusted_producers")) {
     if (!value.at("trusted_producers").is_array())
       throw std::invalid_argument("trusted_producers must be an array");

@@ -1,8 +1,11 @@
 # Element History Analyzer
 
-Repotraverse constructs C/C++ element lineage across Git revisions. Git remains the
-source of exact changed code; artifacts contain compact compiler-derived fingerprints,
-locations, lineage candidates, transition facts, and factual history statistics.
+Repotraverse captures compiler-derived evidence for C/C++ source elements across Git
+revisions. Git remains the source of exact changed code; artifacts contain compact
+fingerprints, locations, lineage candidates, transition facts, and factual history
+statistics. The service and capture infrastructure are implemented in v1. The
+multitarget, element-level historical aggregation described below is the next
+analytical milestone; the current pilot classifier is provisional.
 
 ## Windows VM build
 
@@ -37,11 +40,10 @@ Native mode passes `-march=native` through clang-cl. Its executable must not be
 copied to a VM that may expose fewer CPU features. Both modes use at most two
 build jobs by default; pass `-Jobs N` to override this.
 
-The build is offline: nlohmann/json v3.12.0 is vendored and CMake contains no
-dependency download path. SQLite 3.53.4 and xxHash 0.8.3 are also vendored for
-the local catalog and schema-fixed XXH3-128 identifiers. Upstream license and
-public-domain notices are retained under `third_party/` and installed with the
-tool.
+The build is offline: nlohmann/json v3.12.0, SQLite 3.53.4, xxHash 0.8.3,
+Tree-sitter 0.26.11, and the generated C 0.24.2/C++ 0.23.4 grammars are vendored.
+CMake contains no dependency download or parser-generation path. Upstream license and
+public-domain notices are retained under `third_party/` and installed with the tool.
 
 The core-only preset still uses clang-cl as the compiler but does not link the
 Clang libraries:
@@ -83,8 +85,10 @@ clang-extractor -p build \
 Persistent TU manifests do not contain function bodies, expressions, source
 snippets, or AST edit scripts. They contain logical elements, semantic variants,
 source locations, resolved dependency identifiers, and producer versions.
-Project paths are repository-relative. Identical elements and variants observed
-in several TUs or configurations are deduplicated when queried.
+Project paths are repository-relative. `file.history` deduplicates identical logical
+elements and variants across the endpoint manifests it queries while retaining their
+supporting configurations, contexts, and TUs. The experimental pilot classifier does
+not yet perform this revision-level aggregation.
 
 ## Import ARM build contexts
 
@@ -92,7 +96,7 @@ Capture actual compiler invocations in each configuration and convert them to
 JSONL. Each record has this shape:
 
 ```json
-{"configuration":"arm-debug","source_revision":"<commit>","translation_unit":"src/device.cpp","toolchain":"armclang6","arguments":["--cpu=Cortex-M4","-I","include","-DDEVICE=1"],"dependencies":["include/device.hpp"]}
+{"configuration":"arm-debug","build_variant":{"product":"device-a","target":"cortex-m4","configuration":"debug"},"source_revision":"<commit>","translation_unit":"src/device.cpp","toolchain":"armclang6","arguments":["--cpu=Cortex-M4","-I","include","-DDEVICE=1"],"dependencies":["include/device.hpp"]}
 ```
 
 `dependencies` (or `project_files`) is optional, but is needed to map a header
@@ -113,6 +117,17 @@ and `experiment pilot`. These commands intercept compiler calls made by trusted
 Make builds, measure extraction coverage, and optionally compare element-level
 stability with a developer file partition. See
 [`docs/v1-experiment.md`](docs/v1-experiment.md).
+
+`experiment pilot` is budgeted progressive analysis. Git screens the full selected
+history, Tree-sitter maps changed regions to provisional C/C++ sites directly from
+blobs, and only promoted paths reach Make capture and Clang. Required caps are declared
+under `pilot.budget`; exhausted caps preserve partial facts but prohibit a definitive
+classifier result.
+
+Build records preserve an explicit `(product, target, configuration)` variant. Its ID is
+derived from that tuple; equivalent semantic contexts can still share cached artifacts
+without losing their variant observations. The pilot classifier remains scoped to a
+build-variant/TU series and does not yet produce one repository-wide cross-TU conclusion.
 
 ## Plan Git history
 
@@ -155,6 +170,8 @@ still validated against the ref by Git.
 - `lineage.transition`: find automatic continuity candidates and transition facts.
 - `lineage.resolve`: apply accepted `same_element` and `not_same_element` assertions.
 - `element.history_stats`: summarize ordered snapshots without stability inference.
+- `element.explain`: explain one result from a v1 stability report using its historical
+  facts, score components, policy, and evidence gaps.
 - `analysis.coverage`: return extraction capabilities and gaps.
 
 Requests and responses are one-shot JSON. See
@@ -182,6 +199,10 @@ shared fact and coordination transport. VMs never connect to one another.
   "git_timeout_seconds": 300,
   "extractor_timeout_seconds": 1800,
   "max_manifest_bytes": 268435456,
+  "workspace_mode": "auto",
+  "workspace_max_revisions": 2,
+  "workspace_max_bytes": 10737418240,
+  "workspace_free_space_reserve_bytes": 5368709120,
   "trusted_producers": [],
   "extractor": "C:/repotraverse/bin/clang-extractor.exe",
   "scratch_root": "C:/repotraverse/worktrees",
@@ -199,8 +220,10 @@ The service creates its producer identity on first startup; do not include the
 local catalog directory in a VM image. SQLite is a disposable materialized
 index and is never committed. Immutable results use producer branches, while
 expiring claims use `repotraverse/claims/<prefix>/<task-id>` branches. The
-service worker owns task acquisition, heartbeat, bounded worktree cleanup,
-extraction, and publication.
+service worker owns task acquisition, heartbeat, disk-bounded revision workspace
+reuse, extraction, and publication. A complete dependency closure uses an exact-path
+sparse checkout. Missing closure evidence uses a temporary full checkout and removes it
+when its final lease ends.
 
 An LLM normally issues only a high-level query:
 
@@ -245,25 +268,52 @@ revision/TU/context endpoint. Equivalent named configurations share one task;
 different semantic contexts remain distinct. A cheap ordered reduction runs
 from compact manifests when both endpoints are available.
 
-## Current scope
+## Current implementation status
 
-The implemented slice covers project-owned functions and methods, records,
+The implemented slice covers project-owned functions and methods, declaration and
+definition sites, records,
 enums and enumerators, aliases, fields, function and record templates,
-specializations, and project macro definitions; external and
-TU-scoped internal identity, binding-normalized bodies, semantic variants,
-dependency fingerprints, unique exact-shape rename candidates, reviewed lineage
-assertions, first-parent/PR change units, file rename tracking, changed-line
-ranges, ARM context import, header-to-TU maps when dependencies are supplied,
-parallel automatic extraction, cross-TU/configuration deduplication, local HTTP
-queries, SQLite materialization, Git leases, and immutable producer results.
+specializations, and project macro definitions; external and TU-scoped internal
+identity, binding-normalized bodies, semantic variants, dependency fingerprints,
+conservative lineage, reviewed lineage assertions in the query API,
+first-parent/PR change units, file rename tracking, changed-line ranges, ARM
+context import, header-to-TU maps when dependencies are supplied, parallel
+automatic extraction, endpoint aggregation in `file.history`, local HTTP queries,
+SQLite materialization, Git leases, and immutable producer results.
+
+The experimental stability path currently builds series per explicit build variant and
+TU. It does not yet aggregate a logical element across TUs, consume reviewed lineage
+assertions, or represent an expected-but-missing target/context observation. Its
+classifications are suitable for bounded trials, not a repository-wide multitarget
+conclusion. The report retains historical facts separately, including semantic changes,
+file Git touches, lifetime revisions, lineage gaps, and provisional policy scores.
+Cross-variant semantic divergence is emitted as a separate fact and is not folded into
+the temporal classifier.
+
+The implemented observation model is:
+
+```text
+logical source element
+  revision
+    build variant (product, target, configuration)
+      semantic variant(s)
+        supporting compiler-context and TU observations
+```
+
+Logical elements and content-addressed semantic variants will be stored once. TUs will
+remain extraction provenance except for genuinely TU-local entities. Temporal evolution,
+cross-target divergence, and intra-variant context divergence will remain separate
+reported dimensions rather than being flattened into one score.
 
 Semantic scope expands through captured header-to-TU dependency maps and reports
-partial coverage when a build context lacks that map. Extract and inline changes
+partial coverage when a build context lacks that map. Header include fanout and
+upstream exposure remain separate from direct element changes; a dependent change is
+confirmed only by semantic fingerprints under the same context. Extract and inline changes
 are emitted as review-required relations; they never join historical lineage
 automatically. Submodules use separate repository identities and explicit
 parent-revision to child-revision mappings.
 
-## Production operation
+## Production-oriented service operation
 
 Configuration uses schema v1 and requires an explicit
 `repository_id`. Non-v1 catalogs and artifacts are intentionally unsupported;
@@ -276,3 +326,8 @@ Tasks use bounded child processes, adaptive lease heartbeats, exponential retry,
 and quarantine after the configured attempt limit. When `otlp_endpoint` is set,
 redacted logs and cumulative metrics are exported asynchronously using OTLP/HTTP
 JSON over HTTPS; exporter failure never blocks analysis.
+
+These controls harden deployment and coordination; they do not make the provisional
+multirevision classifier analytically complete. Promotion of historical conclusions
+requires the element/build-variant aggregation milestone and validation in the real
+build environment.

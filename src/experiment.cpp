@@ -2,14 +2,17 @@
 
 #include "history/build_import.hpp"
 #include "history/catalog.hpp"
+#include "history/change_evidence.hpp"
 #include "history/ir.hpp"
 #include "history/process.hpp"
+#include "history/progressive.hpp"
+#include "history/revision_workspace.hpp"
 #include "history/stability.hpp"
 
-#include <chrono>
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <exception>
 #include <fstream>
 #include <map>
@@ -31,11 +34,13 @@ nlohmann::json read_json(const std::filesystem::path &path) {
 
 std::filesystem::path canonical_directory(const nlohmann::json &manifest,
                                           const char *field) {
-  const auto path = std::filesystem::path(manifest.at(field).get<std::string>());
+  const auto path =
+      std::filesystem::path(manifest.at(field).get<std::string>());
   std::error_code error;
   const auto canonical = std::filesystem::weakly_canonical(path, error);
   if (error || !std::filesystem::is_directory(canonical))
-    throw std::runtime_error(std::string(field) + " must be an existing directory");
+    throw std::runtime_error(std::string(field) +
+                             " must be an existing directory");
   return canonical;
 }
 
@@ -43,10 +48,11 @@ void validate_manifest(const nlohmann::json &manifest) {
   if (!manifest.is_object() ||
       manifest.value("schema_version", 0U) != kSchemaVersion)
     throw std::runtime_error("experiment manifest requires schema_version 1");
-  for (const auto *field : {"repository", "revision", "repository_id", "output",
-                            "configurations"})
+  for (const auto *field :
+       {"repository", "revision", "repository_id", "output", "configurations"})
     if (!manifest.contains(field))
-      throw std::runtime_error(std::string("experiment manifest requires ") + field);
+      throw std::runtime_error(std::string("experiment manifest requires ") +
+                               field);
   if (!manifest.at("configurations").is_array() ||
       manifest.at("configurations").empty())
     throw std::runtime_error("experiment requires at least one configuration");
@@ -55,7 +61,8 @@ void validate_manifest(const nlohmann::json &manifest) {
 std::vector<nlohmann::json>
 captured_records(const std::filesystem::path &directory) {
   std::vector<std::filesystem::path> files;
-  for (const auto &entry : std::filesystem::recursive_directory_iterator(directory))
+  for (const auto &entry :
+       std::filesystem::recursive_directory_iterator(directory))
     if (entry.is_regular_file() && entry.path().extension() == ".json")
       files.push_back(entry.path());
   std::sort(files.begin(), files.end());
@@ -67,20 +74,52 @@ captured_records(const std::filesystem::path &directory) {
   return records;
 }
 
+MaterializationManifest
+captured_materialization(const std::filesystem::path &directory) {
+  std::set<std::string> files;
+  bool complete = true;
+  for (const auto &record : captured_records(directory)) {
+    const auto translation_unit =
+        record.value("translation_unit", std::string{});
+    if (!translation_unit.empty())
+      files.insert(translation_unit);
+    const auto project_files =
+        record.value("project_files", std::vector<std::string>{});
+    if (project_files.empty())
+      complete = false;
+    files.insert(project_files.begin(), project_files.end());
+  }
+  MaterializationManifest result;
+  result.files.assign(files.begin(), files.end());
+  result.closure_complete = complete && !result.files.empty();
+  if (!result.closure_complete)
+    result.evidence_gaps.push_back(
+        "captured project dependency closure is unavailable");
+  return result;
+}
+
+bool requires_repository_preparation(const nlohmann::json &manifest) {
+  return std::any_of(manifest.at("configurations").begin(),
+                     manifest.at("configurations").end(),
+                     [](const auto &configuration) {
+                       return configuration.contains("prepare_command") &&
+                              !configuration.at("prepare_command").empty();
+                     });
+}
+
 nlohmann::json capture(const nlohmann::json &manifest,
                        const std::filesystem::path &compiler_probe,
                        Catalog &catalog,
                        const std::filesystem::path &capture_root) {
   const auto repository = canonical_directory(manifest, "repository");
-  const auto revision = manifest.at("revision").get<std::string>();
-  const auto current_revision = run_process(
-      {"git", "-C", repository.string(), "rev-parse", "HEAD"});
+  auto revision = manifest.at("revision").get<std::string>();
+  const auto current_revision =
+      run_process({"git", "-C", repository.string(), "rev-parse", "HEAD"});
   const auto requested_revision = run_process(
       {"git", "-C", repository.string(), "rev-parse", revision + "^{commit}"});
   const auto trim = [](std::string value) {
-    while (!value.empty() &&
-           (value.back() == '\n' || value.back() == '\r' ||
-            value.back() == ' ' || value.back() == '\t'))
+    while (!value.empty() && (value.back() == '\n' || value.back() == '\r' ||
+                              value.back() == ' ' || value.back() == '\t'))
       value.pop_back();
     return value;
   };
@@ -88,6 +127,7 @@ nlohmann::json capture(const nlohmann::json &manifest,
       trim(current_revision.output) != trim(requested_revision.output))
     throw std::runtime_error(
         "capture repository is not checked out at requested revision");
+  revision = trim(requested_revision.output);
   nlohmann::json runs = nlohmann::json::array();
   std::size_t failed_runs = 0;
   for (const auto &configuration : manifest.at("configurations")) {
@@ -98,9 +138,10 @@ nlohmann::json capture(const nlohmann::json &manifest,
     const auto directory = capture_root / stable_hash(name);
     std::filesystem::create_directories(directory);
     ProcessOptions options;
-    auto relative_working_directory = std::filesystem::path(
-        configuration.value("working_directory", std::string{"."}))
-                                          .lexically_normal();
+    auto relative_working_directory =
+        std::filesystem::path(
+            configuration.value("working_directory", std::string{"."}))
+            .lexically_normal();
     if (relative_working_directory.is_absolute() ||
         (!relative_working_directory.empty() &&
          *relative_working_directory.begin() == ".."))
@@ -108,16 +149,26 @@ nlohmann::json capture(const nlohmann::json &manifest,
           "configuration working_directory must be repository-relative");
     options.working_directory = repository / relative_working_directory;
     if (!std::filesystem::is_directory(options.working_directory))
-      throw std::runtime_error("configuration working_directory does not exist");
-    options.timeout = std::chrono::seconds(
-        configuration.value("timeout_seconds", 1800U));
+      throw std::runtime_error(
+          "configuration working_directory does not exist");
+    options.timeout =
+        std::chrono::seconds(configuration.value("timeout_seconds", 1800U));
     options.max_output_bytes = 16ULL * 1024ULL * 1024ULL;
     options.environment = configuration.value(
         "environment", std::map<std::string, std::string>{});
     options.environment["REPOTRAVERSE_CAPTURE_DIRECTORY"] = directory.string();
-    options.environment["REPOTRAVERSE_CAPTURE_REPOSITORY"] = repository.string();
+    options.environment["REPOTRAVERSE_CAPTURE_REPOSITORY"] =
+        repository.string();
     options.environment["REPOTRAVERSE_CAPTURE_CONFIGURATION"] = name;
     options.environment["REPOTRAVERSE_CAPTURE_REVISION"] = revision;
+    const auto build_variant =
+        configuration.value("build_variant", nlohmann::json::object());
+    options.environment["REPOTRAVERSE_CAPTURE_PRODUCT"] =
+        build_variant.value("product", std::string{"unspecified"});
+    options.environment["REPOTRAVERSE_CAPTURE_TARGET"] =
+        build_variant.value("target", std::string{"unspecified"});
+    options.environment["REPOTRAVERSE_CAPTURE_BUILD_CONFIGURATION"] =
+        build_variant.value("configuration", name);
     options.environment["REPOTRAVERSE_CAPTURE_TOOLCHAIN"] = toolchain;
     if (configuration.contains("real_compiler"))
       options.environment["REPOTRAVERSE_REAL_COMPILER"] =
@@ -165,9 +216,10 @@ void prepare_generated_files(const nlohmann::json &manifest,
   for (const auto &configuration : manifest.at("configurations")) {
     if (!configuration.contains("prepare_command"))
       continue;
-    auto relative = std::filesystem::path(
-        configuration.value("working_directory", std::string{"."}))
-                        .lexically_normal();
+    auto relative =
+        std::filesystem::path(
+            configuration.value("working_directory", std::string{"."}))
+            .lexically_normal();
     if (relative.is_absolute() ||
         (!relative.empty() && *relative.begin() == ".."))
       throw std::runtime_error("invalid prepare working directory");
@@ -175,8 +227,8 @@ void prepare_generated_files(const nlohmann::json &manifest,
     options.working_directory = repository / relative;
     options.environment = configuration.value(
         "environment", std::map<std::string, std::string>{});
-    options.timeout = std::chrono::seconds(
-        configuration.value("timeout_seconds", 1800U));
+    options.timeout =
+        std::chrono::seconds(configuration.value("timeout_seconds", 1800U));
     options.max_output_bytes = 16ULL * 1024ULL * 1024ULL;
     const auto result = run_process(
         configuration.at("prepare_command").get<std::vector<std::string>>(),
@@ -190,8 +242,9 @@ void prepare_generated_files(const nlohmann::json &manifest,
 }
 
 std::filesystem::path prepare_output(const nlohmann::json &manifest) {
-  const auto output = std::filesystem::absolute(
-      manifest.at("output").get<std::string>()).lexically_normal();
+  const auto output =
+      std::filesystem::absolute(manifest.at("output").get<std::string>())
+          .lexically_normal();
   if (std::filesystem::exists(output))
     throw std::runtime_error("experiment output already exists: " +
                              output.string());
@@ -252,8 +305,8 @@ std::vector<std::string> changed_paths(const std::filesystem::path &repository,
                                        const std::string &before,
                                        const std::string &after,
                                        const std::string &filter = {}) {
-  std::vector<std::string> command = {
-      "git", "-C", repository.string(), "diff", "--name-only"};
+  std::vector<std::string> command = {"git", "-C", repository.string(), "diff",
+                                      "--name-only"};
   if (!filter.empty())
     command.push_back("--diff-filter=" + filter);
   command.insert(command.end(), {before, after});
@@ -279,8 +332,8 @@ bool path_pattern(std::string_view pattern, std::string_view path) {
         current[index] = previous[index] || current[index - 1];
     } else {
       for (std::size_t index = 1; index <= path.size(); ++index)
-        current[index] = previous[index - 1] &&
-                         (token == '?' || token == path[index - 1]);
+        current[index] =
+            previous[index - 1] && (token == '?' || token == path[index - 1]);
     }
     previous.swap(current);
   }
@@ -288,15 +341,14 @@ bool path_pattern(std::string_view pattern, std::string_view path) {
 }
 
 bool build_context_changed(const std::filesystem::path &repository,
-                           const std::string &before,
-                           const std::string &after,
+                           const std::string &before, const std::string &after,
                            const nlohmann::json &pilot) {
   for (const auto &path : changed_paths(repository, before, after, "ADR"))
     if (source_path(path))
       return true;
   const auto patterns = pilot.value(
       "build_files", std::vector<std::string>{"Makefile", "makefile", "*.mk",
-                                               "config", "toolchain"});
+                                              "config", "toolchain"});
   const auto changed = changed_paths(repository, before, after);
   for (const auto &path : changed)
     for (const auto &pattern : patterns)
@@ -311,6 +363,7 @@ void refresh_manifest_identity(TuManifest &manifest) {
       {"repository", manifest.repository_id},
       {"revision", manifest.source_revision},
       {"configuration", manifest.configuration},
+      {"build_variant", manifest.build_variant},
       {"tu", manifest.translation_unit},
       {"blob", manifest.source_blob},
       {"context", manifest.context_id},
@@ -328,26 +381,20 @@ struct ExtractionOutcome {
 };
 
 std::optional<std::string>
-semantic_cache_key(const CompileContext &context,
-                   const std::filesystem::path &repository,
-                   const std::string &revision, const std::string &source_blob,
+semantic_cache_key(const CompileContext &context, const RevisionTreeIndex &tree,
+                   const std::string &source_blob,
                    const std::string &extractor_identity) {
   if (context.project_files.empty() || extractor_identity.empty())
     return std::nullopt;
   nlohmann::json dependencies = nlohmann::json::object();
   for (const auto &path : context.project_files) {
-    const auto blob = run_process(
-        {"git", "-C", repository.string(), "rev-parse", revision + ":" + path});
-    if (blob.exit_code != 0)
+    const auto blob = tree.blob_at(path);
+    if (!blob)
       return std::nullopt;
-    auto values = lines(blob.output);
-    if (values.empty())
-      return std::nullopt;
-    dependencies[path] = values.front();
+    dependencies[path] = *blob;
   }
   return stable_hash(nlohmann::json({{"source_blob", source_blob},
                                      {"context_id", context.context_id},
-                                     {"configuration", context.configuration},
                                      {"dependencies", dependencies},
                                      {"extractor", extractor_identity}})
                          .dump());
@@ -358,19 +405,13 @@ ExtractionOutcome extract_context(
     const std::string &revision, const std::string &repository_id,
     const std::string &extractor, const nlohmann::json &experiment,
     const std::filesystem::path &output, const std::set<std::string> &changed,
-    const std::map<std::tuple<std::string, std::string, std::string>, TuManifest>
-        &previous_manifests) {
+    const RevisionTreeIndex &tree,
+    const std::map<std::tuple<std::string, std::string, std::string>,
+                   TuManifest> &previous_manifests) {
   ExtractionOutcome outcome;
-  const auto blob = run_process(
-      {"git", "-C", repository.string(), "rev-parse",
-       revision + ":" + context.translation_unit});
   std::string blob_id = "unresolved";
-  if (blob.exit_code == 0) {
-    blob_id = blob.output;
-    while (!blob_id.empty() &&
-           (blob_id.back() == '\n' || blob_id.back() == '\r'))
-      blob_id.pop_back();
-  }
+  if (const auto blob = tree.blob_at(context.translation_unit))
+    blob_id = *blob;
   const auto previous_key = std::make_tuple(
       context.configuration, context.translation_unit, context.context_id);
   bool invalidated = changed.contains(context.translation_unit);
@@ -388,6 +429,7 @@ ExtractionOutcome extract_context(
     auto reused = previous->second;
     reused.source_revision = revision;
     reused.source_blob = blob_id;
+    reused.build_variant = context.build_variant;
     refresh_manifest_identity(reused);
     outcome.state = context.coverage.status == "complete" &&
                             reused.coverage.status == "complete"
@@ -411,18 +453,20 @@ ExtractionOutcome extract_context(
                     {"diagnostic_fingerprint", ""}};
     return outcome;
   }
-  const auto cache_key = semantic_cache_key(
-      context, repository, revision, blob_id,
-      experiment.value("extractor_identity", std::string{}));
+  const auto cache_key =
+      semantic_cache_key(context, tree, blob_id,
+                         experiment.value("extractor_identity", std::string{}));
   if (cache_key && experiment.contains("artifact_cache")) {
     const auto cache_path =
-        std::filesystem::path(experiment.at("artifact_cache").get<std::string>()) /
+        std::filesystem::path(
+            experiment.at("artifact_cache").get<std::string>()) /
         ("tu-" + *cache_key + ".v1.json");
     if (std::filesystem::exists(cache_path)) {
       auto reused = read_json(cache_path).get<TuManifest>();
       reused.source_revision = revision;
       reused.source_blob = blob_id;
       reused.configuration = context.configuration;
+      reused.build_variant = context.build_variant;
       refresh_manifest_identity(reused);
       outcome.state = context.coverage.status == "complete" &&
                               reused.coverage.status == "complete"
@@ -430,10 +474,10 @@ ExtractionOutcome extract_context(
                           : "partial";
       outcome.elements = reused.elements.size();
       outcome.cache_hit = true;
-      persist(output / "manifests" /
-                  (context.configuration + "-" + context.context_id +
-                   ".v1.json"),
-              nlohmann::json(reused));
+      persist(
+          output / "manifests" /
+              (context.configuration + "-" + context.context_id + ".v1.json"),
+          nlohmann::json(reused));
       outcome.unit = {{"configuration", context.configuration},
                       {"translation_unit", context.translation_unit},
                       {"context_id", context.context_id},
@@ -450,21 +494,30 @@ ExtractionOutcome extract_context(
   }
   std::vector<std::string> command = {
       extractor,
-      "--source-revision", revision,
-      "--configuration", context.configuration,
-      "--context-fingerprint", context.context_id,
-      "--source-blob", blob_id,
-      "--project-root", repository.string(),
-      "--repository-id", repository_id,
-      (repository / context.translation_unit).string(), "--"};
+      "--source-revision",
+      revision,
+      "--configuration",
+      context.configuration,
+      "--build-variant",
+      nlohmann::json(context.build_variant).dump(),
+      "--context-fingerprint",
+      context.context_id,
+      "--source-blob",
+      blob_id,
+      "--project-root",
+      repository.string(),
+      "--repository-id",
+      repository_id,
+      (repository / context.translation_unit).string(),
+      "--"};
   command.insert(command.end(), context.frontend_arguments.begin(),
                  context.frontend_arguments.end());
   ProcessOptions options;
   options.working_directory = repository;
   options.timeout = std::chrono::seconds(
       experiment.value("extractor_timeout_seconds", 1800U));
-  options.max_output_bytes = experiment.value(
-      "max_manifest_bytes", 256ULL * 1024ULL * 1024ULL);
+  options.max_output_bytes =
+      experiment.value("max_manifest_bytes", 256ULL * 1024ULL * 1024ULL);
   const auto extracted = run_process(command, options);
   outcome.cpu_time_ms = extracted.cpu_time_ms;
   Coverage extractor_coverage;
@@ -492,10 +545,10 @@ ExtractionOutcome extract_context(
       outcome.failure = "invalid_manifest";
     }
     if (value && outcome.failure.empty()) {
-      persist(output / "manifests" /
-                  (context.configuration + "-" + context.context_id +
-                   ".v1.json"),
-              *value);
+      persist(
+          output / "manifests" /
+              (context.configuration + "-" + context.context_id + ".v1.json"),
+          *value);
       if (cache_key && experiment.contains("artifact_cache"))
         persist(std::filesystem::path(
                     experiment.at("artifact_cache").get<std::string>()) /
@@ -523,10 +576,10 @@ ExtractionOutcome extract_context(
 
 } // namespace
 
-nlohmann::json run_capture_experiment(
-    const std::filesystem::path &manifest_path,
-    const std::filesystem::path &compiler_probe) {
-  const auto manifest = read_json(manifest_path);
+nlohmann::json
+run_capture_experiment(const std::filesystem::path &manifest_path,
+                       const std::filesystem::path &compiler_probe) {
+  auto manifest = read_json(manifest_path);
   validate_manifest(manifest);
   const auto output = prepare_output(manifest);
   Catalog catalog(output / "catalog");
@@ -537,17 +590,17 @@ nlohmann::json run_capture_experiment(
   return result;
 }
 
-nlohmann::json run_head_experiment(
-    const std::filesystem::path &manifest_path,
-    const std::filesystem::path &compiler_probe) {
-  const auto manifest = read_json(manifest_path);
+nlohmann::json
+run_head_experiment(const std::filesystem::path &manifest_path,
+                    const std::filesystem::path &compiler_probe) {
+  auto manifest = read_json(manifest_path);
   validate_manifest(manifest);
   if (!manifest.contains("extractor"))
     throw std::runtime_error("HEAD experiment requires extractor");
   const auto repository = canonical_directory(manifest, "repository");
-  const auto revision = manifest.at("revision").get<std::string>();
-  const auto current = run_process(
-      {"git", "-C", repository.string(), "rev-parse", "HEAD"});
+  auto revision = manifest.at("revision").get<std::string>();
+  const auto current =
+      run_process({"git", "-C", repository.string(), "rev-parse", "HEAD"});
   const auto requested = run_process(
       {"git", "-C", repository.string(), "rev-parse", revision + "^{commit}"});
   git_success(current, "resolve current HEAD");
@@ -555,6 +608,8 @@ nlohmann::json run_head_experiment(
   if (lines(current.output) != lines(requested.output))
     throw std::runtime_error(
         "HEAD experiment repository is not checked out at requested revision");
+  revision = lines(requested.output).front();
+  manifest["revision"] = revision;
   const auto output = prepare_output(manifest);
   Catalog catalog(output / "catalog");
   nlohmann::json capture_result;
@@ -567,7 +622,8 @@ nlohmann::json run_head_experiment(
         {"reused", true},
         {"import", import_build_log(catalog, output / "capture", repository)}};
   } else {
-    capture_result = capture(manifest, compiler_probe, catalog, output / "capture");
+    capture_result =
+        capture(manifest, compiler_probe, catalog, output / "capture");
     capture_result["reused"] = false;
   }
   const auto repository_id = manifest.at("repository_id").get<std::string>();
@@ -589,8 +645,8 @@ nlohmann::json run_head_experiment(
   std::map<std::tuple<std::string, std::string, std::string>, TuManifest>
       previous_manifests;
   if (manifest.contains("previous_manifests")) {
-    const auto directory =
-        std::filesystem::path(manifest.at("previous_manifests").get<std::string>());
+    const auto directory = std::filesystem::path(
+        manifest.at("previous_manifests").get<std::string>());
     if (std::filesystem::exists(directory))
       for (const auto &entry : std::filesystem::directory_iterator(directory))
         if (entry.is_regular_file() && entry.path().extension() == ".json") {
@@ -603,18 +659,36 @@ nlohmann::json run_head_experiment(
   for (const auto &record : captured_records(output / "capture")) {
     const auto tu = record.at("translation_unit").get<std::string>();
     for (const auto &context : catalog.compile_contexts(tu, revision)) {
-      if (!unique_contexts.emplace(context.configuration, context.context_id).second)
+      if (!unique_contexts.emplace(context.configuration, context.context_id)
+               .second)
         continue;
       contexts.push_back(context);
     }
   }
+  if (manifest.contains("selected_files")) {
+    const auto selected =
+        manifest.at("selected_files").get<std::set<std::string>>();
+    contexts.erase(
+        std::remove_if(contexts.begin(), contexts.end(), [&](const auto &context) {
+          if (selected.contains(context.translation_unit))
+            return false;
+          return std::none_of(context.project_files.begin(),
+                              context.project_files.end(),
+                              [&](const auto &path) {
+                                return selected.contains(path);
+                              });
+        }),
+        contexts.end());
+  }
+  const RevisionTreeIndex tree(repository, revision);
   const auto started = std::chrono::steady_clock::now();
   std::vector<ExtractionOutcome> outcomes(contexts.size());
   std::atomic<std::size_t> next{};
   std::exception_ptr worker_error;
   std::mutex error_mutex;
-  const auto configured_concurrency = manifest.value(
-      "extractor_concurrency", std::max(1U, std::thread::hardware_concurrency()));
+  const auto configured_concurrency =
+      manifest.value("extractor_concurrency",
+                     std::max(1U, std::thread::hardware_concurrency()));
   const auto concurrency = std::max<std::size_t>(
       1, std::min<std::size_t>({configured_concurrency, contexts.size(), 64}));
   std::vector<std::jthread> workers;
@@ -628,7 +702,7 @@ nlohmann::json run_head_experiment(
         try {
           outcomes[index] = extract_context(
               contexts[index], repository, revision, repository_id, extractor,
-              extraction_options, output, changed, previous_manifests);
+              extraction_options, output, changed, tree, previous_manifests);
         } catch (...) {
           std::scoped_lock lock(error_mutex);
           if (!worker_error)
@@ -653,7 +727,8 @@ nlohmann::json run_head_experiment(
   const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now() - started);
   std::uint64_t artifact_bytes = 0;
-  for (const auto &entry : std::filesystem::recursive_directory_iterator(output))
+  for (const auto &entry :
+       std::filesystem::recursive_directory_iterator(output))
     if (entry.is_regular_file())
       artifact_bytes += entry.file_size();
   nlohmann::json result = {
@@ -661,7 +736,7 @@ nlohmann::json run_head_experiment(
       {"artifact_version", 1},
       {"revision", revision},
       {"capture", capture_result},
-      {"translation_unit_contexts", unique_contexts.size()},
+      {"translation_unit_contexts", contexts.size()},
       {"extractor_concurrency", concurrency},
       {"extractor_identity", extraction_options.at("extractor_identity")},
       {"states", states},
@@ -677,24 +752,35 @@ nlohmann::json run_head_experiment(
   return result;
 }
 
-nlohmann::json run_pilot_experiment(
-    const std::filesystem::path &manifest_path,
-    const std::filesystem::path &compiler_probe) {
+nlohmann::json
+run_pilot_experiment(const std::filesystem::path &manifest_path,
+                     const std::filesystem::path &compiler_probe) {
   const auto manifest = read_json(manifest_path);
   validate_manifest(manifest);
   const auto repository = canonical_directory(manifest, "repository");
-  const auto output = std::filesystem::absolute(
-      manifest.at("output").get<std::string>()).lexically_normal();
+  const auto output =
+      std::filesystem::absolute(manifest.at("output").get<std::string>())
+          .lexically_normal();
+  const auto pilot = manifest.value("pilot", nlohmann::json::object());
+  if (!pilot.contains("budget"))
+    throw std::runtime_error("pilot experiment requires explicit budget caps");
   std::filesystem::create_directories(output / "revisions");
   std::filesystem::create_directories(output / "worktrees");
+  WorkspaceLimits workspace_limits;
+  workspace_limits.max_revisions =
+      manifest.value("workspace_max_revisions", std::size_t{2});
+  workspace_limits.max_bytes =
+      manifest.value("workspace_max_bytes", std::uint64_t{});
+  workspace_limits.free_space_reserve_bytes = manifest.value(
+      "workspace_free_space_reserve_bytes", 5ULL * 1024ULL * 1024ULL * 1024ULL);
+  RevisionWorkspacePool workspace_pool(output / "worktrees", workspace_limits);
   std::vector<std::string> revisions;
-  const auto pilot = manifest.value("pilot", nlohmann::json::object());
   if (pilot.contains("revisions")) {
     revisions = pilot.at("revisions").get<std::vector<std::string>>();
   } else {
     const auto maximum = pilot.value("max_revisions", 20U);
-    const auto ref = pilot.value(
-        "ref", manifest.at("revision").get<std::string>());
+    const auto ref =
+        pilot.value("ref", manifest.at("revision").get<std::string>());
     const auto listed = run_process(
         {"git", "-C", repository.string(), "rev-list", "--first-parent",
          "--max-count=" + std::to_string(maximum), ref});
@@ -703,12 +789,29 @@ nlohmann::json run_pilot_experiment(
     std::reverse(revisions.begin(), revisions.end());
   }
   if (revisions.size() < 2)
-    throw std::runtime_error("pilot experiment requires at least two revisions");
+    throw std::runtime_error(
+        "pilot experiment requires at least two revisions");
+  const auto progressive = plan_progressive_screening(
+      {repository, output, revisions,
+       manifest.value("partition", nlohmann::json::object()),
+       pilot.at("budget")});
+  persist(output / "progressive-screening.v1.json", progressive);
+  const auto semantic_revisions =
+      progressive.at("promotion")
+          .at("semantic_revisions")
+          .get<std::vector<std::string>>();
+  const auto selected_files = progressive.at("promotion").at("paths");
   nlohmann::json revision_reports = nlohmann::json::array();
-  for (std::size_t index = 0; index < revisions.size(); ++index) {
+  for (std::size_t index = 0; index < semantic_revisions.size(); ++index) {
+    const auto &semantic_revision = semantic_revisions[index];
+    const auto original = std::find(revisions.begin(), revisions.end(),
+                                    semantic_revision);
+    const auto original_index = static_cast<std::size_t>(
+        std::distance(revisions.begin(), original));
     const auto revision_output =
         output / "revisions" /
-        (std::to_string(index) + "-" + revisions[index].substr(0, 12));
+        (std::to_string(original_index) + "-" +
+         semantic_revision.substr(0, 12));
     const auto report_path = revision_output / "head-report.v1.json";
     if (std::filesystem::exists(report_path)) {
       revision_reports.push_back(read_json(report_path));
@@ -721,66 +824,72 @@ nlohmann::json run_pilot_experiment(
               std::chrono::steady_clock::now().time_since_epoch().count());
       std::filesystem::rename(revision_output, quarantined);
     }
-    const auto worktree =
-        output / "worktrees" /
-        (std::to_string(index) + "-" + revisions[index].substr(0, 12));
-    if (std::filesystem::exists(worktree))
-      run_process({"git", "-C", repository.string(), "worktree", "remove",
-                   "--force", worktree.string()});
-    git_success(run_process({"git", "-C", repository.string(), "worktree", "add",
-                             "--detach", worktree.string(), revisions[index]}),
-                "materialize pilot revision");
-    struct WorktreeCleanup {
-      std::filesystem::path repository, worktree;
-      ~WorktreeCleanup() {
-        run_process({"git", "-C", repository.string(), "worktree", "remove",
-                     "--force", worktree.string()});
-        run_process({"git", "-C", repository.string(), "worktree", "prune"});
-      }
-    } cleanup{repository, worktree};
+    const bool capture_reused =
+        index > 0 &&
+        !build_context_changed(repository, semantic_revisions[index - 1],
+                               semantic_revision, pilot);
+    MaterializationManifest materialization;
+    if (capture_reused) {
+      const auto previous_output = std::filesystem::path(
+          revision_reports.back().at("output").get<std::string>());
+      materialization = captured_materialization(previous_output / "capture");
+    }
+    const bool require_full =
+        !capture_reused || requires_repository_preparation(manifest);
+    auto workspace = workspace_pool.acquire(repository, semantic_revision,
+                                            materialization, require_full);
+    const auto &worktree = workspace.path();
     auto child = manifest;
     child["repository"] = worktree.string();
-    child["revision"] = revisions[index];
+    child["revision"] = semantic_revision;
     child["output"] = revision_output.string();
+    child["selected_files"] = selected_files;
     child["artifact_cache"] = manifest.value(
         "artifact_cache", (output / "artifact-cache-v1").string());
     child.erase("pilot");
     child.erase("partition");
     child.erase("policy");
-    if (index > 0 &&
-        !build_context_changed(repository, revisions[index - 1],
-                               revisions[index], pilot)) {
-      const auto previous_output =
-          std::filesystem::path(
-              revision_reports.back().at("output").get<std::string>());
+    if (capture_reused) {
+      const auto previous_output = std::filesystem::path(
+          revision_reports.back().at("output").get<std::string>());
       child["capture_input"] = (previous_output / "capture").string();
-      child["previous_manifests"] =
-          (previous_output / "manifests").string();
-      child["changed_files"] =
-          changed_paths(repository, revisions[index - 1], revisions[index]);
+      child["previous_manifests"] = (previous_output / "manifests").string();
+      child["changed_files"] = changed_paths(
+          repository, semantic_revisions[index - 1], semantic_revision);
     }
     const auto child_manifest =
         output / ("revision-" + std::to_string(index) + ".v1.json");
     persist(child_manifest, child);
-    revision_reports.push_back(
-        run_head_experiment(child_manifest, compiler_probe));
+    auto revision_report = run_head_experiment(child_manifest, compiler_probe);
+    revision_report["workspace"] = {
+        {"mode", workspace.full() ? "temporary_full" : "sparse"},
+        {"closure_complete", materialization.closure_complete},
+        {"requested_files", materialization.files.size()}};
+    revision_reports.push_back(std::move(revision_report));
   }
 
-  std::map<std::pair<std::string, std::string>, nlohmann::json> series;
+  std::map<std::tuple<std::string, std::string, std::string>, nlohmann::json>
+      series;
   for (const auto &revision : revision_reports) {
     const auto manifest_directory =
         std::filesystem::path(revision.at("output").get<std::string>()) /
         "manifests";
     if (!std::filesystem::exists(manifest_directory))
       continue;
-    for (const auto &entry : std::filesystem::directory_iterator(manifest_directory)) {
+    for (const auto &entry :
+         std::filesystem::directory_iterator(manifest_directory)) {
       if (!entry.is_regular_file() || entry.path().extension() != ".json")
         continue;
       const auto value = read_json(entry.path());
       const auto tu = value.get<TuManifest>();
-      auto &item = series[{tu.configuration, tu.translation_unit}];
+      auto &item = series[{tu.build_variant.variant_id, tu.configuration,
+                           tu.translation_unit}];
       item["configuration"] = tu.configuration;
+      item["build_variant"] = tu.build_variant;
       item["translation_unit"] = tu.translation_unit;
+      item["evidence_tier"] = "semantic";
+      item["coverage_complete"] =
+          progressive.at("coverage").value("history_complete", false);
       if (!item.contains("bundles"))
         item["bundles"] = nlohmann::json::array();
       item["bundles"].push_back(entry.path().string());
@@ -793,11 +902,10 @@ nlohmann::json run_pilot_experiment(
 
   std::map<std::string, std::string> revision_authors;
   std::map<std::string, std::int64_t> revision_times;
+  std::map<std::string, std::vector<std::string>> revision_file_touches;
   for (const auto &revision : revisions) {
-    const auto author = run_process(
-        {"git", "-C", repository.string(), "show", "-s",
-         "--format=%ae%n%ct",
-         revision});
+    const auto author = run_process({"git", "-C", repository.string(), "show",
+                                     "-s", "--format=%ae%n%ct", revision});
     git_success(author, "read pilot revision author");
     auto values = lines(author.output);
     revision_authors[revision] =
@@ -805,23 +913,36 @@ nlohmann::json run_pilot_experiment(
     if (values.size() >= 2)
       revision_times[revision] = std::stoll(values[1]);
   }
+  for (std::size_t index = 1; index < revisions.size(); ++index)
+    revision_file_touches[revisions[index]] =
+        changed_paths(repository, revisions[index - 1], revisions[index]);
+  const auto change_evidence = summarize_change_evidence(
+      repository, revision_reports, pilot.at("budget"));
+  auto evidence_gaps = progressive.at("evidence_gaps");
+  for (const auto &gap : change_evidence.at("evidence_gaps"))
+    evidence_gaps.push_back(gap);
 
-  nlohmann::json result = {
-      {"schema_version", kSchemaVersion},
-      {"artifact_version", 1},
-      {"revisions", revisions},
-      {"revision_reports", revision_reports},
-      {"series", usable_series},
-      {"revision_authors", revision_authors},
-      {"revision_times", revision_times},
-      {"resume_granularity", "revision"},
-      {"output", output.generic_string()}};
+  nlohmann::json result = {{"schema_version", kSchemaVersion},
+                           {"artifact_version", 1},
+                           {"revisions", revisions},
+                           {"revision_reports", revision_reports},
+                           {"series", usable_series},
+                           {"revision_authors", revision_authors},
+                           {"revision_times", revision_times},
+                           {"revision_file_touches", revision_file_touches},
+                           {"progressive", progressive},
+                           {"change_evidence", change_evidence},
+                           {"evidence_gaps", evidence_gaps},
+                           {"budget_usage", progressive.at("budget_usage")},
+                           {"resume_granularity", "revision"},
+                           {"output", output.generic_string()}};
   if (manifest.contains("partition")) {
     nlohmann::json stability_manifest = {
         {"schema_version", kSchemaVersion},
         {"series", usable_series},
         {"revision_authors", revision_authors},
         {"revision_times", revision_times},
+        {"revision_file_touches", revision_file_touches},
         {"partition", manifest.at("partition")},
         {"report", (output / "stability-report.v1.json").string()}};
     if (manifest.contains("policy"))

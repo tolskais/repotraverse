@@ -12,11 +12,11 @@
 #include "history/experiment.hpp"
 #include "history/git_coordination.hpp"
 #include "history/http.hpp"
-#include "history/query.hpp"
 #include "history/process.hpp"
+#include "history/query.hpp"
 #include "history/stability.hpp"
-#include "history/worker.hpp"
 #include "history/telemetry.hpp"
+#include "history/worker.hpp"
 
 #ifdef _WIN32
 #define NOMINMAX
@@ -86,7 +86,7 @@ int run_service(const std::filesystem::path &config_path,
   history::set_default_process_timeout(
       std::chrono::seconds(config.git_timeout_seconds));
   history::Telemetry::instance().configure(config.otlp_endpoint,
-                                            config.otel_service_name);
+                                           config.otel_service_name);
   auto catalog = std::make_shared<history::Catalog>(config.catalog);
   history::CoordinationOptions coordination;
   coordination.repository = config.artifact_repository;
@@ -100,6 +100,13 @@ int run_service(const std::filesystem::path &config_path,
       std::make_shared<history::GitCoordinator>(*catalog, coordination);
   std::vector<std::shared_ptr<history::BackgroundWorker>> workers;
   if (!config.extractor.empty()) {
+    history::WorkspaceLimits workspace_limits;
+    workspace_limits.max_revisions = config.workspace_max_revisions;
+    workspace_limits.max_bytes = config.workspace_max_bytes;
+    workspace_limits.free_space_reserve_bytes =
+        config.workspace_free_space_reserve_bytes;
+    auto workspace_pool = std::make_shared<history::RevisionWorkspacePool>(
+        config.scratch_root, workspace_limits);
     history::WorkerOptions options;
     options.extractor = config.extractor;
     options.scratch_root = config.scratch_root;
@@ -109,6 +116,7 @@ int run_service(const std::filesystem::path &config_path,
     options.extractor_timeout =
         std::chrono::seconds(config.extractor_timeout_seconds);
     options.max_manifest_bytes = config.max_manifest_bytes;
+    options.workspace_pool = std::move(workspace_pool);
     for (std::uint32_t index = 0; index < config.worker_concurrency; ++index)
       workers.push_back(std::make_shared<history::BackgroundWorker>(
           *catalog, *coordinator, options));
@@ -117,61 +125,56 @@ int run_service(const std::filesystem::path &config_path,
                                 catalog, coordinator,
                                 workers.empty() ? nullptr : workers.front());
   std::vector<std::jthread> worker_threads;
-  std::jthread coordination_thread(
-      [catalog, coordinator, config, service_stop](std::stop_token thread_stop) {
-        while (!thread_stop.stop_requested() &&
-               !service_stop.stop_requested()) {
-          try {
-            const auto pending = catalog->pending_tasks();
-            const auto coordinated =
-                !pending.empty() ? coordinator->publish_tasks(pending)
-                                 : coordinator->sync();
-            const auto state = coordinated.value("state", std::string{});
-            history::Telemetry::instance().gauge(
-                "coordination.ready",
-                state == "published" || state == "synchronized" ? 1 : 0);
-          } catch (const std::exception &error) {
-            history::Telemetry::instance().gauge("coordination.ready", 0);
-            history::Telemetry::instance().increment(
-                "coordination.sync_failures");
-            history::Telemetry::instance().log(
-                "warning", "coordination.sync_failed",
-                {{"diagnostic_fingerprint", history::stable_hash(error.what())}});
-          }
-          for (std::uint32_t elapsed = 0;
-               elapsed < config.sync_seconds &&
-               !thread_stop.stop_requested() &&
-               !service_stop.stop_requested();
-               ++elapsed)
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-        }
-      });
+  std::jthread coordination_thread([catalog, coordinator, config,
+                                    service_stop](std::stop_token thread_stop) {
+    while (!thread_stop.stop_requested() && !service_stop.stop_requested()) {
+      try {
+        const auto pending = catalog->pending_tasks();
+        const auto coordinated = !pending.empty()
+                                     ? coordinator->publish_tasks(pending)
+                                     : coordinator->sync();
+        const auto state = coordinated.value("state", std::string{});
+        history::Telemetry::instance().gauge(
+            "coordination.ready",
+            state == "published" || state == "synchronized" ? 1 : 0);
+      } catch (const std::exception &error) {
+        history::Telemetry::instance().gauge("coordination.ready", 0);
+        history::Telemetry::instance().increment("coordination.sync_failures");
+        history::Telemetry::instance().log(
+            "warning", "coordination.sync_failed",
+            {{"diagnostic_fingerprint", history::stable_hash(error.what())}});
+      }
+      for (std::uint32_t elapsed = 0;
+           elapsed < config.sync_seconds && !thread_stop.stop_requested() &&
+           !service_stop.stop_requested();
+           ++elapsed)
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+  });
   for (const auto &worker : workers) {
-    worker_threads.emplace_back(
-        [worker, service_stop](std::stop_token thread_stop) {
-          while (!thread_stop.stop_requested() &&
-                 !service_stop.stop_requested()) {
-            const auto result = worker->run_once();
-            if (result.value("state", std::string{}) != "completed")
-              std::this_thread::sleep_for(std::chrono::seconds(1));
-          }
-        });
+    worker_threads.emplace_back([worker,
+                                 service_stop](std::stop_token thread_stop) {
+      while (!thread_stop.stop_requested() && !service_stop.stop_requested()) {
+        const auto result = worker->run_once();
+        if (result.value("state", std::string{}) != "completed")
+          std::this_thread::sleep_for(std::chrono::seconds(1));
+      }
+    });
   }
   history::HttpServerOptions server;
   server.address = config.listen_address;
   server.port = config.port;
   server.sync_seconds = config.sync_seconds;
   server.stop_token = service_stop;
-  history::run_http_server(
-      server, service,
-      {{"schema_version", history::kSchemaVersion},
-       {"ok", true},
-       {"tool_version", history::build::kToolVersion},
-       {"repository_id", config.repository_id},
-       {"producer_id", catalog->producer_id()},
-       {"snapshot_id", catalog->snapshot_id()},
-       {"listen_address", server.address},
-       {"port", server.port}});
+  history::run_http_server(server, service,
+                           {{"schema_version", history::kSchemaVersion},
+                            {"ok", true},
+                            {"tool_version", history::build::kToolVersion},
+                            {"repository_id", config.repository_id},
+                            {"producer_id", catalog->producer_id()},
+                            {"snapshot_id", catalog->snapshot_id()},
+                            {"listen_address", server.address},
+                            {"port", server.port}});
   return 0;
 }
 
@@ -234,8 +237,7 @@ int main(int argc, char **argv) {
     if (command == "experiment") {
       if (argc != 5 || std::string(argv[3]) != "--manifest" ||
           (std::string(argv[2]) != "capture" &&
-           std::string(argv[2]) != "head" &&
-           std::string(argv[2]) != "pilot" &&
+           std::string(argv[2]) != "head" && std::string(argv[2]) != "pilot" &&
            std::string(argv[2]) != "classify")) {
         usage();
         return 2;
@@ -247,13 +249,10 @@ int main(int argc, char **argv) {
 #endif
       const auto action = std::string(argv[2]);
       const auto result =
-          action == "capture"
-              ? history::run_capture_experiment(argv[4], probe)
-              : action == "head"
-                    ? history::run_head_experiment(argv[4], probe)
-                    : action == "pilot"
-                          ? history::run_pilot_experiment(argv[4], probe)
-                          : history::run_stability_experiment(argv[4]);
+          action == "capture" ? history::run_capture_experiment(argv[4], probe)
+          : action == "head"  ? history::run_head_experiment(argv[4], probe)
+          : action == "pilot" ? history::run_pilot_experiment(argv[4], probe)
+                              : history::run_stability_experiment(argv[4]);
       std::cout << history::canonical_json(result) << '\n';
       return 0;
     }
@@ -275,7 +274,8 @@ int main(int argc, char **argv) {
           {const_cast<wchar_t *>(L"Repotraverse"), service_entry},
           {nullptr, nullptr}};
       if (!StartServiceCtrlDispatcherW(table))
-        throw std::runtime_error("cannot connect to Windows Service Control Manager");
+        throw std::runtime_error(
+            "cannot connect to Windows Service Control Manager");
       return 0;
     }
 #endif
@@ -301,6 +301,7 @@ int main(int argc, char **argv) {
            {"shared_transport", "git_refs_v1"},
            {"identifier_model", "xxh3_128_v1"},
            {"history_planner", "first_parent_v1"},
+           {"progressive_history", "git_tree_sitter_clang_v1"},
            {"file_history", "parallel_endpoints_v1"},
            {"build_context_adapter", "armcc5_armclang6_v1"},
            {"background_worker", "git_task_batches_v1"},
@@ -308,8 +309,7 @@ int main(int argc, char **argv) {
            {"persistent_raw_source", false}});
       return 0;
     }
-    if (command == "identity" && argc == 5 &&
-        std::string(argv[2]) == "init" &&
+    if (command == "identity" && argc == 5 && std::string(argv[2]) == "init" &&
         std::string(argv[3]) == "--catalog") {
       history::Catalog catalog(argv[4]);
       std::cout << history::canonical_json(

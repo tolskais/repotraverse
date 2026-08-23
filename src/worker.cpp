@@ -2,10 +2,10 @@
 #include "history/ir.hpp"
 #include "history/process.hpp"
 #include "history/telemetry.hpp"
+#include <algorithm>
 #include <chrono>
 #include <stdexcept>
 #include <thread>
-#include <algorithm>
 namespace history {
 namespace {
 std::string trim(std::string value) {
@@ -23,13 +23,12 @@ bool safe_frontend_argument(const std::string &argument) {
       argument.starts_with("-fplugin") || argument.starts_with("-MJ"))
     return false;
   return argument == "-D" || argument == "-U" || argument == "-I" ||
-         argument == "-include" || argument == "-isystem" ||
-         argument == "-x" || argument == "--sysroot" ||
-         argument == "-fsigned-char" || argument == "-funsigned-char" ||
-         argument == "-fno-short-enums" || argument == "-fno-short-wchar" ||
-         argument == "-fexceptions" || argument == "-fno-exceptions" ||
-         argument == "-frtti" || argument == "-fno-rtti" ||
-         argument.starts_with("-D") ||
+         argument == "-include" || argument == "-isystem" || argument == "-x" ||
+         argument == "--sysroot" || argument == "-fsigned-char" ||
+         argument == "-funsigned-char" || argument == "-fno-short-enums" ||
+         argument == "-fno-short-wchar" || argument == "-fexceptions" ||
+         argument == "-fno-exceptions" || argument == "-frtti" ||
+         argument == "-fno-rtti" || argument.starts_with("-D") ||
          argument.starts_with("-U") || argument.starts_with("-I") ||
          argument.starts_with("-std=") || argument.starts_with("--target=") ||
          argument.starts_with("-m") || argument.front() != '-';
@@ -44,6 +43,12 @@ BackgroundWorker::BackgroundWorker(Catalog &c, GitCoordinator &g,
   git_ok(version, "identify extractor");
   extractor_identity_ = stable_hash(trim(version.output));
   std::filesystem::create_directories(options_.scratch_root);
+  if (!options_.workspace_pool) {
+    WorkspaceLimits limits;
+    limits.free_space_reserve_bytes = 0;
+    options_.workspace_pool =
+        std::make_shared<RevisionWorkspacePool>(options_.scratch_root, limits);
+  }
 }
 nlohmann::json BackgroundWorker::run_once() {
   std::scoped_lock worker_lock(mutex_);
@@ -85,34 +90,35 @@ nlohmann::json BackgroundWorker::run_once() {
     const auto relative = std::filesystem::path(tu).lexically_normal();
     if (relative.is_absolute() || relative.empty() || *relative.begin() == "..")
       throw std::runtime_error("translation unit must be repository-relative");
-    const auto worktree = options_.scratch_root / task_id;
-    run_process({"git", "-C", repository.string(), "worktree", "remove",
-                 "--force", worktree.string()});
-    git_ok(run_process({"git", "-C", repository.string(), "worktree", "add",
-                        "--detach", worktree.string(), revision}),
-           "materialize revision");
-    struct Cleanup {
-      std::filesystem::path repo, tree;
-      ~Cleanup() {
-        run_process({"git", "-C", repo.string(), "worktree", "remove",
-                     "--force", tree.string()});
-        run_process({"git", "-C", repo.string(), "worktree", "prune"});
-      }
-    } cleanup{repository, worktree};
-    const auto blob =
-        run_process({"git", "-C", repository.string(), "rev-parse",
-                     revision + ":" + relative.generic_string()});
-    git_ok(blob, "resolve source blob");
+    auto materialization = pending->value(
+        "materialization",
+        MaterializationManifest{{relative.generic_string()},
+                                false,
+                                {"legacy task has no dependency closure"}});
+    if (std::find(materialization.files.begin(), materialization.files.end(),
+                  relative.generic_string()) == materialization.files.end())
+      materialization.files.push_back(relative.generic_string());
+    auto workspace =
+        options_.workspace_pool->acquire(repository, revision, materialization,
+                                         !materialization.closure_complete);
+    const auto &worktree = workspace.path();
+    const RevisionTreeIndex tree(repository, revision);
+    const auto blob = tree.blob_at(relative.generic_string());
+    if (!blob)
+      throw std::runtime_error(
+          "resolve source blob: path is absent at revision");
     std::vector<std::string> command = {
         options_.extractor.string(),
         "--source-revision",
         revision,
         "--configuration",
         pending->at("configurations").dump(),
+        "--build-variant",
+        nlohmann::json(pending->value("build_variant", BuildVariant{})).dump(),
         "--context-fingerprint",
         pending->at("context_id").get<std::string>(),
         "--source-blob",
-        trim(blob.output),
+        *blob,
         "--project-root",
         worktree.string(),
         "--repository-id",
@@ -165,20 +171,20 @@ nlohmann::json BackgroundWorker::run_once() {
            manifest.repository_id != options_.repository_id))
         throw std::runtime_error("extractor manifest identity mismatch");
     } else
-      result = {{"schema_version", kSchemaVersion},
-                {"record_type", "tu_failure"},
-                {"source_revision", revision},
-                {"translation_unit", tu},
-                {"context_id", pending->at("context_id")},
-                {"coverage",
-                 {{"status", "partial"},
-                  {"gaps",
-                   {std::string(process.timed_out ? "extractor timed out; "
-                                                  : process.output_truncated
-                                                        ? "extractor output limit exceeded; "
-                                                        : "extractor failed; ") +
-                    "diagnostics fingerprint: " +
-                    stable_hash(process.error)}}}}};
+      result = {
+          {"schema_version", kSchemaVersion},
+          {"record_type", "tu_failure"},
+          {"source_revision", revision},
+          {"translation_unit", tu},
+          {"context_id", pending->at("context_id")},
+          {"coverage",
+           {{"status", "partial"},
+            {"gaps",
+             {std::string(process.timed_out ? "extractor timed out; "
+                          : process.output_truncated
+                              ? "extractor output limit exceeded; "
+                              : "extractor failed; ") +
+              "diagnostics fingerprint: " + stable_hash(process.error)}}}}};
     const auto completed = coordinator_.complete(task_id, result);
     if (completed.value("state", std::string{}) == "completed")
       catalog_.set_task_state(task_id, "completed");
@@ -189,10 +195,15 @@ nlohmann::json BackgroundWorker::run_once() {
     return completed;
   } catch (const std::exception &error) {
     Telemetry::instance().increment("worker.task_failures");
-    const auto failure = catalog_.fail_task(
-        task_id, stable_hash(error.what()), options_.max_attempts);
+    const auto failure = catalog_.fail_task(task_id, stable_hash(error.what()),
+                                            options_.max_attempts);
+    const std::string diagnostic = error.what();
+    const auto error_code = diagnostic.starts_with("disk_space_insufficient")
+                                ? "disk_space_insufficient"
+                                : "worker_failure";
     return {{"state", failure.at("state")},
             {"task_id", task_id},
+            {"error", {{"code", error_code}}},
             {"attempt_count", failure.at("attempt_count")},
             {"next_attempt_at", failure.at("next_attempt_at")},
             {"diagnostic_fingerprint", stable_hash(error.what())}};

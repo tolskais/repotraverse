@@ -1,8 +1,13 @@
-# Production operations
+# Production-oriented service operations
+
+These procedures cover deployment, coordination, and recovery of the v1 service. They
+do not assert that the experimental historical classifier is analytically complete.
+Multitarget element aggregation and validation in the real build environment remain
+promotion gates for historical conclusions.
 
 ## Deployment
 
-Use the generic Windows x64 package on the supported 8-vCPU, 32-GB VM. Extract
+Use the generic Windows x64 package on the intended 8-vCPU, 32-GB VM. Extract
 the ZIP to a versioned directory, copy `config/service.example.json` to
 an operations-owned location, and replace every path and repository ID. Keep
 the catalog and scratch roots on fast local storage; never place either in a VM
@@ -46,9 +51,15 @@ Durable local request state should be included in catalog backups.
   do not start them. Restore the remote and allow the coordination loop to retry.
 - Extractor timeout or output limit: the worker publishes a typed coverage gap
   or retries according to task state; increase a limit only after capacity review.
-- Disk pressure: stop scheduling, preserve the catalog, prune completed
-  worktrees and expired claim refs, and expand local storage. Never delete
-  producer result refs.
+- Disk pressure: the workspace pool evicts idle sparse revisions by byte and count
+  limits. Full capture workspaces are temporary. If a revision cannot fit while
+  preserving the configured reserve, it fails with `disk_space_insufficient`; reduce
+  concurrency, increase the workspace volume, or provide complete dependency capture.
+  Never delete producer result refs.
+- Progressive budget exhausted: retain `progressive-screening.v1.json` and the pilot
+  report. Git and syntax facts remain valid, but semantic history is partial and the
+  classifier must remain `insufficient_evidence`. Increase only the exhausted explicit
+  stratum, capture, dependency-depth, or induced-element cap on a new output directory.
 - Invalid producer record: remove the producer from the allowlist, preserve the
   offending ref, and investigate before reenrollment.
 - Telemetry outage: use `/v1/metrics` and host-captured structured stderr;

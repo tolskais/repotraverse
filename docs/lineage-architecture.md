@@ -2,10 +2,12 @@
 
 ## Responsibility boundary
 
-The tool exhaustively traces elements that Git cannot track. It reports continuity,
+The factual core reports compiler-observed source elements, conservative continuity,
 coarse content changes, source locations, coverage, and historical counts. It does not
-infer developer intent or classify code as stable or dynamic. An LLM reads selected Git
-changes and may store reviewed explanations separately.
+claim exhaustive coverage or infer developer intent. An LLM or developer may review
+lineage and store explanations separately. The optional v1 experiment applies an
+explicit policy to those facts to produce provisional `stable`, `variable`, or
+`insufficient_evidence` labels; those labels are not factual core records.
 
 ## Snapshot facts
 
@@ -21,8 +23,23 @@ Raw source and raw AST bodies are not persisted.
 Schema v1 separates a repository, build target, normalized compile context, logical
 element, semantic variant, element observation, and TU manifest. External
 logical elements are shared across TUs; internal-linkage elements include the
-TU in their identity. A revision/file view unions observations and variants
-while retaining the configurations, contexts, and TUs that support each fact.
+TU in their identity. `file.history` unions endpoint observations and variants while
+retaining the build variants, configurations, contexts, and TUs that support each fact.
+The current experimental pilot still reduces build-variant/TU series independently;
+revision-level cross-TU aggregation remains to be implemented.
+
+The intended history model stores a logical source element once, then indexes its
+observations by revision and explicit build variant. A build variant includes product,
+target, and configuration labels; its normalized semantic contexts retain the effective
+target triple, CPU, ABI, language mode, defines, include paths, preincludes, sysroot,
+toolchain profile, and feature flags. Equivalent TU observations support one semantic
+variant rather than creating duplicate elements. Different variants are retained and
+reported, never flattened merely because they share a source location.
+
+An element can therefore be temporally stable within each target while intentionally
+different across targets. Temporal evolution, cross-build-variant divergence, and
+intra-variant context divergence are separate facts. Successful semantic absence,
+unobserved context, and failed extraction are also separate states.
 
 ## History plans
 
@@ -52,7 +69,9 @@ pure move never becomes implementation churn.
 
 Matching proceeds conservatively: exact compiler identity first, then a unique exact
 interface/implementation/dependency shape. Multiple exact candidates remain ambiguous.
-False merges are considered worse than missed refactorings.
+In the current transition implementation, a unique exact-shape candidate is resolved
+automatically with `high` confidence; multiple matches are review-only. False merges are
+considered worse than missed refactorings.
 
 ## Managed assertions
 
@@ -63,10 +82,37 @@ managed knowledge but do not alter facts.
 
 ## History statistics
 
-`element.history_stats` unions resolved identities across ordered bundles and reports
-observed versions, observable transitions, content/interface/implementation changes,
-moves, renames, ambiguities, and the last content-change revision. These are factual
-inputs for LLM inference, not stability conclusions.
+`element.history_stats` unions resolved identities across explicitly ordered bundles
+and reports observed versions, observable transitions,
+content/interface/implementation/dependency changes, moves, renames, ambiguities,
+lifetime revisions, and the last content-change revision. Stability reports add
+revision-level owning-file Git touches when the pilot supplies them. The progressive
+screening artifact separately joins changed ranges to provisional syntax sites; those
+touches do not become canonical element changes until Clang confirms the promoted
+candidate. These are factual
+inputs for inference, not stability conclusions. The separate experiment classifier
+adds a documented weighting and threshold policy. It does not yet consume managed
+lineage assertions or normalized multitarget element states.
+
+## Progressive history analysis
+
+The public pilot does not send every file at every revision directly to Clang. Git first
+computes repository-wide file facts. Explicit per-stratum budgets select COMMON leakage,
+VARIABLE detail, stable-island candidates, high-impact headers, and deterministic control
+samples. Tree-sitter then parses selected C/C++ blobs and maps each hunk against the
+ranges from both historical endpoints. HEAD ranges are never projected backward.
+
+Tree-sitter sites have a `syntactic_candidate` identity kind. Names, enclosing syntax,
+interface shape, and structural shape may propose work or lineage, but cannot establish
+canonical identity or a stability label. Clang confirms promoted candidates in every
+available target/configuration observation. Git and syntax stages require neither a
+worktree nor a compile command.
+
+Element change facts separate intrinsic source/declaration changes from upstream
+exposure, confirmed induced semantic changes, and build-configuration changes. Include
+edges alone never increment direct element changes. Declaration and definition locations
+are observations of one Clang logical element. Bounded reverse dependency traversal
+retains causal element/path sets; exhausted budgets become coverage gaps.
 
 ## Federated catalogs and leases
 
@@ -84,10 +130,13 @@ corresponding `repotraverse/claims/` ref. Claims expire and are renewed or taken
 over using Git compare-and-swap updates. The result is pushed before the claim
 is marked complete, so a VM crash cannot hide a published fact.
 
-Each VM configures its own source-repository path; paths embedded by the
-scheduling VM are informational. Worktrees contain one checked-out revision and
-are deleted after extraction. A failed frontend run publishes a typed failure
-with a diagnostics fingerprint rather than compiler output.
+Each VM configures its own source-repository path; paths embedded by the scheduling VM
+are informational. Tasks carry a materialization manifest. A complete dependency
+closure uses a shared exact-path sparse revision workspace; the required path set grows
+monotonically as TUs arrive. Incomplete closure evidence upgrades the revision to a
+temporary full workspace. Byte/count limits, a free-space reserve, leases, and LRU
+eviction bound local disk use. A failed frontend run publishes a typed failure with a
+diagnostics fingerprint rather than compiler output.
 
 The local HTTP response may be partial. It identifies the materialized snapshot,
 observed coverage, and pending task ownership. Git synchronizes facts and leases;
@@ -97,10 +146,11 @@ History ordering does not serialize compiler work. Snapshot extraction is
 independent for each revision, translation unit, and normalized configuration
 context, so VMs claim those tasks in parallel. The query performs a cheap
 ordered reduction after both endpoints arrive. Exact logical identity produces
-facts; unique semantic-shape matches are emitted only as reviewable lineage
-candidates. The LLM or developer records accepted lineage separately.
+facts; a unique exact semantic-shape match currently produces a high-confidence
+automatic fact and candidate, while ambiguous matches remain reviewable. The LLM or
+developer can record accepted or rejected lineage separately.
 
-## Production boundaries
+## Production-oriented service boundaries
 
 Every logical identifier includes an explicit repository ID. Submodules retain
 independent histories; a mapping records which child revision is pinned by a

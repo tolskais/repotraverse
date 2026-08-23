@@ -5,12 +5,12 @@
 #include "history/file_history.hpp"
 #include "history/git_coordination.hpp"
 #include "history/history_plan.hpp"
-#include "history/worker.hpp"
 #include "history/telemetry.hpp"
+#include "history/worker.hpp"
 
-#include <fstream>
 #include <algorithm>
 #include <chrono>
+#include <fstream>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -78,6 +78,7 @@ EvidenceBundle MemoryFactStore::load(const std::filesystem::path &path) const {
       elements[item.element_id] = item;
     for (const auto &item : manifest.variants)
       variants[item.variant_id] = item;
+    std::map<std::string, ElementSnapshot> snapshots;
     for (const auto &observation : manifest.observations) {
       const auto &logical = elements.at(observation.element_id);
       const auto &variant = variants.at(observation.variant_id);
@@ -91,8 +92,13 @@ EvidenceBundle MemoryFactStore::load(const std::filesystem::path &path) const {
       snapshot.dependency_fingerprint = variant.dependency_fingerprint;
       snapshot.referenced_compiler_ids = variant.referenced_element_ids;
       snapshot.location = observation.location;
-      bundle.elements.push_back(std::move(snapshot));
+      const auto existing = snapshots.find(observation.element_id);
+      if (existing == snapshots.end() ||
+          observation.location.role == "definition")
+        snapshots[observation.element_id] = std::move(snapshot);
     }
+    for (auto &[id, snapshot] : snapshots)
+      bundle.elements.push_back(std::move(snapshot));
     return bundle;
   }
   return value.get<EvidenceBundle>();
@@ -123,8 +129,7 @@ nlohmann::json QueryService::submit(const nlohmann::json &request) const {
   const auto request_id = catalog_->create_request(request);
   if (const auto existing = catalog_->request_job(request_id);
       existing && (existing->value("state", std::string{}) == "complete" ||
-                   existing->value("state", std::string{}) == "cancelled"))
-  {
+                   existing->value("state", std::string{}) == "cancelled")) {
     auto response = *existing;
     response["schema_version"] = kSchemaVersion;
     response["ok"] = response.value("state", std::string{}) != "failed";
@@ -138,17 +143,15 @@ nlohmann::json QueryService::submit(const nlohmann::json &request) const {
                            .count();
   Telemetry::instance().increment("requests.submitted");
   Telemetry::instance().gauge("requests.last_latency_ms", elapsed);
-  const auto state = !response.value("ok", false)
-                         ? "failed"
-                         : response.value("result_status", std::string{}) ==
-                                   "complete"
-                               ? "complete"
-                               : "partial";
-  Telemetry::instance().span(
-      "request.plan", elapsed,
-      {{"request_id", request_id},
-       {"query", request.value("query", std::string{})},
-       {"state", state}});
+  const auto state =
+      !response.value("ok", false) ? "failed"
+      : response.value("result_status", std::string{}) == "complete"
+          ? "complete"
+          : "partial";
+  Telemetry::instance().span("request.plan", elapsed,
+                             {{"request_id", request_id},
+                              {"query", request.value("query", std::string{})},
+                              {"state", state}});
   const auto error = response.value("error", nlohmann::json::object());
   catalog_->update_request(
       request_id, state,
@@ -179,8 +182,8 @@ nlohmann::json QueryService::request_status(const std::string &request_id,
   return response;
 }
 
-nlohmann::json QueryService::cancel_request(
-    const std::string &request_id) const {
+nlohmann::json
+QueryService::cancel_request(const std::string &request_id) const {
   if (!catalog_ || !catalog_->request_job(request_id))
     return {{"ok", false}, {"error", {{"code", "not_found"}}}};
   catalog_->cancel_request_tasks(request_id);
@@ -227,9 +230,9 @@ nlohmann::json QueryService::execute(const nlohmann::json &request) const {
     if (query == "build.import") {
       if (!catalog_)
         throw std::runtime_error("build.import requires federated service");
-      const auto result = import_build_log(
-          *catalog_, path_parameter(params, "input"),
-          params.value("repository", std::string{}));
+      const auto result =
+          import_build_log(*catalog_, path_parameter(params, "input"),
+                           params.value("repository", std::string{}));
       return {{"schema_version", kSchemaVersion},
               {"ok", true},
               {"result_status", "complete"},
@@ -365,8 +368,8 @@ nlohmann::json QueryService::execute(const nlohmann::json &request) const {
         throw std::runtime_error("lineage review requires relation");
       auto relation = params.at("relation").get<LineageRelation>();
       static const std::set<std::string> kinds = {
-          "same", "renamed", "moved", "moved_and_renamed", "extract",
-          "inline", "split", "merge"};
+          "same",    "renamed", "moved", "moved_and_renamed",
+          "extract", "inline",  "split", "merge"};
       static const std::set<std::string> states = {"candidate", "accepted",
                                                    "rejected"};
       if (relation.repository_id.empty() || !kinds.contains(relation.kind) ||
@@ -416,7 +419,8 @@ nlohmann::json QueryService::execute(const nlohmann::json &request) const {
     }
     if (query == "submodule.map") {
       if (!catalog_)
-        throw std::runtime_error("submodule mapping requires federated service");
+        throw std::runtime_error(
+            "submodule mapping requires federated service");
       if (!params.contains("mapping"))
         throw std::runtime_error("submodule.map requires mapping");
       const auto mapping = params.at("mapping").get<SubmoduleRevision>();
@@ -431,7 +435,8 @@ nlohmann::json QueryService::execute(const nlohmann::json &request) const {
     }
     if (query == "submodule.revisions") {
       if (!catalog_)
-        throw std::runtime_error("submodule mapping requires federated service");
+        throw std::runtime_error(
+            "submodule mapping requires federated service");
       const auto parent = params.value("parent_repository_id", std::string{});
       const auto revision = params.value("parent_revision", std::string{});
       return {{"schema_version", kSchemaVersion},
@@ -441,16 +446,15 @@ nlohmann::json QueryService::execute(const nlohmann::json &request) const {
     }
     if (query == "semantic.dependents") {
       if (!catalog_)
-        throw std::runtime_error("semantic dependencies require federated service");
-      const auto repository_id =
-          params.value("repository_id", std::string{});
+        throw std::runtime_error(
+            "semantic dependencies require federated service");
+      const auto repository_id = params.value("repository_id", std::string{});
       const auto revision = params.value("revision", std::string{});
       if (!params.contains("element_ids") ||
           !params.at("element_ids").is_array())
         throw std::runtime_error("semantic.dependents requires element_ids");
-      const auto maximum =
-          std::clamp<std::size_t>(params.value("maximum", std::size_t{10000}),
-                                  1, 100000);
+      const auto maximum = std::clamp<std::size_t>(
+          params.value("maximum", std::size_t{10000}), 1, 100000);
       return {{"schema_version", kSchemaVersion},
               {"ok", true},
               {"result_status", "complete"},
@@ -479,11 +483,9 @@ nlohmann::json QueryService::execute(const nlohmann::json &request) const {
           if (relation->source_element_ids.size() == 1 &&
               relation->target_element_ids.size() == 1)
             assertions.push_back(
-                {relation->relation_id,
-                 relation->source_element_ids.front(),
-                 relation->target_element_ids.front(),
-                 "same_element", "accepted", relation->author,
-                 relation->reviewer});
+                {relation->relation_id, relation->source_element_ids.front(),
+                 relation->target_element_ids.front(), "same_element",
+                 "accepted", relation->author, relation->reviewer});
         }
       }
       auto result = trace_transition(before, after, assertions);
@@ -526,8 +528,10 @@ nlohmann::json QueryService::execute(const nlohmann::json &request) const {
       }
       struct Stats {
         std::set<std::size_t> versions, changed, interface_changed,
-            implementation_changed, renamed, moved, ambiguous;
-        std::string current_name, last_changed_revision;
+            implementation_changed, dependency_changed, renamed, moved,
+            ambiguous;
+        std::string current_name, added_revision, last_observed_revision,
+            last_changed_revision;
       };
       std::map<std::string, Stats> stats;
       for (std::size_t version = 0; version < bundles.size(); ++version)
@@ -535,6 +539,9 @@ nlohmann::json QueryService::execute(const nlohmann::json &request) const {
           auto &item = stats[find(find, element.compiler_id)];
           item.versions.insert(version);
           item.current_name = element.qualified_name;
+          if (item.added_revision.empty())
+            item.added_revision = bundles[version].source_revision;
+          item.last_observed_revision = bundles[version].source_revision;
         }
       for (std::size_t i = 0; i < transitions.size(); ++i)
         for (const auto &fact : transitions[i].facts) {
@@ -552,6 +559,8 @@ nlohmann::json QueryService::execute(const nlohmann::json &request) const {
             item.changed.insert(i);
             item.last_changed_revision = fact.after_revision;
           }
+          if (fact.dependencies_changed)
+            item.dependency_changed.insert(i);
           if (fact.continuity == "renamed" ||
               fact.continuity == "moved_and_renamed")
             item.renamed.insert(i);
@@ -573,9 +582,12 @@ nlohmann::json QueryService::execute(const nlohmann::json &request) const {
              {"interface_changed_transitions", item.interface_changed.size()},
              {"implementation_changed_transitions",
               item.implementation_changed.size()},
+             {"dependency_changed_transitions", item.dependency_changed.size()},
              {"renamed_transitions", item.renamed.size()},
              {"moved_transitions", item.moved.size()},
              {"ambiguous_transitions", item.ambiguous.size()},
+             {"added_revision", item.added_revision},
+             {"last_observed_revision", item.last_observed_revision},
              {"last_content_change_revision", item.last_changed_revision}});
       Coverage coverage;
       coverage.capabilities = {"element_lineage", "history_statistics"};
@@ -591,6 +603,85 @@ nlohmann::json QueryService::execute(const nlohmann::json &request) const {
           {"coverage", coverage},
           {"result",
            {{"bundle_count", bundles.size()}, {"elements", std::move(rows)}}}};
+    }
+    if (query == "element.explain") {
+      std::ifstream input(path_parameter(params, "report"));
+      if (!input)
+        throw std::runtime_error("cannot open stability report");
+      const auto report = nlohmann::json::parse(input);
+      if (report.value("schema_version", 0U) != kSchemaVersion ||
+          !report.contains("elements") || !report.at("elements").is_array())
+        throw std::runtime_error(
+            "element.explain requires a v1 stability report");
+      const auto wanted_id =
+          params.value("historical_element_id", std::string{});
+      const auto wanted_name = params.value("current_name", std::string{});
+      if (wanted_id.empty() && wanted_name.empty())
+        throw std::runtime_error(
+            "element.explain requires historical_element_id or current_name");
+      nlohmann::json matches = nlohmann::json::array();
+      for (const auto &element : report.at("elements"))
+        if ((!wanted_id.empty() && element.value("historical_element_id",
+                                                 std::string{}) == wanted_id) ||
+            (!wanted_name.empty() &&
+             element.value("current_name", std::string{}) == wanted_name))
+          matches.push_back(
+              {{"identity",
+                {{"historical_element_id",
+                  element.value("historical_element_id", std::string{})},
+                 {"current_name", element.value("current_name", std::string{})},
+                 {"kind", element.value("kind", std::string{})},
+                 {"path", element.value("path", std::string{})},
+                 {"configuration",
+                  element.value("configuration", std::string{})},
+                 {"build_variant",
+                  element.value("build_variant", BuildVariant{})}}},
+               {"classification",
+                element.value("classification", std::string{})},
+               {"historical_facts",
+                {{"observed_versions", element.value("observed_versions", 0U)},
+                 {"observable_transitions",
+                  element.value("observable_transitions", 0U)},
+                 {"implementation_changes",
+                  element.value("implementation_changes", 0U)},
+                 {"interface_changes", element.value("interface_changes", 0U)},
+                 {"dependency_changes",
+                  element.value("dependency_changes", 0U)},
+                 {"moves", element.value("moves", 0U)},
+                 {"renames", element.value("renames", 0U)},
+                 {"ambiguous_transitions",
+                  element.value("ambiguous_transitions", 0U)},
+                 {"change_units", element.value("change_units", 0U)},
+                 {"authors", element.value("authors", 0U)}}},
+               {"lifetime",
+                {{"added_at", element.value("added_at", std::string{})},
+                 {"last_observed_at",
+                  element.value("last_observed_at", std::string{})},
+                 {"removed_at", element.value("removed_at", std::string{})},
+                 {"last_semantic_change",
+                  element.value("last_semantic_change", std::string{})}}},
+               {"git_touches",
+                {{"file", element.value("file_git_touches", 0U)},
+                 {"direct", element.value("direct_git_touches", nullptr)},
+                 {"coverage",
+                  element.value("fact_coverage", nlohmann::json::object())}}},
+               {"score",
+                {{"volatility", element.value("volatility_score", 0.0)},
+                 {"implementation", element.value("implementation_score", 0.0)},
+                 {"interface",
+                  element.value("interface_instability_score", 0.0)},
+                 {"structural",
+                  element.value("structural_volatility_score", 0.0)}}},
+               {"evidence_gaps",
+                element.value("evidence_gaps", std::vector<std::string>{})}});
+      if (matches.empty())
+        throw std::runtime_error("historical element was not found in report");
+      return {{"schema_version", kSchemaVersion},
+              {"ok", true},
+              {"result_status", "complete"},
+              {"result",
+               {{"policy", report.value("policy", nlohmann::json::object())},
+                {"matches", std::move(matches)}}}};
     }
     if (query == "analysis.coverage") {
       const auto bundle = store_->load(path_parameter(params, "bundle"));

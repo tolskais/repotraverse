@@ -1,7 +1,7 @@
 #include "history/ir.hpp"
 
-#include <stdexcept>
 #include <set>
+#include <stdexcept>
 
 #include <xxhash.h>
 
@@ -121,6 +121,18 @@ void from_json(const nlohmann::json &v, BuildTarget &x) {
   optional(v, "float_abi", x.float_abi);
   optional(v, "abi", x.abi);
 }
+void to_json(nlohmann::json &v, const BuildVariant &x) {
+  v = {{"variant_id", x.variant_id},
+       {"product", x.product},
+       {"target", x.target},
+       {"configuration", x.configuration}};
+}
+void from_json(const nlohmann::json &v, BuildVariant &x) {
+  optional(v, "variant_id", x.variant_id);
+  optional(v, "product", x.product);
+  optional(v, "target", x.target);
+  optional(v, "configuration", x.configuration);
+}
 void to_json(nlohmann::json &v, const CompileContext &x) {
   v = {{"context_id", x.context_id},
        {"configuration", x.configuration},
@@ -128,6 +140,7 @@ void to_json(nlohmann::json &v, const CompileContext &x) {
        {"translation_unit", x.translation_unit},
        {"working_directory", x.working_directory},
        {"target", x.target},
+       {"build_variant", x.build_variant},
        {"frontend_arguments", x.frontend_arguments},
        {"project_files", x.project_files},
        {"toolchain", x.toolchain},
@@ -141,6 +154,7 @@ void from_json(const nlohmann::json &v, CompileContext &x) {
   optional(v, "translation_unit", x.translation_unit);
   optional(v, "working_directory", x.working_directory);
   optional(v, "target", x.target);
+  optional(v, "build_variant", x.build_variant);
   optional(v, "frontend_arguments", x.frontend_arguments);
   optional(v, "project_files", x.project_files);
   optional(v, "toolchain", x.toolchain);
@@ -213,6 +227,7 @@ void to_json(nlohmann::json &v, const TuManifest &x) {
        {"source_blob", x.source_blob},
        {"context_id", x.context_id},
        {"configuration", x.configuration},
+       {"build_variant", x.build_variant},
        {"extractor_fingerprint", x.extractor_fingerprint},
        {"producer", x.producer},
        {"coverage", x.coverage},
@@ -232,6 +247,7 @@ void from_json(const nlohmann::json &v, TuManifest &x) {
   optional(v, "source_blob", x.source_blob);
   optional(v, "context_id", x.context_id);
   optional(v, "configuration", x.configuration);
+  optional(v, "build_variant", x.build_variant);
   optional(v, "extractor_fingerprint", x.extractor_fingerprint);
   optional(v, "producer", x.producer);
   optional(v, "coverage", x.coverage);
@@ -298,7 +314,8 @@ bool validate_tu_manifest(const TuManifest &manifest, std::string &error) {
   if (manifest.schema_version != kSchemaVersion ||
       manifest.repository_id.empty() || manifest.source_revision.empty() ||
       manifest.translation_unit.empty() || manifest.context_id.empty() ||
-      manifest.configuration.empty() || manifest.extractor_fingerprint.empty()) {
+      manifest.configuration.empty() ||
+      manifest.extractor_fingerprint.empty()) {
     error = "manifest identity fields are incomplete";
     return false;
   }
@@ -307,9 +324,9 @@ bool validate_tu_manifest(const TuManifest &manifest, std::string &error) {
     const auto domain = element.linkage == "internal"
                             ? manifest.translation_unit
                             : std::string{};
-    const auto expected = stable_hash(
-        manifest.repository_id + "\n" + element.linkage + "\n" + domain +
-        "\n" + element.compiler_id);
+    const auto expected =
+        stable_hash(manifest.repository_id + "\n" + element.linkage + "\n" +
+                    domain + "\n" + element.compiler_id);
     if (element.repository_id != manifest.repository_id ||
         element.element_id != expected || element.kind.empty() ||
         !element_ids.insert(element.element_id).second) {
@@ -324,10 +341,10 @@ bool validate_tu_manifest(const TuManifest &manifest, std::string &error) {
       return false;
     }
   for (const auto &variant : manifest.variants) {
-    const auto expected = stable_hash(
-        variant.element_id + "\n" + variant.interface_fingerprint + "\n" +
-        variant.implementation_fingerprint + "\n" +
-        variant.dependency_fingerprint);
+    const auto expected =
+        stable_hash(variant.element_id + "\n" + variant.interface_fingerprint +
+                    "\n" + variant.implementation_fingerprint + "\n" +
+                    variant.dependency_fingerprint);
     if (!element_ids.contains(variant.element_id) ||
         variant.variant_id != expected ||
         !variant_ids.insert(variant.variant_id).second) {
@@ -354,6 +371,7 @@ bool validate_tu_manifest(const TuManifest &manifest, std::string &error) {
       {"repository", manifest.repository_id},
       {"revision", manifest.source_revision},
       {"configuration", manifest.configuration},
+      {"build_variant", manifest.build_variant},
       {"tu", manifest.translation_unit},
       {"blob", manifest.source_blob},
       {"context", manifest.context_id},

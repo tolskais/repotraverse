@@ -63,10 +63,15 @@ struct BuildTarget {
       float_abi, abi;
 };
 
+struct BuildVariant {
+  std::string variant_id, product, target, configuration;
+};
+
 struct CompileContext {
   std::string context_id, configuration, source_revision, translation_unit,
       working_directory;
   BuildTarget target;
+  BuildVariant build_variant;
   std::vector<std::string> frontend_arguments;
   std::vector<std::string> project_files;
   std::string toolchain, adapter_version;
@@ -100,6 +105,7 @@ struct TuManifest {
   std::string manifest_id, repository_id, source_revision, translation_unit,
       source_blob, context_id, configuration, extractor_fingerprint;
   ProducerIdentity producer;
+  BuildVariant build_variant;
   Coverage coverage;
   std::vector<LogicalElement> elements;
   std::vector<SemanticVariant> variants;
@@ -140,6 +146,8 @@ void to_json(nlohmann::json &, const EvidenceBundle &);
 void from_json(const nlohmann::json &, EvidenceBundle &);
 void to_json(nlohmann::json &, const BuildTarget &);
 void from_json(const nlohmann::json &, BuildTarget &);
+void to_json(nlohmann::json &, const BuildVariant &);
+void from_json(const nlohmann::json &, BuildVariant &);
 void to_json(nlohmann::json &, const CompileContext &);
 void from_json(const nlohmann::json &, CompileContext &);
 void to_json(nlohmann::json &, const LogicalElement &);

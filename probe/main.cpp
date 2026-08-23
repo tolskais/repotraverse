@@ -30,7 +30,8 @@ std::string environment(const char *name, bool required = false) {
   if (value && *value)
     return value;
   if (required)
-    throw std::runtime_error(std::string("missing environment variable: ") + name);
+    throw std::runtime_error(std::string("missing environment variable: ") +
+                             name);
   return {};
 }
 
@@ -48,8 +49,8 @@ std::string repository_path(const std::filesystem::path &path,
     return {};
   const auto absolute = path.is_absolute() ? path : cwd / path;
   std::error_code error;
-  auto relative = std::filesystem::relative(absolute.lexically_normal(), repository,
-                                             error);
+  auto relative =
+      std::filesystem::relative(absolute.lexically_normal(), repository, error);
   if (error || relative.empty() || *relative.begin() == "..")
     return {};
   return relative.generic_string();
@@ -73,7 +74,7 @@ dependencies(const std::filesystem::path &dependency_output,
   if (dependency_output.empty())
     return result;
   const auto path = dependency_output.is_absolute() ? dependency_output
-                                                     : cwd / dependency_output;
+                                                    : cwd / dependency_output;
   std::error_code error;
   const auto size = std::filesystem::file_size(path, error);
   if (error || size > 8ULL * 1024ULL * 1024ULL)
@@ -118,8 +119,8 @@ int main(int argc, char **argv) {
                 << history::build::kToolVersion << " artifact v1\n";
       return 0;
     }
-    const auto capture_directory =
-        std::filesystem::path(environment("REPOTRAVERSE_CAPTURE_DIRECTORY", true));
+    const auto capture_directory = std::filesystem::path(
+        environment("REPOTRAVERSE_CAPTURE_DIRECTORY", true));
     const auto repository = std::filesystem::weakly_canonical(
         environment("REPOTRAVERSE_CAPTURE_REPOSITORY", true));
     const auto cwd = std::filesystem::current_path();
@@ -132,7 +133,8 @@ int main(int argc, char **argv) {
       if (argument.starts_with('@'))
         response_files.push_back(argument.substr(1));
       if ((argument == "-o" || argument == "--output" ||
-           argument == "--depend") && index + 1 < argc) {
+           argument == "--depend") &&
+          index + 1 < argc) {
         const auto value = std::filesystem::path(argv[index + 1]);
         if (argument == "--depend")
           dependency_output = value;
@@ -165,7 +167,13 @@ int main(int argc, char **argv) {
     }
     nlohmann::json record = {
         {"schema_version", history::kSchemaVersion},
-        {"configuration", environment("REPOTRAVERSE_CAPTURE_CONFIGURATION", true)},
+        {"configuration",
+         environment("REPOTRAVERSE_CAPTURE_CONFIGURATION", true)},
+        {"build_variant",
+         {{"product", environment("REPOTRAVERSE_CAPTURE_PRODUCT")},
+          {"target", environment("REPOTRAVERSE_CAPTURE_TARGET")},
+          {"configuration",
+           environment("REPOTRAVERSE_CAPTURE_BUILD_CONFIGURATION")}}},
         {"source_revision", environment("REPOTRAVERSE_CAPTURE_REVISION", true)},
         {"toolchain", environment("REPOTRAVERSE_CAPTURE_TOOLCHAIN", true)},
         {"working_directory", repository_path(cwd, repository, cwd)},
@@ -178,7 +186,8 @@ int main(int argc, char **argv) {
          {{"LANG", environment("LANG")},
           {"ARMCC5INC", environment("ARMCC5INC")},
           {"ARMCC5LIB", environment("ARMCC5LIB")}}}};
-    const auto tick = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto tick =
+        std::chrono::steady_clock::now().time_since_epoch().count();
     std::random_device random;
 #ifdef _WIN32
     const auto process = _getpid();
@@ -201,8 +210,7 @@ int main(int argc, char **argv) {
       materialize(output, cwd);
       materialize(dependency_output, cwd);
     }
-    record["project_files"] =
-        dependencies(dependency_output, repository, cwd);
+    record["project_files"] = dependencies(dependency_output, repository, cwd);
     std::ofstream captured(destination, std::ios::binary);
     captured << record.dump() << '\n';
     captured.close();

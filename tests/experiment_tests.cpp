@@ -21,6 +21,29 @@ void write(const std::filesystem::path &path, std::string_view contents) {
   output << contents;
 }
 
+nlohmann::json progressive_budget() {
+  nlohmann::json result;
+  for (const auto &name : {"common_leakage", "variable_detail",
+                           "stable_island_candidates", "high_impact_headers",
+                           "controls"})
+    result[name] = {{"max_files", 20},
+                    {"max_syntax_transitions", 100},
+                    {"max_semantic_elements", 100}};
+  result["max_capture_revisions"] = 20;
+  result["max_dependency_depth"] = 2;
+  result["max_induced_elements_per_transition"] = 500;
+  return result;
+}
+
+nlohmann::json first_manifest(const std::filesystem::path &directory) {
+  for (const auto &entry : std::filesystem::directory_iterator(directory))
+    if (entry.is_regular_file() && entry.path().extension() == ".json") {
+      std::ifstream input(entry.path());
+      return nlohmann::json::parse(input);
+    }
+  throw std::runtime_error("manifest directory is empty");
+}
+
 history::EvidenceBundle bundle(std::string revision, bool changed) {
   history::EvidenceBundle result;
   result.source_revision = std::move(revision);
@@ -38,7 +61,8 @@ history::EvidenceBundle bundle(std::string revision, bool changed) {
   variable.compiler_id = "variable-id";
   variable.qualified_name = "variable_function";
   variable.location.path = "variable/variable.cpp";
-  variable.implementation_fingerprint = changed ? result.source_revision : "base";
+  variable.implementation_fingerprint =
+      changed ? result.source_revision : "base";
   result.elements = {stable, variable};
   return result;
 }
@@ -46,11 +70,11 @@ history::EvidenceBundle bundle(std::string revision, bool changed) {
 
 int main() {
   try {
-    const auto root = std::filesystem::temp_directory_path() /
-                      ("repotraverse-experiment-" +
-                       std::to_string(std::chrono::steady_clock::now()
-                                          .time_since_epoch()
-                                          .count()));
+    const auto root =
+        std::filesystem::temp_directory_path() /
+        ("repotraverse-experiment-" +
+         std::to_string(
+             std::chrono::steady_clock::now().time_since_epoch().count()));
     struct Cleanup {
       std::filesystem::path path;
       ~Cleanup() {
@@ -70,9 +94,10 @@ int main() {
                  "-c", "user.email=test@example.invalid", "add", "."})
                     .exit_code == 0,
             "cannot stage experiment repository");
-    require(history::run_process(
-                {GIT_PATH, "-C", repository.string(), "-c", "user.name=Test",
-                 "-c", "user.email=test@example.invalid", "commit", "-m", "base"})
+    require(history::run_process({GIT_PATH, "-C", repository.string(), "-c",
+                                  "user.name=Test", "-c",
+                                  "user.email=test@example.invalid", "commit",
+                                  "-m", "base"})
                     .exit_code == 0,
             "cannot commit experiment repository");
     auto revision = history::run_process(
@@ -90,13 +115,17 @@ int main() {
         {"artifact_cache", (root / "artifact-cache-v1").string()},
         {"extractor", EXTRACTOR_PATH},
         {"configurations",
-         nlohmann::json::array(
-             {{{"name", "debug"},
-               {"toolchain", "armclang6"},
-               {"real_compiler", FAKE_ARM_COMPILER_PATH},
-               {"command", {FAKE_MAKE_PATH}}}})}};
+         nlohmann::json::array({{{"name", "debug"},
+                                 {"build_variant",
+                                  {{"product", "fixture"},
+                                   {"target", "host"},
+                                   {"configuration", "debug"}}},
+                                 {"toolchain", "armclang6"},
+                                 {"real_compiler", FAKE_ARM_COMPILER_PATH},
+                                 {"command", {FAKE_MAKE_PATH}}}})}};
     write(experiment_manifest, experiment.dump());
-    const auto head = history::run_head_experiment(experiment_manifest, PROBE_PATH);
+    const auto head =
+        history::run_head_experiment(experiment_manifest, PROBE_PATH);
     require(head.at("translation_unit_contexts") == 1,
             "HEAD experiment did not extract captured TU");
     require(head.at("extracted_elements").get<std::uint64_t>() > 0,
@@ -104,25 +133,58 @@ int main() {
     require(head.at("states").value("complete", 0U) == 1,
             "captured dependency map did not produce complete coverage");
 
+    auto aliased_variant = experiment;
+    aliased_variant["output"] = (root / "alias-head-output").string();
+    aliased_variant["configurations"][0]["build_variant"]["product"] =
+        "fixture-alias";
+    const auto alias_manifest = root / "alias-head.json";
+    write(alias_manifest, aliased_variant.dump());
+    const auto alias_head =
+        history::run_head_experiment(alias_manifest, PROBE_PATH);
+    require(alias_head.at("cache_hits") == 1,
+            "equivalent build variant did not share semantic artifact cache");
+    require(first_manifest(std::filesystem::path(
+                               alias_head.at("output").get<std::string>()) /
+                           "manifests")
+                    .at("build_variant")
+                    .at("product") == "fixture-alias",
+            "cached semantic artifact lost its build-variant observation");
+
     for (int index = 1; index <= 3; ++index) {
       write(repository / "README.md", "documentation " + std::to_string(index));
       require(history::run_process(
                   {GIT_PATH, "-C", repository.string(), "add", "README.md"})
                       .exit_code == 0,
               "cannot stage pilot revision");
-      require(history::run_process(
-                  {GIT_PATH, "-C", repository.string(), "-c", "user.name=Test",
-                   "-c", "user.email=test@example.invalid", "commit", "-m",
-                   "documentation"})
+      require(history::run_process({GIT_PATH, "-C", repository.string(), "-c",
+                                    "user.name=Test", "-c",
+                                    "user.email=test@example.invalid", "commit",
+                                    "-m", "documentation"})
                       .exit_code == 0,
               "cannot commit pilot revision");
     }
     auto pilot_experiment = experiment;
     pilot_experiment["revision"] = "main";
     pilot_experiment["output"] = (root / "pilot-output").string();
-    pilot_experiment["pilot"] = {{"ref", "main"}, {"max_revisions", 4}};
+    pilot_experiment["pilot"] = {{"ref", "main"},
+                                  {"max_revisions", 4},
+                                  {"budget", progressive_budget()}};
     pilot_experiment["partition"] = {{"stable", {"src/*", "include/*"}},
-                                      {"variable", nlohmann::json::array()}};
+                                     {"variable", nlohmann::json::array()}};
+    auto missing_budget = pilot_experiment;
+    missing_budget["output"] = (root / "missing-budget-output").string();
+    missing_budget["pilot"].erase("budget");
+    const auto missing_budget_manifest = root / "missing-budget.json";
+    write(missing_budget_manifest, missing_budget.dump());
+    bool budget_rejected = false;
+    try {
+      (void)history::run_pilot_experiment(missing_budget_manifest, PROBE_PATH);
+    } catch (const std::exception &error) {
+      budget_rejected =
+          std::string(error.what()).find("explicit budget") !=
+          std::string::npos;
+    }
+    require(budget_rejected, "pilot accepted a manifest without explicit caps");
     const auto pilot_manifest = root / "pilot.json";
     write(pilot_manifest, pilot_experiment.dump());
     const auto pilot =
@@ -135,16 +197,45 @@ int main() {
     require(pilot.at("revision_reports").back().at("capture").at("reused") ==
                 true,
             "pilot did not reuse an unchanged build context");
-    require(pilot.at("revision_reports").front().at("units").front().at(
-                "cache_source") == "content_addressed",
+    require(pilot.at("revision_reports")
+                    .front()
+                    .at("units")
+                    .front()
+                    .at("cache_source") == "content_addressed",
             "pilot did not reuse the content-addressed HEAD artifact");
+    require(
+        pilot.at("revision_reports").front().at("workspace").at("mode") ==
+                "temporary_full" &&
+            pilot.at("revision_reports").back().at("workspace").at("mode") ==
+                "sparse",
+        "pilot did not switch from capture workspace to sparse extraction");
     require(pilot.at("stability").at("classifications").value("stable", 0U) > 0,
             "pilot did not classify unchanged elements as stable");
+
+    auto clean_experiment = experiment;
+    clean_experiment["revision"] = "main";
+    clean_experiment["output"] = (root / "clean-head-output").string();
+    clean_experiment.erase("artifact_cache");
+    const auto clean_manifest = root / "clean-head.json";
+    write(clean_manifest, clean_experiment.dump());
+    const auto clean = history::run_head_experiment(clean_manifest, PROBE_PATH);
+    const auto incremental_manifest =
+        first_manifest(std::filesystem::path(pilot.at("revision_reports")
+                                                 .back()
+                                                 .at("output")
+                                                 .get<std::string>()) /
+                       "manifests");
+    const auto full_manifest = first_manifest(
+        std::filesystem::path(clean.at("output").get<std::string>()) /
+        "manifests");
+    require(incremental_manifest == full_manifest,
+            "incremental and clean full manifests diverged");
 
     nlohmann::json paths = nlohmann::json::array();
     for (int index = 0; index < 4; ++index) {
       const auto path = root / ("bundle-" + std::to_string(index) + ".json");
-      write(path, nlohmann::json(bundle("r" + std::to_string(index), index > 0)).dump());
+      write(path, nlohmann::json(bundle("r" + std::to_string(index), index > 0))
+                      .dump());
       paths.push_back(path.string());
     }
     const auto stability_manifest = root / "stability.json";

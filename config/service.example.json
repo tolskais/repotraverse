@@ -17,6 +17,10 @@
   "git_timeout_seconds": 300,
   "extractor_timeout_seconds": 1800,
   "max_manifest_bytes": 268435456,
+  "workspace_mode": "auto",
+  "workspace_max_revisions": 2,
+  "workspace_max_bytes": 10737418240,
+  "workspace_free_space_reserve_bytes": 5368709120,
   "trusted_producers": [],
   "otlp_endpoint": "https://otel-collector.example.internal:4318",
   "otel_service_name": "repotraverse"

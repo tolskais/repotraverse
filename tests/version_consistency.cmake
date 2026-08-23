@@ -13,6 +13,7 @@ if(NOT schema EQUAL 1 OR NOT tool_version STREQUAL "1.0.0")
 endif()
 foreach(field query_transport federated_service shared_transport
               identifier_model history_planner file_history
+              progressive_history
               build_context_adapter background_worker lineage_model)
     string(JSON value GET "${status_json}" "${field}")
     if(NOT value MATCHES "_v1$")

@@ -37,6 +37,13 @@ int main() {
       require(kinds.contains(kind), "expected C++ element kind was not extracted");
     require(!manifest.macro_expansions.empty(),
             "macro expansion dependency was not extracted");
+    bool declaration = false, definition = false;
+    for (const auto &observation : manifest.observations) {
+      declaration = declaration || observation.location.role == "declaration";
+      definition = definition || observation.location.role == "definition";
+    }
+    require(declaration && definition,
+            "declaration and definition sites were not preserved separately");
     std::cout << "extractor entity tests passed\n";
     return 0;
   } catch (const std::exception &error) {

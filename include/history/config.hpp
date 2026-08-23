@@ -28,6 +28,11 @@ struct ServiceConfig {
   std::uint32_t git_timeout_seconds{300};
   std::uint32_t extractor_timeout_seconds{1800};
   std::uint64_t max_manifest_bytes{256ULL * 1024ULL * 1024ULL};
+  std::string workspace_mode{"auto"};
+  std::uint32_t workspace_max_revisions{2};
+  std::uint64_t workspace_max_bytes{};
+  std::uint64_t workspace_free_space_reserve_bytes{5ULL * 1024ULL * 1024ULL *
+                                                   1024ULL};
   std::set<std::string> trusted_producers;
   std::string otlp_endpoint;
   std::string otel_service_name{"repotraverse"};

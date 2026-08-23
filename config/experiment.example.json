@@ -14,22 +14,29 @@
   "workspace_free_space_reserve_bytes": 5368709120,
   "configurations": [
     {
-      "name": "product-a-cortex-r5-debug",
+      "name": "product-a-cortex-r5-clang-poc",
       "build_variant": {
         "product": "product-a",
         "target": "cortex-r5",
-        "configuration": "debug"
+        "configuration": "clang-poc"
       },
-      "toolchain": "armcc5",
+      "toolchain": "armclang6",
       "working_directory": ".",
-      "command": ["make.exe", "-j8", "objects"],
+      "command": [
+        "make.exe",
+        "CC={compiler_probe}",
+        "CXX={compiler_probe}",
+        "-j8",
+        "objects"
+      ],
       "prepare_command": ["make.exe", "-j8", "generated-headers"],
-      "compiler_variables": ["CC", "CXX", "ARMCC"],
+      "compiler_variables": ["CC", "CXX"],
+      "real_compiler": "C:/llvm-sdk/bin/clang.exe",
       "timeout_seconds": 3600,
       "environment": {
         "PRODUCT": "A",
         "TARGET": "cortex-r5",
-        "CONFIGURATION": "debug"
+        "CONFIGURATION": "clang-poc"
       }
     }
   ],
@@ -38,33 +45,33 @@
     "max_revisions": 20,
     "budget": {
       "common_leakage": {
-        "max_files": 100,
-        "max_syntax_transitions": 1000,
-        "max_semantic_elements": 100
-      },
-      "variable_detail": {
-        "max_files": 100,
-        "max_syntax_transitions": 1000,
-        "max_semantic_elements": 100
-      },
-      "stable_island_candidates": {
-        "max_files": 50,
-        "max_syntax_transitions": 250,
-        "max_semantic_elements": 50
-      },
-      "high_impact_headers": {
-        "max_files": 50,
-        "max_syntax_transitions": 500,
-        "max_semantic_elements": 50
-      },
-      "controls": {
         "max_files": 20,
         "max_syntax_transitions": 100,
         "max_semantic_elements": 20
       },
+      "variable_detail": {
+        "max_files": 20,
+        "max_syntax_transitions": 100,
+        "max_semantic_elements": 20
+      },
+      "stable_island_candidates": {
+        "max_files": 10,
+        "max_syntax_transitions": 50,
+        "max_semantic_elements": 10
+      },
+      "high_impact_headers": {
+        "max_files": 10,
+        "max_syntax_transitions": 50,
+        "max_semantic_elements": 10
+      },
+      "controls": {
+        "max_files": 10,
+        "max_syntax_transitions": 50,
+        "max_semantic_elements": 10
+      },
       "max_capture_revisions": 20,
       "max_dependency_depth": 2,
-      "max_induced_elements_per_transition": 500
+      "max_induced_elements_per_transition": 100
     }
   },
   "partition": {

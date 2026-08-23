@@ -16,3 +16,14 @@ int declared(int value);
 int declared(int value) { return value; }
 
 template struct Box<int>;
+
+struct AnonymousMembers {
+  union {
+    struct {
+      int first;
+    };
+    struct {
+      int second;
+    };
+  };
+};

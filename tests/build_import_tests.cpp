@@ -43,6 +43,15 @@ int main() {
                      {"dependencies", {"include/device.hpp"}}})
                     .dump()
              << '\n';
+    output << nlohmann::json({{"configuration", "debug"},
+                              {"schema_version", history::kSchemaVersion},
+                              {"source_revision", "revision-1"},
+                              {"translation_unit", ""},
+                              {"invocation_kind", "non_translation_unit"},
+                              {"toolchain", "armclang6"},
+                              {"arguments", {"-E", "-dM", "-"}}})
+                  .dump()
+           << '\n';
     output << nlohmann::json(
                   {{"configuration", "legacy"},
                    {"schema_version", history::kSchemaVersion},
@@ -58,6 +67,8 @@ int main() {
     history::Catalog catalog(root / "catalog");
     const auto imported = history::import_build_log(catalog, input);
     require(imported.at("records") == 3, "build records missing");
+    require(imported.at("ignored_non_translation_unit_records") == 1,
+            "compiler capability invocation was not ignored");
     require(imported.at("distinct_contexts") == 2,
             "equivalent configurations were not deduplicated");
     require(imported.at("partial_contexts") == 1,
@@ -77,8 +88,8 @@ int main() {
         std::filesystem::path(TEST_FIXTURE_DIR) / "armcc-capture.v1.jsonl");
     require(golden.at("records") == 2 && golden.at("partial_contexts") == 1,
             "golden ARM capture coverage was not preserved");
-    const auto golden_contexts = golden_catalog.compile_contexts(
-        "src/device.cpp", "0123456789abcdef");
+    const auto golden_contexts =
+        golden_catalog.compile_contexts("src/device.cpp", "0123456789abcdef");
     require(golden_contexts.size() == 2,
             "golden ARM configurations were not imported");
     const auto armcc = std::find_if(
@@ -86,8 +97,8 @@ int main() {
         [](const auto &context) { return context.toolchain == "armcc5"; });
     require(armcc != golden_contexts.end() &&
                 std::find(armcc->frontend_arguments.begin(),
-                          armcc->frontend_arguments.end(),
-                          "-mcpu=Cortex-R5") != armcc->frontend_arguments.end() &&
+                          armcc->frontend_arguments.end(), "-mcpu=Cortex-R5") !=
+                    armcc->frontend_arguments.end() &&
                 armcc->coverage.status == "partial",
             "golden ARMCC translation or APCS gap is missing");
     std::cout << "build import tests passed\n";

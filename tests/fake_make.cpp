@@ -4,18 +4,31 @@
 #include <fstream>
 #include <iostream>
 
-int main() {
-  const auto *compiler = std::getenv("CC");
-  if (!compiler || !*compiler) {
+int main(int argc, char **argv) {
+  std::string configured;
+  for (int index = 1; index < argc; ++index) {
+    const std::string argument = argv[index];
+    if (argument.starts_with("CC="))
+      configured = argument.substr(3);
+  }
+  const auto *compiler_environment = std::getenv("CC");
+  const auto compiler =
+      configured.empty()
+          ? std::string(compiler_environment ? compiler_environment : "")
+          : configured;
+  if (compiler.empty()) {
     std::cerr << "CC is not set\n";
     return 2;
   }
   std::ofstream response("flags.rsp");
   response << "-I include -DREPOTRAVERSE_EXPERIMENT=1\n";
   response.close();
-  const auto result = history::run_process(
-      {compiler, "@flags.rsp", "--depend=obj/sample.d", "-c",
-       "src/sample.cpp", "-o", "obj/sample.o"});
+  const auto capability = history::run_process({compiler, "-E", "-dM", "-"});
+  if (capability.exit_code != 0)
+    return capability.exit_code;
+  const auto result =
+      history::run_process({compiler, "@flags.rsp", "-Wp,-MD,obj/sample.d",
+                            "-c", "src/sample.cpp", "-o", "obj/sample.o"});
   std::cout << result.output;
   std::cerr << result.error;
   return result.exit_code;

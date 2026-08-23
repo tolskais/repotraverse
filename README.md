@@ -117,12 +117,20 @@ and `experiment pilot`. These commands intercept compiler calls made by trusted
 Make builds, measure extraction coverage, and optionally compare element-level
 stability with a developer file partition. See
 [`docs/v1-experiment.md`](docs/v1-experiment.md).
+Use [`docs/poc-runbook.md`](docs/poc-runbook.md) for the staged PoC procedure,
+measurements, and expansion gates.
 
 `experiment pilot` is budgeted progressive analysis. Git screens the full selected
 history, Tree-sitter maps changed regions to provisional C/C++ sites directly from
 blobs, and only promoted paths reach Make capture and Clang. Required caps are declared
 under `pilot.budget`; exhausted caps preserve partial facts but prohibit a definitive
-classifier result.
+classifier result. Exact repeated screening plans reuse their v1 artifact. Capture,
+head, and pilot commands print compact JSON summaries by default; `--full-output` emits
+the complete persisted report.
+
+The first PoC assumes a Clang-compatible build. Capture-only operation without a real
+compiler remains partial, and ARMCC/ARMCLANG qualification is deferred until the real
+vendor build environment and compatibility layer are available.
 
 Build records preserve an explicit `(product, target, configuration)` variant. Its ID is
 derived from that tuple; equivalent semantic contexts can still share cached artifacts
@@ -306,9 +314,9 @@ cross-target divergence, and intra-variant context divergence will remain separa
 reported dimensions rather than being flattened into one score.
 
 Semantic scope expands through captured header-to-TU dependency maps and reports
-partial coverage when a build context lacks that map. Header include fanout and
-upstream exposure remain separate from direct element changes; a dependent change is
-confirmed only by semantic fingerprints under the same context. Extract and inline changes
+partial coverage when a build context lacks that map. Textual header include-fanout
+screening and upstream exposure remain separate from direct element changes; a dependent
+change is confirmed only by semantic fingerprints under the same context. Extract and inline changes
 are emitted as review-required relations; they never join historical lineage
 automatically. Submodules use separate repository identities and explicit
 parent-revision to child-revision mappings.

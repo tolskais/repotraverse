@@ -328,9 +328,12 @@ bool validate_tu_manifest(const TuManifest &manifest, std::string &error) {
         stable_hash(manifest.repository_id + "\n" + element.linkage + "\n" +
                     domain + "\n" + element.compiler_id);
     if (element.repository_id != manifest.repository_id ||
-        element.element_id != expected || element.kind.empty() ||
-        !element_ids.insert(element.element_id).second) {
+        element.element_id != expected || element.kind.empty()) {
       error = "manifest contains an invalid logical element";
+      return false;
+    }
+    if (!element_ids.insert(element.element_id).second) {
+      error = "manifest contains a duplicate logical element id";
       return false;
     }
   }

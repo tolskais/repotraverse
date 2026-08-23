@@ -42,6 +42,36 @@ bool source_extension(const std::filesystem::path &path) {
          extension == ".S";
 }
 
+std::optional<std::filesystem::path>
+dependency_argument(const std::string &argument) {
+  for (const auto &prefix :
+       {std::string{"-MF"}, std::string{"--dependency-file="}})
+    if (argument.starts_with(prefix) && argument.size() > prefix.size())
+      return std::filesystem::path(argument.substr(prefix.size()));
+  if (argument.starts_with("-Wp,")) {
+    std::vector<std::string> parts;
+    std::string part;
+    for (const auto character : argument.substr(4)) {
+      if (character == ',') {
+        parts.push_back(std::move(part));
+        part.clear();
+      } else {
+        part.push_back(character);
+      }
+    }
+    parts.push_back(std::move(part));
+    for (std::size_t index = 0; index < parts.size(); ++index) {
+      if ((parts[index] == "-MD" || parts[index] == "-MMD" ||
+           parts[index] == "-MF") &&
+          index + 1 < parts.size() && !parts[index + 1].empty())
+        return std::filesystem::path(parts[index + 1]);
+      if (parts[index].starts_with("-MF") && parts[index].size() > 3)
+        return std::filesystem::path(parts[index].substr(3));
+    }
+  }
+  return std::nullopt;
+}
+
 std::string repository_path(const std::filesystem::path &path,
                             const std::filesystem::path &repository,
                             const std::filesystem::path &cwd) {
@@ -127,16 +157,19 @@ int main(int argc, char **argv) {
     std::vector<std::string> arguments;
     std::vector<std::string> response_files;
     std::filesystem::path source, output, dependency_output;
+    bool implicit_dependency_output = false;
     for (int index = 1; index < argc; ++index) {
       std::string argument = argv[index];
       arguments.push_back(argument);
       if (argument.starts_with('@'))
         response_files.push_back(argument.substr(1));
       if ((argument == "-o" || argument == "--output" ||
-           argument == "--depend") &&
+           argument == "--depend" || argument == "-MF" ||
+           argument == "--dependency-file") &&
           index + 1 < argc) {
         const auto value = std::filesystem::path(argv[index + 1]);
-        if (argument == "--depend")
+        if (argument == "--depend" || argument == "-MF" ||
+            argument == "--dependency-file")
           dependency_output = value;
         else
           output = value;
@@ -146,9 +179,18 @@ int main(int argc, char **argv) {
         dependency_output = argument.substr(9);
       } else if (argument.size() > 2 && argument.starts_with("-o")) {
         output = argument.substr(2);
+      } else if (const auto dependency = dependency_argument(argument)) {
+        dependency_output = *dependency;
+      } else if (argument == "-MD" || argument == "-MMD") {
+        implicit_dependency_output = true;
       } else if (!argument.starts_with('-') && source_extension(argument)) {
         source = argument;
       }
+    }
+    if (dependency_output.empty() && implicit_dependency_output &&
+        !output.empty()) {
+      dependency_output = output;
+      dependency_output.replace_extension(".d");
     }
     std::filesystem::create_directories(capture_directory);
     std::map<std::string, std::string> response_file_contents;
@@ -186,6 +228,10 @@ int main(int argc, char **argv) {
          {{"LANG", environment("LANG")},
           {"ARMCC5INC", environment("ARMCC5INC")},
           {"ARMCC5LIB", environment("ARMCC5LIB")}}}};
+    record["invocation_kind"] =
+        record.at("translation_unit").get<std::string>().empty()
+            ? "non_translation_unit"
+            : "translation_unit";
     const auto tick =
         std::chrono::steady_clock::now().time_since_epoch().count();
     std::random_device random;

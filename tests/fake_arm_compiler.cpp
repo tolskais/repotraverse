@@ -22,6 +22,8 @@ int main(int argc, char **argv) {
       output = argument.substr(9);
     else if (argument.starts_with("--depend="))
       dependency = argument.substr(9);
+    else if (argument.starts_with("-Wp,-MD,"))
+      dependency = argument.substr(8);
   }
   touch(output);
   touch(dependency,

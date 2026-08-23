@@ -36,9 +36,9 @@ std::string git(const std::filesystem::path &repository,
 
 nlohmann::json budget(std::size_t transitions = 20) {
   nlohmann::json result;
-  for (const auto &name : {"common_leakage", "variable_detail",
-                           "stable_island_candidates", "high_impact_headers",
-                           "controls"})
+  for (const auto &name :
+       {"common_leakage", "variable_detail", "stable_island_candidates",
+        "high_impact_headers", "controls"})
     result[name] = {{"max_files", 10},
                     {"max_syntax_transitions", transitions},
                     {"max_semantic_elements", 10}};
@@ -60,10 +60,8 @@ int main() {
             "valid C++ syntax was not parsed completely");
     bool definition = false, declaration = false, record = false;
     for (const auto &site : parsed.at("sites")) {
-      definition = definition ||
-                   site.at("kind") == "function_definition";
-      declaration = declaration ||
-                    site.at("kind") == "function_declaration";
+      definition = definition || site.at("kind") == "function_definition";
+      declaration = declaration || site.at("kind") == "function_declaration";
       record = record || site.at("kind") == "record";
       require(site.at("identity_kind") == "syntactic_candidate",
               "syntax site was presented as canonical identity");
@@ -118,7 +116,9 @@ int main() {
             "selected source transitions were not syntax-mapped");
     require(!result.at("promotion").at("elements").empty(),
             "changed symbols were not promoted");
-    require(result.at("promotion").at("paths").get<std::set<std::string>>()
+    require(result.at("promotion")
+                .at("paths")
+                .get<std::set<std::string>>()
                 .contains("src/variable.cpp"),
             "variable source was not promoted");
     require(!std::filesystem::exists(options.output / "worktrees") &&
@@ -128,11 +128,15 @@ int main() {
             "identical endpoint blobs were reparsed instead of reused");
     std::set<std::string> promoted_ids;
     for (const auto &candidate : result.at("promotion").at("elements"))
-      require(promoted_ids
-                  .insert(candidate.at("syntactic_symbol_id")
-                              .get<std::string>())
-                  .second,
-              "one syntax site was duplicated across promotion strata");
+      require(
+          promoted_ids
+              .insert(candidate.at("syntactic_symbol_id").get<std::string>())
+              .second,
+          "one syntax site was duplicated across promotion strata");
+
+    const auto cached = history::plan_progressive_screening(options);
+    require(cached.at("budget_usage").value("screening_plan_cache_hit", false),
+            "an identical screening plan repeated Git history work");
 
     auto capped = options;
     capped.budget = budget(0);
@@ -141,9 +145,10 @@ int main() {
                 !partial.at("promotion").at("elements").empty() &&
                 !partial.at("evidence_gaps").empty(),
             "syntax cap exhaustion was not preserved as partial evidence");
-    require(partial.at("budget_usage")
-                    .value("persistent_syntax_cache_hits", 0U) > 0,
-            "a repeated screening run did not reuse persisted syntax facts");
+    require(
+        partial.at("budget_usage").value("persistent_syntax_cache_hits", 0U) >
+            0,
+        "a repeated screening run did not reuse persisted syntax facts");
 
     bool rejected = false;
     try {

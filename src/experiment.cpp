@@ -81,8 +81,9 @@ captured_materialization(const std::filesystem::path &directory) {
   for (const auto &record : captured_records(directory)) {
     const auto translation_unit =
         record.value("translation_unit", std::string{});
-    if (!translation_unit.empty())
-      files.insert(translation_unit);
+    if (translation_unit.empty())
+      continue;
+    files.insert(translation_unit);
     const auto project_files =
         record.value("project_files", std::vector<std::string>{});
     if (project_files.empty())
@@ -185,8 +186,16 @@ nlohmann::json capture(const nlohmann::json &manifest,
         throw std::runtime_error("invalid compiler variable name");
       options.environment[variable] = compiler_probe.string();
     }
-    const auto command =
-        configuration.at("command").get<std::vector<std::string>>();
+    auto command = configuration.at("command").get<std::vector<std::string>>();
+    for (auto &argument : command) {
+      constexpr std::string_view placeholder = "{compiler_probe}";
+      for (std::size_t position = 0;
+           (position = argument.find(placeholder, position)) !=
+           std::string::npos;) {
+        argument.replace(position, placeholder.size(), compiler_probe.string());
+        position += compiler_probe.string().size();
+      }
+    }
     const auto started = std::chrono::steady_clock::now();
     const auto process = run_process(command, options);
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -373,7 +382,7 @@ void refresh_manifest_identity(TuManifest &manifest) {
 }
 
 struct ExtractionOutcome {
-  std::string state{"failed"}, failure;
+  std::string state{"failed"}, failure, failure_detail;
   std::size_t elements{};
   std::uint64_t cpu_time_ms{};
   bool cache_hit{};
@@ -541,8 +550,12 @@ ExtractionOutcome extract_context(
                               tu_manifest.coverage.status == "complete"
                           ? "complete"
                           : "partial";
+    } catch (const std::exception &error) {
+      outcome.failure = "invalid_manifest";
+      outcome.failure_detail = error.what();
     } catch (...) {
       outcome.failure = "invalid_manifest";
+      outcome.failure_detail = "unknown manifest validation error";
     }
     if (value && outcome.failure.empty()) {
       persist(
@@ -565,6 +578,7 @@ ExtractionOutcome extract_context(
                   {"context_id", context.context_id},
                   {"state", outcome.state},
                   {"failure", outcome.failure},
+                  {"failure_detail", outcome.failure_detail},
                   {"cache_hit", false},
                   {"cache_source", ""},
                   {"elements", outcome.elements},
@@ -669,15 +683,16 @@ run_head_experiment(const std::filesystem::path &manifest_path,
     const auto selected =
         manifest.at("selected_files").get<std::set<std::string>>();
     contexts.erase(
-        std::remove_if(contexts.begin(), contexts.end(), [&](const auto &context) {
-          if (selected.contains(context.translation_unit))
-            return false;
-          return std::none_of(context.project_files.begin(),
-                              context.project_files.end(),
-                              [&](const auto &path) {
-                                return selected.contains(path);
-                              });
-        }),
+        std::remove_if(contexts.begin(), contexts.end(),
+                       [&](const auto &context) {
+                         if (selected.contains(context.translation_unit))
+                           return false;
+                         return std::none_of(context.project_files.begin(),
+                                             context.project_files.end(),
+                                             [&](const auto &path) {
+                                               return selected.contains(path);
+                                             });
+                       }),
         contexts.end());
   }
   const RevisionTreeIndex tree(repository, revision);
@@ -796,22 +811,20 @@ run_pilot_experiment(const std::filesystem::path &manifest_path,
        manifest.value("partition", nlohmann::json::object()),
        pilot.at("budget")});
   persist(output / "progressive-screening.v1.json", progressive);
-  const auto semantic_revisions =
-      progressive.at("promotion")
-          .at("semantic_revisions")
-          .get<std::vector<std::string>>();
+  const auto semantic_revisions = progressive.at("promotion")
+                                      .at("semantic_revisions")
+                                      .get<std::vector<std::string>>();
   const auto selected_files = progressive.at("promotion").at("paths");
   nlohmann::json revision_reports = nlohmann::json::array();
   for (std::size_t index = 0; index < semantic_revisions.size(); ++index) {
     const auto &semantic_revision = semantic_revisions[index];
-    const auto original = std::find(revisions.begin(), revisions.end(),
-                                    semantic_revision);
-    const auto original_index = static_cast<std::size_t>(
-        std::distance(revisions.begin(), original));
-    const auto revision_output =
-        output / "revisions" /
-        (std::to_string(original_index) + "-" +
-         semantic_revision.substr(0, 12));
+    const auto original =
+        std::find(revisions.begin(), revisions.end(), semantic_revision);
+    const auto original_index =
+        static_cast<std::size_t>(std::distance(revisions.begin(), original));
+    const auto revision_output = output / "revisions" /
+                                 (std::to_string(original_index) + "-" +
+                                  semantic_revision.substr(0, 12));
     const auto report_path = revision_output / "head-report.v1.json";
     if (std::filesystem::exists(report_path)) {
       revision_reports.push_back(read_json(report_path));
@@ -922,6 +935,19 @@ run_pilot_experiment(const std::filesystem::path &manifest_path,
   for (const auto &gap : change_evidence.at("evidence_gaps"))
     evidence_gaps.push_back(gap);
 
+  const nlohmann::json progressive_summary = {
+      {"artifact", (output / "progressive-screening.v1.json").generic_string()},
+      {"screening_identity",
+       progressive.value("screening_identity", std::string{})},
+      {"screened_files", progressive.at("screening").at("files").size()},
+      {"syntax_transitions", progressive.at("syntax").at("transitions").size()},
+      {"promoted_elements", progressive.at("promotion").at("elements").size()},
+      {"paths", progressive.at("promotion").at("paths")},
+      {"semantic_revisions",
+       progressive.at("promotion").at("semantic_revisions")},
+      {"coverage", progressive.at("coverage")},
+      {"evidence_gaps", progressive.at("evidence_gaps")}};
+
   nlohmann::json result = {{"schema_version", kSchemaVersion},
                            {"artifact_version", 1},
                            {"revisions", revisions},
@@ -930,7 +956,7 @@ run_pilot_experiment(const std::filesystem::path &manifest_path,
                            {"revision_authors", revision_authors},
                            {"revision_times", revision_times},
                            {"revision_file_touches", revision_file_touches},
-                           {"progressive", progressive},
+                           {"progressive", progressive_summary},
                            {"change_evidence", change_evidence},
                            {"evidence_gaps", evidence_gaps},
                            {"budget_usage", progressive.at("budget_usage")},

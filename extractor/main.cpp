@@ -51,9 +51,32 @@ llvm::cl::opt<std::string> repository_id("repository-id", llvm::cl::init(""),
 
 std::string usr(const clang::Decl *declaration) {
   llvm::SmallString<128> value;
-  return clang::index::generateUSRForDecl(declaration, value)
-             ? std::string{}
-             : std::string(value);
+  if (clang::index::generateUSRForDecl(declaration, value))
+    return {};
+  std::string result(value);
+  const auto *tag = llvm::dyn_cast<clang::TagDecl>(declaration);
+  if (!tag || tag->getIdentifier())
+    return result;
+  const auto &sources = declaration->getASTContext().getSourceManager();
+  const auto location = sources.getPresumedLoc(
+      sources.getSpellingLoc(declaration->getCanonicalDecl()->getLocation()));
+  if (!location.isValid())
+    return result;
+  std::filesystem::path file(location.getFilename());
+  if (!project_root.empty()) {
+    std::error_code error;
+    const auto root =
+        std::filesystem::weakly_canonical(project_root.getValue(), error);
+    const auto canonical = std::filesystem::weakly_canonical(file, error);
+    if (!error) {
+      const auto relative = canonical.lexically_relative(root);
+      if (!relative.empty() && *relative.begin() != "..")
+        file = relative;
+    }
+  }
+  return result + "@anonymous:" + file.generic_string() + ":" +
+         std::to_string(location.getLine()) + ":" +
+         std::to_string(location.getColumn());
 }
 
 std::string normalized_project_path(const std::string &path) {
@@ -665,8 +688,7 @@ public:
     }
     for (const auto &variant : manifest.variants)
       variant_by_element[variant.element_id] = variant.variant_id;
-    std::set<std::tuple<std::string, std::string, std::uint32_t,
-                        std::uint32_t>>
+    std::set<std::tuple<std::string, std::string, std::uint32_t, std::uint32_t>>
         observed_locations;
     for (const auto &observation : manifest.observations)
       observed_locations.emplace(
@@ -682,9 +704,9 @@ public:
                         site.location.begin_line, site.location.begin_column)
                .second)
         continue;
-      manifest.observations.push_back(
-          {element->second, variant_by_element.at(element->second),
-           std::move(site.location)});
+      manifest.observations.push_back({element->second,
+                                       variant_by_element.at(element->second),
+                                       std::move(site.location)});
     }
     for (const auto &use : state_.macro_uses) {
       const auto macro = element_by_compiler.find(use.compiler_id);

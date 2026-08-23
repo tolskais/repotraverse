@@ -23,9 +23,9 @@ void write(const std::filesystem::path &path, std::string_view contents) {
 
 nlohmann::json progressive_budget() {
   nlohmann::json result;
-  for (const auto &name : {"common_leakage", "variable_detail",
-                           "stable_island_candidates", "high_impact_headers",
-                           "controls"})
+  for (const auto &name :
+       {"common_leakage", "variable_detail", "stable_island_candidates",
+        "high_impact_headers", "controls"})
     result[name] = {{"max_files", 20},
                     {"max_syntax_transitions", 100},
                     {"max_semantic_elements", 100}};
@@ -115,14 +115,16 @@ int main() {
         {"artifact_cache", (root / "artifact-cache-v1").string()},
         {"extractor", EXTRACTOR_PATH},
         {"configurations",
-         nlohmann::json::array({{{"name", "debug"},
-                                 {"build_variant",
-                                  {{"product", "fixture"},
-                                   {"target", "host"},
-                                   {"configuration", "debug"}}},
-                                 {"toolchain", "armclang6"},
-                                 {"real_compiler", FAKE_ARM_COMPILER_PATH},
-                                 {"command", {FAKE_MAKE_PATH}}}})}};
+         nlohmann::json::array(
+             {{{"name", "debug"},
+               {"build_variant",
+                {{"product", "fixture"},
+                 {"target", "host"},
+                 {"configuration", "debug"}}},
+               {"toolchain", "armclang6"},
+               {"real_compiler", FAKE_ARM_COMPILER_PATH},
+               {"compiler_variables", nlohmann::json::array()},
+               {"command", {FAKE_MAKE_PATH, "CC={compiler_probe}"}}}})}};
     write(experiment_manifest, experiment.dump());
     const auto head =
         history::run_head_experiment(experiment_manifest, PROBE_PATH);
@@ -132,6 +134,9 @@ int main() {
             "HEAD experiment did not extract elements");
     require(head.at("states").value("complete", 0U) == 1,
             "captured dependency map did not produce complete coverage");
+    require(head.at("capture").at("import").at(
+                "ignored_non_translation_unit_records") == 1,
+            "non-TU compiler invocation was not accounted for");
 
     auto aliased_variant = experiment;
     aliased_variant["output"] = (root / "alias-head-output").string();
@@ -167,8 +172,8 @@ int main() {
     pilot_experiment["revision"] = "main";
     pilot_experiment["output"] = (root / "pilot-output").string();
     pilot_experiment["pilot"] = {{"ref", "main"},
-                                  {"max_revisions", 4},
-                                  {"budget", progressive_budget()}};
+                                 {"max_revisions", 4},
+                                 {"budget", progressive_budget()}};
     pilot_experiment["partition"] = {{"stable", {"src/*", "include/*"}},
                                      {"variable", nlohmann::json::array()}};
     auto missing_budget = pilot_experiment;
@@ -180,9 +185,8 @@ int main() {
     try {
       (void)history::run_pilot_experiment(missing_budget_manifest, PROBE_PATH);
     } catch (const std::exception &error) {
-      budget_rejected =
-          std::string(error.what()).find("explicit budget") !=
-          std::string::npos;
+      budget_rejected = std::string(error.what()).find("explicit budget") !=
+                        std::string::npos;
     }
     require(budget_rejected, "pilot accepted a manifest without explicit caps");
     const auto pilot_manifest = root / "pilot.json";

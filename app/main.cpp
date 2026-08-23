@@ -32,22 +32,67 @@ nlohmann::json read_json(std::istream &input) {
 }
 
 void usage() {
-  std::cerr << "usage:\n"
-            << "  repotraverse --version\n"
-            << "  repotraverse serve --config FILE\n"
+  std::cerr
+      << "usage:\n"
+      << "  repotraverse --version\n"
+      << "  repotraverse serve --config FILE\n"
 #ifdef _WIN32
-            << "  repotraverse service --config FILE\n"
+      << "  repotraverse service --config FILE\n"
 #endif
-            << "  repotraverse query [--request FILE]\n"
-            << "  repotraverse query --endpoint URL [--request FILE]\n"
-            << "  repotraverse status [--endpoint URL]\n"
-            << "  repotraverse identity init --catalog DIRECTORY\n"
-            << "  repotraverse experiment capture --manifest FILE\n"
-            << "  repotraverse experiment head --manifest FILE\n"
-            << "  repotraverse experiment pilot --manifest FILE\n"
-            << "  repotraverse experiment classify --manifest FILE\n"
-            << "  repotraverse benchmark [--elements N]\n"
-            << "  repotraverse facts canonicalize [FILE]\n";
+      << "  repotraverse query [--request FILE]\n"
+      << "  repotraverse query --endpoint URL [--request FILE]\n"
+      << "  repotraverse status [--endpoint URL]\n"
+      << "  repotraverse identity init --catalog DIRECTORY\n"
+      << "  repotraverse experiment capture --manifest FILE [--full-output]\n"
+      << "  repotraverse experiment head --manifest FILE [--full-output]\n"
+      << "  repotraverse experiment pilot --manifest FILE [--full-output]\n"
+      << "  repotraverse experiment classify --manifest FILE [--full-output]\n"
+      << "  repotraverse benchmark [--elements N]\n"
+      << "  repotraverse facts canonicalize [FILE]\n";
+}
+
+nlohmann::json experiment_summary(const std::string &action,
+                                  const nlohmann::json &result) {
+  if (action == "classify")
+    return result;
+  nlohmann::json summary = {
+      {"schema_version", result.value("schema_version", 1)},
+      {"artifact_version", result.value("artifact_version", 1)},
+      {"command", "experiment " + action},
+      {"output", result.value("output", std::string{})}};
+  if (action == "capture") {
+    summary["report"] =
+        (std::filesystem::path(summary.at("output").get<std::string>()) /
+         "capture-report.v1.json")
+            .generic_string();
+    summary["failed_runs"] = result.value("failed_runs", 0U);
+    summary["import"] = result.value("import", nlohmann::json::object());
+  } else if (action == "head") {
+    summary["report"] =
+        (std::filesystem::path(summary.at("output").get<std::string>()) /
+         "head-report.v1.json")
+            .generic_string();
+    for (const auto *field :
+         {"revision", "translation_unit_contexts", "states", "failure_taxonomy",
+          "extracted_elements", "cache_hits", "extraction_elapsed_ms",
+          "artifact_bytes"})
+      if (result.contains(field))
+        summary[field] = result.at(field);
+  } else if (action == "pilot") {
+    summary["report"] =
+        (std::filesystem::path(summary.at("output").get<std::string>()) /
+         "pilot-report.v1.json")
+            .generic_string();
+    summary["revision_count"] =
+        result.value("revisions", nlohmann::json::array()).size();
+    summary["semantic_series"] =
+        result.value("series", nlohmann::json::array()).size();
+    summary["progressive"] =
+        result.value("progressive", nlohmann::json::object());
+    summary["evidence_gap_count"] =
+        result.value("evidence_gaps", nlohmann::json::array()).size();
+  }
+  return summary;
 }
 
 history::EvidenceBundle synthetic_bundle(std::size_t count, bool changed) {
@@ -235,7 +280,9 @@ int main(int argc, char **argv) {
       return 0;
     }
     if (command == "experiment") {
-      if (argc != 5 || std::string(argv[3]) != "--manifest" ||
+      const bool full_output =
+          argc == 6 && std::string(argv[5]) == "--full-output";
+      if ((argc != 5 && !full_output) || std::string(argv[3]) != "--manifest" ||
           (std::string(argv[2]) != "capture" &&
            std::string(argv[2]) != "head" && std::string(argv[2]) != "pilot" &&
            std::string(argv[2]) != "classify")) {
@@ -253,7 +300,10 @@ int main(int argc, char **argv) {
           : action == "head"  ? history::run_head_experiment(argv[4], probe)
           : action == "pilot" ? history::run_pilot_experiment(argv[4], probe)
                               : history::run_stability_experiment(argv[4]);
-      std::cout << history::canonical_json(result) << '\n';
+      std::cout << history::canonical_json(
+                       full_output ? result
+                                   : experiment_summary(action, result))
+                << '\n';
       return 0;
     }
     if (command == "serve") {

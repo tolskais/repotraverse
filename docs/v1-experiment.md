@@ -5,6 +5,9 @@ be reconstructed accurately enough to compare element-level stability with an
 existing file-level architectural partition. These commands execute trusted
 repository build logic and are intentionally CLI-only.
 
+For the staged operating procedure and evidence gates, use
+[`poc-runbook.md`](poc-runbook.md).
+
 ## Current analytical boundary
 
 Capture, progressive screening, extraction, coverage reporting, caching, and revision
@@ -39,10 +42,19 @@ variables pointing to `repotraverse-compiler-probe`. Use an object-producing
 Make target for capture-only operation. If the real compiler is available, set
 `real_compiler` for pass-through capture.
 
+Without `real_compiler`, the probe only materializes expected outputs; it does not
+synthesize compiler dependency data. That capture is useful for an interception smoke
+test but remains partial. A Clang pass-through run qualifies the Clang PoC path only.
+ARMCC/ARMCLANG qualification remains deferred until the real vendor environment and
+compatibility layer are available.
+
 Each compiler invocation is written independently, so parallel recursive Make
 does not contend on a shared log. Relative working directories and response
 files are retained. Import expands bounded repository-local response files and
 marks unknown semantic options as coverage gaps instead of dropping them.
+The v1 probe still requires the source path to appear directly on the compiler command
+line. An invocation whose source exists only inside `@response.rsp` is not identified as
+a TU and must be reported as a capture limitation.
 
 `head-report.v1.json` contains capture status, unique TU contexts, complete,
 partial, and failed extraction counts, failure taxonomy, elapsed time, element
@@ -68,8 +80,9 @@ elements per transition. There are no hidden analysis-budget defaults.
 
 The pipeline is progressive:
 
-1. Git measures direct file touches, churn, rename/move history, and direct header
-   include fanout across the selected history without a checkout.
+1. Git measures direct file touches, churn, rename/move history, and a textual header
+   include-fanout estimate across the selected history without a checkout. This estimate
+   is a screening signal, not a compiler-resolved include graph.
 2. COMMON leakage candidates, VARIABLE detail, low-change VARIABLE stable-island
    candidates, high-impact headers, and deterministic controls are ranked separately.
 3. Vendored Tree-sitter C/C++ parsers read both Git blob endpoints and map zero-context
@@ -80,10 +93,20 @@ The pipeline is progressive:
    overloads, templates, preprocessing, declaration/definition identity, dependencies,
    configurations, and targets.
 
+Clang can assign the same USR to distinct anonymous C/C++ tags. V1 disambiguates those
+tags with a repository-relative spelling anchor before deriving the logical element ID.
+This prevents one TU manifest from collapsing separate anonymous declarations, while
+also making their exact lineage intentionally sensitive to moving that declaration;
+such gaps remain evidence limitations rather than classifier certainty.
+
 `progressive-screening.v1.json` records file facts, syntax snapshots and transitions,
-promotion reasons, cap usage, and coverage. `pilot-report.v1.json` embeds that report and
-adds semantic `change_evidence`. Parsed sites are cached under `syntax-cache-v1` by
-source content, screening language/path, and parser identity; raw source is not stored.
+promotion reasons, cap usage, and coverage. An identical
+revision/partition/budget/parser/screening-engine plan reuses that complete artifact
+instead of repeating Git screening and include-fanout work.
+`pilot-report.v1.json` links to it and retains a compact promotion/coverage summary rather
+than embedding a second copy; it adds semantic `change_evidence`. Parsed sites are cached
+under `syntax-cache-v1` by source content, screening language/path, and parser identity;
+raw source is not stored.
 Completed revision reports remain resumable. A revision
 with reusable, complete dependency capture uses an exact-path sparse workspace containing
 the selected TUs and their project dependencies. Make capture, repository preparation,
@@ -98,6 +121,18 @@ that cannot fit reports `disk_space_insufficient`; it is never treated as comple
 If extraction needs generated files, set a configuration `prepare_command` to a
 target that creates them without compiling the full product. It runs when a
 previous build context is reused in a fresh worktree.
+
+Some Makefiles override `CC`/`CXX` assignments from the environment. Command arguments
+may therefore contain `{compiler_probe}`, for example
+`["make", "CC={compiler_probe}", "objects"]`. The placeholder is replaced without a
+shell. The importer counts source-less compiler checks and link calls as ignored non-TU
+invocations. A preprocessing invocation that names a repository source file remains a TU
+record. GCC/Clang dependency forms including
+`-MF`, `--dependency-file`, and `-Wp,-MD,...` are recognized.
+
+The `capture`, `head`, and `pilot` experiment commands print a compact JSON summary and
+artifact path by default. Add `--full-output` when the complete persisted report must
+also be written to stdout. `classify` retains its result-oriented JSON output.
 
 The pilot reuses the previous captured build context when configured build
 files and source topology are unchanged. Within a reused context it re-extracts
@@ -145,3 +180,7 @@ Logical elements and semantic variants are already normalized in TU manifests, a
 build variants are explicit. The remaining analytical milestone is the reduction into
 cross-TU logical-element revision states. Temporal stability and cross-target
 variability remain separate facts.
+
+The default weights and thresholds shown in the example manifest are an explicit
+baseline hypothesis for practical experiments. They are not empirical constants or a
+production definition of stability.

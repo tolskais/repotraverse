@@ -285,12 +285,18 @@ std::vector<nlohmann::json> load_records(const std::filesystem::path &input) {
 nlohmann::json import_build_log(Catalog &catalog,
                                 const std::filesystem::path &input,
                                 const std::filesystem::path &repository) {
-  std::size_t imported = 0, partial = 0;
+  std::size_t imported = 0, partial = 0, ignored = 0;
   std::set<std::string> configurations, contexts, translation_units;
   for (const auto &record : load_records(input)) {
     if (record.value("schema_version", 0U) != kSchemaVersion)
       throw std::runtime_error(
           "captured build record requires schema_version 1");
+    if (record.value("invocation_kind", std::string{}) ==
+            "non_translation_unit" ||
+        record.value("translation_unit", std::string{}).empty()) {
+      ++ignored;
+      continue;
+    }
     CompileContext context;
     context.configuration = record.at("configuration").get<std::string>();
     context.source_revision = record.at("source_revision").get<std::string>();
@@ -369,6 +375,7 @@ nlohmann::json import_build_log(Catalog &catalog,
   }
   return {{"schema_version", kSchemaVersion},
           {"records", imported},
+          {"ignored_non_translation_unit_records", ignored},
           {"translation_units", translation_units.size()},
           {"configurations", configurations.size()},
           {"distinct_contexts", contexts.size()},

@@ -11,9 +11,9 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <memory>
-#include <limits>
 #include <optional>
 #include <regex>
 #include <set>
@@ -32,6 +32,8 @@ namespace {
 
 constexpr std::string_view kParserIdentity =
     "tree-sitter-0.26.11;c-0.24.2;cpp-0.23.4";
+constexpr std::string_view kScreeningEngineIdentity =
+    "progressive-screening-v1.1";
 
 struct ParserDeleter {
   void operator()(TSParser *value) const { ts_parser_delete(value); }
@@ -75,8 +77,8 @@ bool source_or_header(std::string path) {
   });
   const auto extension = std::filesystem::path(path).extension().string();
   static const std::set<std::string> extensions = {
-      ".c",   ".cc",  ".cpp", ".cxx", ".h",   ".hh", ".hpp",
-      ".hxx", ".inc", ".inl", ".ipp", ".tpp"};
+      ".c",   ".cc",  ".cpp", ".cxx", ".h",   ".hh",
+      ".hpp", ".hxx", ".inc", ".inl", ".ipp", ".tpp"};
   return extensions.contains(extension);
 }
 
@@ -92,8 +94,9 @@ bool header_path(std::string path) {
 
 std::string screening_language(const std::string &path) {
   auto extension = std::filesystem::path(path).extension().string();
-  std::transform(extension.begin(), extension.end(), extension.begin(),
-                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  std::transform(
+      extension.begin(), extension.end(), extension.begin(),
+      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
   return extension == ".c" ? "c" : "cpp";
 }
 
@@ -109,9 +112,9 @@ std::vector<std::string> nul_tokens(std::string_view value) {
   std::size_t begin = 0;
   while (begin < value.size()) {
     const auto end = value.find('\0', begin);
-    result.emplace_back(value.substr(
-        begin, end == std::string_view::npos ? value.size() - begin
-                                             : end - begin));
+    result.emplace_back(value.substr(begin, end == std::string_view::npos
+                                                ? value.size() - begin
+                                                : end - begin));
     if (end == std::string_view::npos)
       break;
     begin = end + 1;
@@ -137,7 +140,8 @@ numstat(const std::filesystem::path &repository, const std::string &before,
     const auto added = result.output.substr(cursor, first_tab - cursor);
     const auto deleted =
         result.output.substr(first_tab + 1, second_tab - first_tab - 1);
-    auto path = result.output.substr(second_tab + 1, terminator - second_tab - 1);
+    auto path =
+        result.output.substr(second_tab + 1, terminator - second_tab - 1);
     cursor = terminator + 1;
     if (path.empty()) {
       const auto old_end = result.output.find('\0', cursor);
@@ -156,12 +160,12 @@ numstat(const std::filesystem::path &repository, const std::string &before,
   return values;
 }
 
-std::vector<PathChange>
-path_changes(const std::filesystem::path &repository, const std::string &before,
-             const std::string &after) {
-  const auto result = run_process({"git", "-C", repository.string(), "diff",
-                                   "--name-status", "-M", "-z", before,
-                                   after, "--"});
+std::vector<PathChange> path_changes(const std::filesystem::path &repository,
+                                     const std::string &before,
+                                     const std::string &after) {
+  const auto result =
+      run_process({"git", "-C", repository.string(), "diff", "--name-status",
+                   "-M", "-z", before, after, "--"});
   require_git(result, "read changed paths");
   const auto tokens = nul_tokens(result.output);
   const auto churn = numstat(repository, before, after);
@@ -185,8 +189,8 @@ path_changes(const std::filesystem::path &repository, const std::string &before,
       if (status.front() == 'D')
         change.after_path.clear();
     }
-    const auto key = change.after_path.empty() ? change.before_path
-                                               : change.after_path;
+    const auto key =
+        change.after_path.empty() ? change.before_path : change.after_path;
     if (const auto found = churn.find(key); found != churn.end()) {
       change.additions = found->second.first;
       change.deletions = found->second.second;
@@ -206,17 +210,15 @@ std::int64_t revision_time(const std::filesystem::path &repository,
 
 std::int64_t calendar_month(std::int64_t timestamp) {
   using namespace std::chrono;
-  const year_month_day value{
-      floor<days>(sys_seconds{seconds{timestamp}})};
+  const year_month_day value{floor<days>(sys_seconds{seconds{timestamp}})};
   return static_cast<int>(value.year()) * 12 +
          static_cast<unsigned>(value.month());
 }
 
-std::vector<std::string> tracked_paths(
-    const std::filesystem::path &repository, const std::string &revision) {
-  const auto result = run_process({"git", "-C", repository.string(),
-                                   "ls-tree", "-r", "--name-only", "-z",
-                                   revision});
+std::vector<std::string> tracked_paths(const std::filesystem::path &repository,
+                                       const std::string &revision) {
+  const auto result = run_process({"git", "-C", repository.string(), "ls-tree",
+                                   "-r", "--name-only", "-z", revision});
   require_git(result, "list tracked screening files");
   return nul_tokens(result.output);
 }
@@ -241,9 +243,8 @@ void measure_include_fanout(const std::filesystem::path &repository,
   options.max_output_bytes = 512ULL * 1024ULL * 1024ULL;
   const auto result = run_process(
       {"git", "-C", repository.string(), "grep", "-I", "-n", "-z", "-E",
-       "^[[:space:]]*#[[:space:]]*include[[:space:]]*[<\"]", revision,
-       "--", "*.c", "*.cc", "*.cpp", "*.cxx", "*.h", "*.hh", "*.hpp",
-       "*.hxx"},
+       "^[[:space:]]*#[[:space:]]*include[[:space:]]*[<\"]", revision, "--",
+       "*.c", "*.cc", "*.cpp", "*.cxx", "*.h", "*.hh", "*.hpp", "*.hxx"},
       options);
   if (result.exit_code == 1)
     return;
@@ -263,10 +264,10 @@ void measure_include_fanout(const std::filesystem::path &repository,
     cursor = line_end + 1;
     const auto content_end = result.output.find('\n', cursor);
     const auto content = result.output.substr(
-        cursor, content_end == std::string::npos ? content_end
-                                                 : content_end - cursor);
+        cursor,
+        content_end == std::string::npos ? content_end : content_end - cursor);
     cursor = content_end == std::string::npos ? result.output.size()
-                                               : content_end + 1;
+                                              : content_end + 1;
     const auto prefix = revision + ":";
     if (includer.starts_with(prefix))
       includer.erase(0, prefix.size());
@@ -290,8 +291,9 @@ std::optional<std::string> blob(const std::filesystem::path &repository,
     return std::nullopt;
   ProcessOptions options;
   options.max_output_bytes = 512ULL * 1024ULL * 1024ULL;
-  const auto result = run_process({"git", "-C", repository.string(), "show",
-                                   revision + ":" + path}, options);
+  const auto result = run_process(
+      {"git", "-C", repository.string(), "show", revision + ":" + path},
+      options);
   if (result.exit_code != 0 || result.timed_out || result.output_truncated)
     return std::nullopt;
   return result.output;
@@ -308,8 +310,8 @@ bool wildcard(std::string_view pattern, std::string_view value) {
         current[index] = previous[index] || current[index - 1];
     } else {
       for (std::size_t index = 1; index <= value.size(); ++index)
-        current[index] = previous[index - 1] &&
-                         (token == '?' || token == value[index - 1]);
+        current[index] =
+            previous[index - 1] && (token == '?' || token == value[index - 1]);
     }
     previous.swap(current);
   }
@@ -319,10 +321,11 @@ bool wildcard(std::string_view pattern, std::string_view value) {
 bool matches(const nlohmann::json &patterns, const std::string &path) {
   if (!patterns.is_array())
     return false;
-  return std::any_of(patterns.begin(), patterns.end(), [&](const auto &pattern) {
-    return pattern.is_string() &&
-           wildcard(pattern.template get<std::string>(), path);
-  });
+  return std::any_of(
+      patterns.begin(), patterns.end(), [&](const auto &pattern) {
+        return pattern.is_string() &&
+               wildcard(pattern.template get<std::string>(), path);
+      });
 }
 
 std::string developer_label(const nlohmann::json &partition,
@@ -360,9 +363,9 @@ StratumBudget stratum_budget(const nlohmann::json &budget,
 void validate_budget(const nlohmann::json &budget) {
   if (!budget.is_object())
     throw std::runtime_error("pilot requires budget object");
-  for (const auto &name : {"common_leakage", "variable_detail",
-                           "stable_island_candidates", "high_impact_headers",
-                           "controls"})
+  for (const auto &name :
+       {"common_leakage", "variable_detail", "stable_island_candidates",
+        "high_impact_headers", "controls"})
     (void)stratum_budget(budget, name);
   for (const auto *field : {"max_capture_revisions", "max_dependency_depth",
                             "max_induced_elements_per_transition"})
@@ -475,8 +478,7 @@ std::string interface_text(TSNode node, std::string_view source,
 }
 
 void collect_sites(TSNode node, std::string_view source,
-                   const std::string &path,
-                   std::vector<std::string> enclosing,
+                   const std::string &path, std::vector<std::string> enclosing,
                    std::vector<nlohmann::json> &sites,
                    std::map<std::string, std::size_t> &occurrences,
                    std::size_t &error_nodes) {
@@ -499,26 +501,25 @@ void collect_sites(TSNode node, std::string_view source,
       qualified += "::";
     qualified += name;
     const auto interface_shape = interface_text(node, source, kind);
-    const auto base = stable_hash(path + "\n" + kind + "\n" + qualified +
-                                  "\n" + interface_shape);
+    const auto base = stable_hash(path + "\n" + kind + "\n" + qualified + "\n" +
+                                  interface_shape);
     const auto occurrence = occurrences[base]++;
     const auto start = ts_node_start_point(node);
     const auto end = ts_node_end_point(node);
-    sites.push_back(
-        {{"syntactic_symbol_id",
-          stable_hash(base + "\n" + std::to_string(occurrence))},
-         {"identity_kind", "syntactic_candidate"},
-         {"kind", kind},
-         {"name", name},
-         {"qualified_name", qualified},
-         {"path", path},
-         {"begin_line", start.row + 1},
-         {"begin_column", start.column + 1},
-         {"end_line", end.row + 1},
-         {"end_column", end.column + 1},
-         {"interface_fingerprint", stable_hash(interface_shape)},
-         {"structural_fingerprint",
-          stable_hash(normalized(node_text(node, source)))}});
+    sites.push_back({{"syntactic_symbol_id",
+                      stable_hash(base + "\n" + std::to_string(occurrence))},
+                     {"identity_kind", "syntactic_candidate"},
+                     {"kind", kind},
+                     {"name", name},
+                     {"qualified_name", qualified},
+                     {"path", path},
+                     {"begin_line", start.row + 1},
+                     {"begin_column", start.column + 1},
+                     {"end_line", end.row + 1},
+                     {"end_column", end.column + 1},
+                     {"interface_fingerprint", stable_hash(interface_shape)},
+                     {"structural_fingerprint",
+                      stable_hash(normalized(node_text(node, source)))}});
     if (scope_kind(kind))
       enclosing.push_back(name);
   }
@@ -530,10 +531,10 @@ void collect_sites(TSNode node, std::string_view source,
 
 nlohmann::json changed_ranges(const std::filesystem::path &repository,
                               const Touch &touch) {
-  std::vector<std::string> command = {"git", "-C", repository.string(),
-                                      "diff", "--no-color", "--unified=0",
-                                      touch.before_revision,
-                                      touch.after_revision, "--"};
+  std::vector<std::string> command = {
+      "git",        "-C",          repository.string(),   "diff",
+      "--no-color", "--unified=0", touch.before_revision, touch.after_revision,
+      "--"};
   if (!touch.before_path.empty())
     command.push_back(touch.before_path);
   if (!touch.after_path.empty() && touch.after_path != touch.before_path)
@@ -580,8 +581,8 @@ nlohmann::json mapped_site(const nlohmann::json &sites, std::uint64_t start,
     if (!overlaps(site, start, count))
       continue;
     ++matches;
-    const auto span = site.value("end_line", 0ULL) -
-                      site.value("begin_line", 0ULL);
+    const auto span =
+        site.value("end_line", 0ULL) - site.value("begin_line", 0ULL);
     if (span < best_span) {
       best = &site;
       best_span = span;
@@ -617,8 +618,9 @@ nlohmann::json parse_syntax_blob(std::string_view language,
   ParserPtr parser(ts_parser_new());
   if (!parser || !ts_parser_set_language(parser.get(), grammar))
     throw std::runtime_error("cannot initialize Tree-sitter parser");
-  TreePtr tree(ts_parser_parse_string(parser.get(), nullptr, source.data(),
-                                      static_cast<std::uint32_t>(source.size())));
+  TreePtr tree(
+      ts_parser_parse_string(parser.get(), nullptr, source.data(),
+                             static_cast<std::uint32_t>(source.size())));
   if (!tree)
     throw std::runtime_error("Tree-sitter failed to parse source blob");
   std::vector<nlohmann::json> sites;
@@ -656,21 +658,44 @@ plan_progressive_screening(const ProgressiveScreeningOptions &options) {
     throw std::runtime_error("progressive screening requires two revisions");
   validate_budget(options.budget);
 
+  const auto screening_identity = stable_hash(
+      nlohmann::json({{"revisions", options.revisions},
+                      {"partition", options.partition},
+                      {"budget", options.budget},
+                      {"screening_engine_identity", kScreeningEngineIdentity},
+                      {"parser_identity", kParserIdentity}})
+          .dump());
+  const auto screening_artifact =
+      options.output / "progressive-screening.v1.json";
+  if (std::filesystem::exists(screening_artifact)) {
+    std::ifstream cached_input(screening_artifact, std::ios::binary);
+    auto cached = nlohmann::json::parse(cached_input, nullptr, false);
+    if (!cached.is_discarded() &&
+        cached.value("record_type", std::string{}) == "progressive_screening" &&
+        cached.value("screening_identity", std::string{}) ==
+            screening_identity &&
+        cached.value("parser_identity", std::string{}) == kParserIdentity) {
+      cached["budget_usage"]["screening_plan_cache_hit"] = true;
+      return cached;
+    }
+  }
+
   std::map<std::string, FileFact> facts;
-  for (const auto &path : tracked_paths(options.repository,
-                                        options.revisions.back()))
+  for (const auto &path :
+       tracked_paths(options.repository, options.revisions.back()))
     if (source_or_header(path)) {
       auto &fact = facts[path];
       fact.path = path;
       fact.header = header_path(path);
     }
   for (std::size_t index = 1; index < options.revisions.size(); ++index) {
-    const auto time = revision_time(options.repository, options.revisions[index]);
-    for (const auto &change : path_changes(options.repository,
-                                           options.revisions[index - 1],
-                                           options.revisions[index])) {
-      const auto path = change.after_path.empty() ? change.before_path
-                                                  : change.after_path;
+    const auto time =
+        revision_time(options.repository, options.revisions[index]);
+    for (const auto &change :
+         path_changes(options.repository, options.revisions[index - 1],
+                      options.revisions[index])) {
+      const auto path =
+          change.after_path.empty() ? change.before_path : change.after_path;
       if (!source_or_header(path) && !source_or_header(change.before_path))
         continue;
       if (!change.before_path.empty() && !change.after_path.empty() &&
@@ -697,10 +722,10 @@ plan_progressive_screening(const ProgressiveScreeningOptions &options) {
         fact.first_change = time;
       fact.last_change = time;
       fact.active_months.insert(calendar_month(time));
-      fact.transitions.push_back(
-          {options.revisions[index - 1], options.revisions[index],
-           change.before_path, change.after_path, change.status,
-           change.additions, change.deletions, time});
+      fact.transitions.push_back({options.revisions[index - 1],
+                                  options.revisions[index], change.before_path,
+                                  change.after_path, change.status,
+                                  change.additions, change.deletions, time});
     }
   }
   measure_include_fanout(options.repository, options.revisions.back(), facts);
@@ -709,15 +734,16 @@ plan_progressive_screening(const ProgressiveScreeningOptions &options) {
   for (auto &[path, fact] : facts) {
     (void)path;
     fact.recent_touches = static_cast<std::uint64_t>(std::count_if(
-        fact.transitions.begin(), fact.transitions.end(), [&](const auto &touch) {
+        fact.transitions.begin(), fact.transitions.end(),
+        [&](const auto &touch) {
           return touch.time >= latest_time - 90LL * 24LL * 60LL * 60LL;
         }));
   }
 
   std::map<std::string, StratumBudget> budgets;
-  for (const auto &name : {"common_leakage", "variable_detail",
-                           "stable_island_candidates", "high_impact_headers",
-                           "controls"})
+  for (const auto &name :
+       {"common_leakage", "variable_detail", "stable_island_candidates",
+        "high_impact_headers", "controls"})
     budgets[name] = stratum_budget(options.budget, name);
 
   std::map<std::string, std::vector<FileFact *>> ranked;
@@ -771,8 +797,7 @@ plan_progressive_screening(const ProgressiveScreeningOptions &options) {
 
   std::set<std::string> selected_non_controls;
   for (const auto &name : {"common_leakage", "variable_detail",
-                           "stable_island_candidates",
-                           "high_impact_headers"}) {
+                           "stable_island_candidates", "high_impact_headers"}) {
     std::size_t selected = 0;
     for (auto *fact : ranked[name]) {
       if (selected >= budgets[name].max_files)
@@ -811,9 +836,9 @@ plan_progressive_screening(const ProgressiveScreeningOptions &options) {
          {"last_change_time", fact.last_change},
          {"total_transitions", fact.transitions.size()},
          {"promotion_reasons", set_json(fact.promotion_reasons)},
-         {"screening_label",
-          fact.promotion_reasons.empty() ? "screened_not_selected"
-                                         : "selected_for_syntax"}});
+         {"screening_label", fact.promotion_reasons.empty()
+                                 ? "screened_not_selected"
+                                 : "selected_for_syntax"}});
 
   nlohmann::json syntax_transitions = nlohmann::json::array();
   nlohmann::json syntax_snapshots = nlohmann::json::array();
@@ -826,9 +851,9 @@ plan_progressive_screening(const ProgressiveScreeningOptions &options) {
       snapshot_output_index;
   std::size_t syntax_cache_hits = 0, persistent_syntax_cache_hits = 0;
   const auto syntax_cache_root = options.output / "syntax-cache-v1";
-  const auto parse_endpoint = [&](const std::string &revision,
-                                  const std::string &path)
-      -> const nlohmann::json & {
+  const auto parse_endpoint =
+      [&](const std::string &revision,
+          const std::string &path) -> const nlohmann::json & {
     const auto key = revision + "\n" + path;
     if (const auto found = parsed_endpoints.find(key);
         found != parsed_endpoints.end())
@@ -880,9 +905,9 @@ plan_progressive_screening(const ProgressiveScreeningOptions &options) {
     return parsed_endpoints.emplace(key, std::move(parsed)).first->second;
   };
   bool syntax_complete = true;
-  for (const auto &name : {"common_leakage", "variable_detail",
-                           "stable_island_candidates", "high_impact_headers",
-                           "controls"}) {
+  for (const auto &name :
+       {"common_leakage", "variable_detail", "stable_island_candidates",
+        "high_impact_headers", "controls"}) {
     for (auto *fact : ranked[name]) {
       if (!fact->promotion_reasons.contains(name))
         continue;
@@ -952,10 +977,8 @@ plan_progressive_screening(const ProgressiveScreeningOptions &options) {
                {"status", touch->status},
                {"ranges", ranges},
                {"mapped_regions", mapped},
-               {"before_coverage",
-                before.value("coverage", nlohmann::json{})},
-               {"after_coverage",
-                after.value("coverage", nlohmann::json{})}});
+               {"before_coverage", before.value("coverage", nlohmann::json{})},
+               {"after_coverage", after.value("coverage", nlohmann::json{})}});
         }
       }
     }
@@ -964,9 +987,9 @@ plan_progressive_screening(const ProgressiveScreeningOptions &options) {
   // A selected file may be unchanged throughout the window. Parse its current
   // blob once so control samples and stable-island candidates still have sites
   // that can be promoted for semantic observation.
-  for (const auto &name : {"common_leakage", "variable_detail",
-                           "stable_island_candidates", "high_impact_headers",
-                           "controls"}) {
+  for (const auto &name :
+       {"common_leakage", "variable_detail", "stable_island_candidates",
+        "high_impact_headers", "controls"}) {
     std::set<std::string> seen_paths;
     for (auto *fact : ranked[name]) {
       if (!fact->promotion_reasons.contains(name) ||
@@ -976,8 +999,7 @@ plan_progressive_screening(const ProgressiveScreeningOptions &options) {
           parse_endpoint(options.revisions.back(), fact->path);
       if (!snapshot.contains("sites"))
         continue;
-      if (snapshot.at("coverage").value("status", std::string{}) !=
-          "complete")
+      if (snapshot.at("coverage").value("status", std::string{}) != "complete")
         syntax_complete = false;
       for (const auto &site : snapshot.at("sites")) {
         const auto id = site.at("syntactic_symbol_id").get<std::string>();
@@ -996,13 +1018,12 @@ plan_progressive_screening(const ProgressiveScreeningOptions &options) {
         syntax_snapshots[existing->second]["strata"].push_back(name);
       } else {
         snapshot_output_index[output_key] = syntax_snapshots.size();
-        syntax_snapshots.push_back(
-            {{"strata", nlohmann::json::array({name})},
-             {"revision", options.revisions.back()},
-             {"path", fact->path},
-             {"coverage", snapshot.at("coverage")},
-             {"site_count", snapshot.at("sites").size()},
-             {"sites", snapshot.at("sites")}});
+        syntax_snapshots.push_back({{"strata", nlohmann::json::array({name})},
+                                    {"revision", options.revisions.back()},
+                                    {"path", fact->path},
+                                    {"coverage", snapshot.at("coverage")},
+                                    {"site_count", snapshot.at("sites").size()},
+                                    {"sites", snapshot.at("sites")}});
       }
     }
   }
@@ -1010,19 +1031,19 @@ plan_progressive_screening(const ProgressiveScreeningOptions &options) {
   std::map<std::string, nlohmann::json> promoted_by_id;
   std::map<std::string, std::size_t> promoted_by_stratum;
   std::set<std::string> promoted_paths;
-  for (const auto &name : {"common_leakage", "variable_detail",
-                           "stable_island_candidates", "high_impact_headers",
-                           "controls"}) {
+  for (const auto &name :
+       {"common_leakage", "variable_detail", "stable_island_candidates",
+        "high_impact_headers", "controls"}) {
     std::vector<nlohmann::json> values;
     for (auto &[id, candidate] : candidates[name])
       values.push_back(std::move(candidate));
-    std::sort(values.begin(), values.end(), [](const auto &left,
-                                               const auto &right) {
-      return std::tie(left.at("touches"), left.at("qualified_name"),
-                      left.at("syntactic_symbol_id")) >
-             std::tie(right.at("touches"), right.at("qualified_name"),
-                      right.at("syntactic_symbol_id"));
-    });
+    std::sort(values.begin(), values.end(),
+              [](const auto &left, const auto &right) {
+                return std::tie(left.at("touches"), left.at("qualified_name"),
+                                left.at("syntactic_symbol_id")) >
+                       std::tie(right.at("touches"), right.at("qualified_name"),
+                                right.at("syntactic_symbol_id"));
+              });
     if (values.size() > budgets[name].max_semantic_elements)
       values.resize(budgets[name].max_semantic_elements);
     promoted_by_stratum[name] = values.size();
@@ -1032,9 +1053,8 @@ plan_progressive_screening(const ProgressiveScreeningOptions &options) {
       const auto id = candidate.at("syntactic_symbol_id").get<std::string>();
       if (auto found = promoted_by_id.find(id); found != promoted_by_id.end()) {
         found->second["promotion_reasons"].push_back(name);
-        found->second["touches"] =
-            std::max(found->second.value("touches", 0U),
-                     candidate.value("touches", 0U));
+        found->second["touches"] = std::max(found->second.value("touches", 0U),
+                                            candidate.value("touches", 0U));
       } else {
         candidate.erase("promotion_reason");
         candidate["promotion_reasons"] = nlohmann::json::array({name});
@@ -1060,19 +1080,21 @@ plan_progressive_screening(const ProgressiveScreeningOptions &options) {
 
   nlohmann::json usage = nlohmann::json::object();
   for (const auto &[name, value] : budgets)
-    usage[name] =
-        {{"selected_files",
-          std::count_if(facts.begin(), facts.end(), [&](const auto &item) {
-            return item.second.promotion_reasons.contains(name);
-          })},
-         {"syntax_transitions", used_transitions[name]},
-         {"semantic_elements", promoted_by_stratum[name]},
-         {"caps", options.budget.at(name)}};
+    usage[name] = {
+        {"selected_files",
+         std::count_if(facts.begin(), facts.end(),
+                       [&](const auto &item) {
+                         return item.second.promotion_reasons.contains(name);
+                       })},
+        {"syntax_transitions", used_transitions[name]},
+        {"semantic_elements", promoted_by_stratum[name]},
+        {"caps", options.budget.at(name)}};
   usage["capture_revisions"] = semantic_revisions.size();
   usage["capture_revision_cap"] = options.budget.at("max_capture_revisions");
   usage["syntax_blob_cache_hits"] = syntax_cache_hits;
   usage["persistent_syntax_cache_hits"] = persistent_syntax_cache_hits;
   usage["unique_syntax_blobs"] = parsed_blobs.size();
+  usage["screening_plan_cache_hit"] = false;
 
   nlohmann::json gaps = nlohmann::json::array();
   if (!syntax_complete)
@@ -1083,22 +1105,32 @@ plan_progressive_screening(const ProgressiveScreeningOptions &options) {
                     {"required", options.revisions.size()},
                     {"observed", semantic_revisions.size()},
                     {"effect", "build_context_unobserved"}});
-  return {{"schema_version", 1},
-          {"artifact_version", 1},
-          {"record_type", "progressive_screening"},
-          {"parser_identity", kParserIdentity},
-          {"screening", {{"files", file_facts}}},
-          {"syntax", {{"transitions", syntax_transitions},
-                       {"snapshots", syntax_snapshots}}},
-          {"promotion", {{"elements", promoted},
-                          {"paths", promoted_paths},
-                          {"semantic_revisions", semantic_revisions}}},
-          {"coverage",
-           {{"status", gaps.empty() ? "complete" : "partial"},
-            {"history_complete", gaps.empty()},
-            {"canonical_identity", false}}},
-          {"budget_usage", usage},
-          {"evidence_gaps", gaps}};
+  nlohmann::json result = {
+      {"schema_version", 1},
+      {"artifact_version", 1},
+      {"record_type", "progressive_screening"},
+      {"screening_identity", screening_identity},
+      {"screening_engine_identity", kScreeningEngineIdentity},
+      {"parser_identity", kParserIdentity},
+      {"screening", {{"files", file_facts}}},
+      {"syntax",
+       {{"transitions", syntax_transitions}, {"snapshots", syntax_snapshots}}},
+      {"promotion",
+       {{"elements", promoted},
+        {"paths", promoted_paths},
+        {"semantic_revisions", semantic_revisions}}},
+      {"coverage",
+       {{"status", gaps.empty() ? "complete" : "partial"},
+        {"history_complete", gaps.empty()},
+        {"canonical_identity", false}}},
+      {"budget_usage", usage},
+      {"evidence_gaps", gaps}};
+  std::filesystem::create_directories(options.output);
+  std::ofstream persisted(screening_artifact, std::ios::binary);
+  persisted << canonical_json(result);
+  if (!persisted)
+    throw std::runtime_error("cannot persist progressive screening artifact");
+  return result;
 }
 
 } // namespace history

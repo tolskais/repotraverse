@@ -5,6 +5,9 @@ do not assert that the experimental historical classifier is analytically comple
 Multitarget element aggregation and validation in the real build environment remain
 promotion gates for historical conclusions.
 
+For the CLI experiment PoC, including separate output-directory rules and evidence
+collection, use [`poc-runbook.md`](poc-runbook.md).
+
 ## Deployment
 
 Use the generic Windows x64 package on the intended 8-vCPU, 32-GB VM. Extract

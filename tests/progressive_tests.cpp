@@ -1,6 +1,7 @@
 #include "history/process.hpp"
 #include "history/progressive.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -46,6 +47,12 @@ nlohmann::json budget(std::size_t transitions = 20) {
   result["max_dependency_depth"] = 2;
   result["max_induced_elements_per_transition"] = 100;
   return result;
+}
+
+bool has_gap(const nlohmann::json &result, std::string_view kind) {
+  return std::any_of(result.at("evidence_gaps").begin(),
+                     result.at("evidence_gaps").end(),
+                     [&](const auto &gap) { return gap.at("kind") == kind; });
 }
 
 } // namespace
@@ -149,6 +156,28 @@ int main() {
         partial.at("budget_usage").value("persistent_syntax_cache_hits", 0U) >
             0,
         "a repeated screening run did not reuse persisted syntax facts");
+
+    auto file_capped = options;
+    for (const auto &name :
+         {"common_leakage", "variable_detail", "stable_island_candidates",
+          "high_impact_headers", "controls"})
+      file_capped.budget[name]["max_files"] = 0;
+    const auto file_partial = history::plan_progressive_screening(file_capped);
+    require(file_partial.at("coverage").at("status") == "partial" &&
+                has_gap(file_partial, "file_budget_exhausted"),
+            "file cap exhaustion was reported as complete coverage");
+
+    auto element_capped = options;
+    for (const auto &name :
+         {"common_leakage", "variable_detail", "stable_island_candidates",
+          "high_impact_headers", "controls"})
+      element_capped.budget[name]["max_semantic_elements"] = 0;
+    const auto element_partial =
+        history::plan_progressive_screening(element_capped);
+    require(
+        element_partial.at("coverage").at("status") == "partial" &&
+            has_gap(element_partial, "semantic_element_budget_exhausted"),
+        "semantic element cap exhaustion was reported as complete coverage");
 
     bool rejected = false;
     try {

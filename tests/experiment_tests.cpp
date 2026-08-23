@@ -216,6 +216,46 @@ int main() {
     require(pilot.at("stability").at("classifications").value("stable", 0U) > 0,
             "pilot did not classify unchanged elements as stable");
 
+    auto changed_pilot_experiment = pilot_experiment;
+    changed_pilot_experiment["partition"]["exclude"] = {"README.md"};
+    write(pilot_manifest, changed_pilot_experiment.dump());
+    const auto rerun =
+        history::run_pilot_experiment(pilot_manifest, PROBE_PATH);
+    require(rerun.at("pilot_analysis_identity") !=
+                pilot.at("pilot_analysis_identity"),
+            "changed pilot inputs retained the previous analysis identity");
+    for (const auto &report : rerun.at("revision_reports"))
+      require(report.at("pilot_analysis_identity") ==
+                  rerun.at("pilot_analysis_identity"),
+              "pilot reused a stale revision report after its inputs changed");
+
+    const auto missing_manifest_directory =
+        std::filesystem::path(rerun.at("revision_reports")
+                                  .at(1)
+                                  .at("output")
+                                  .get<std::string>()) /
+        "manifests";
+    for (const auto &entry :
+         std::filesystem::directory_iterator(missing_manifest_directory))
+      if (entry.is_regular_file() && entry.path().extension() == ".json") {
+        std::filesystem::remove(entry.path());
+        break;
+      }
+    const auto incomplete =
+        history::run_pilot_experiment(pilot_manifest, PROBE_PATH);
+    require(
+        !incomplete.at("series").front().at("coverage_complete") &&
+            !incomplete.at("series").front().at("missing_revisions").empty(),
+        "a missing semantic revision was presented as complete coverage");
+    require(incomplete.at("stability")
+                        .at("classifications")
+                        .value("insufficient_evidence", 0U) > 0 &&
+                incomplete.at("stability")
+                        .at("classifications")
+                        .value("stable", 0U) == 0,
+            "a series with a missing revision received a definitive "
+            "classification");
+
     auto clean_experiment = experiment;
     clean_experiment["revision"] = "main";
     clean_experiment["output"] = (root / "clean-head-output").string();

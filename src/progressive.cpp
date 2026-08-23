@@ -33,7 +33,7 @@ namespace {
 constexpr std::string_view kParserIdentity =
     "tree-sitter-0.26.11;c-0.24.2;cpp-0.23.4";
 constexpr std::string_view kScreeningEngineIdentity =
-    "progressive-screening-v1.1";
+    "progressive-screening-v1.2";
 
 struct ParserDeleter {
   void operator()(TSParser *value) const { ts_parser_delete(value); }
@@ -796,6 +796,8 @@ plan_progressive_screening(const ProgressiveScreeningOptions &options) {
             });
 
   std::set<std::string> selected_non_controls;
+  std::map<std::string, bool> file_cap_exhausted;
+  std::map<std::string, std::size_t> eligible_files;
   for (const auto &name : {"common_leakage", "variable_detail",
                            "stable_island_candidates", "high_impact_headers"}) {
     std::size_t selected = 0;
@@ -806,16 +808,22 @@ plan_progressive_screening(const ProgressiveScreeningOptions &options) {
       selected_non_controls.insert(fact->path);
       ++selected;
     }
+    eligible_files[name] = ranked[name].size();
+    file_cap_exhausted[name] = eligible_files[name] > selected;
   }
   std::size_t control_count = 0;
+  std::size_t eligible_controls = 0;
   for (auto *fact : ranked["controls"]) {
-    if (control_count >= budgets["controls"].max_files)
-      break;
     if (selected_non_controls.contains(fact->path))
+      continue;
+    ++eligible_controls;
+    if (control_count >= budgets["controls"].max_files)
       continue;
     fact->promotion_reasons.insert("controls");
     ++control_count;
   }
+  eligible_files["controls"] = eligible_controls;
+  file_cap_exhausted["controls"] = eligible_controls > control_count;
 
   nlohmann::json file_facts = nlohmann::json::array();
   for (const auto &[path, fact] : facts)
@@ -1030,6 +1038,7 @@ plan_progressive_screening(const ProgressiveScreeningOptions &options) {
 
   std::map<std::string, nlohmann::json> promoted_by_id;
   std::map<std::string, std::size_t> promoted_by_stratum;
+  std::map<std::string, bool> semantic_cap_exhausted;
   std::set<std::string> promoted_paths;
   for (const auto &name :
        {"common_leakage", "variable_detail", "stable_island_candidates",
@@ -1044,7 +1053,9 @@ plan_progressive_screening(const ProgressiveScreeningOptions &options) {
                        std::tie(right.at("touches"), right.at("qualified_name"),
                                 right.at("syntactic_symbol_id"));
               });
-    if (values.size() > budgets[name].max_semantic_elements)
+    semantic_cap_exhausted[name] =
+        values.size() > budgets[name].max_semantic_elements;
+    if (semantic_cap_exhausted[name])
       values.resize(budgets[name].max_semantic_elements);
     promoted_by_stratum[name] = values.size();
     for (auto &candidate : values) {
@@ -1097,9 +1108,24 @@ plan_progressive_screening(const ProgressiveScreeningOptions &options) {
   usage["screening_plan_cache_hit"] = false;
 
   nlohmann::json gaps = nlohmann::json::array();
+  for (const auto &[name, exhausted] : file_cap_exhausted)
+    if (exhausted)
+      gaps.push_back({{"kind", "file_budget_exhausted"},
+                      {"stratum", name},
+                      {"eligible", eligible_files[name]},
+                      {"observed", usage.at(name).at("selected_files")},
+                      {"cap", budgets[name].max_files},
+                      {"effect", "syntax_screening_incomplete"}});
   if (!syntax_complete)
     gaps.push_back({{"kind", "syntax_budget_exhausted"},
                     {"effect", "semantic_history_incomplete"}});
+  for (const auto &[name, exhausted] : semantic_cap_exhausted)
+    if (exhausted)
+      gaps.push_back({{"kind", "semantic_element_budget_exhausted"},
+                      {"stratum", name},
+                      {"observed", promoted_by_stratum[name]},
+                      {"cap", budgets[name].max_semantic_elements},
+                      {"effect", "semantic_history_incomplete"}});
   if (!promoted.empty() && options.revisions.size() > semantic_revisions.size())
     gaps.push_back({{"kind", "capture_revision_budget_exhausted"},
                     {"required", options.revisions.size()},

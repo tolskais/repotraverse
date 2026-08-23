@@ -15,6 +15,7 @@
 #include <chrono>
 #include <exception>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -297,6 +298,14 @@ void git_success(const ProcessOutput &result, const char *operation) {
   if (result.exit_code != 0 || result.timed_out || result.output_truncated)
     throw std::runtime_error(std::string("git failed while attempting to ") +
                              operation + ": " + stable_hash(result.error));
+}
+
+std::string executable_identity(const std::filesystem::path &executable,
+                                const char *description) {
+  const auto version = run_process({executable.string(), "--version"});
+  if (version.exit_code != 0 || version.timed_out || version.output_truncated)
+    throw std::runtime_error(std::string("cannot identify ") + description);
+  return stable_hash(executable.generic_string() + "\n" + version.output);
 }
 
 void reuse_capture(const std::filesystem::path &source,
@@ -815,6 +824,21 @@ run_pilot_experiment(const std::filesystem::path &manifest_path,
                                       .at("semantic_revisions")
                                       .get<std::vector<std::string>>();
   const auto selected_files = progressive.at("promotion").at("paths");
+  if (!manifest.contains("extractor"))
+    throw std::runtime_error("pilot experiment requires extractor");
+  const auto pilot_analysis_identity = stable_hash(
+      nlohmann::json(
+          {{"manifest", manifest},
+           {"resolved_revisions", revisions},
+           {"screening_identity",
+            progressive.value("screening_identity", std::string{})},
+           {"compiler_probe_identity",
+            executable_identity(compiler_probe, "experiment compiler probe")},
+           {"extractor_identity",
+            executable_identity(manifest.at("extractor").get<std::string>(),
+                                "experiment extractor")},
+           {"pilot_engine_identity", "pilot-analysis-v1.1"}})
+          .dump());
   nlohmann::json revision_reports = nlohmann::json::array();
   for (std::size_t index = 0; index < semantic_revisions.size(); ++index) {
     const auto &semantic_revision = semantic_revisions[index];
@@ -826,9 +850,17 @@ run_pilot_experiment(const std::filesystem::path &manifest_path,
                                  (std::to_string(original_index) + "-" +
                                   semantic_revision.substr(0, 12));
     const auto report_path = revision_output / "head-report.v1.json";
+    const auto revision_identity = stable_hash(
+        nlohmann::json({{"pilot_analysis_identity", pilot_analysis_identity},
+                        {"revision", semantic_revision}})
+            .dump());
     if (std::filesystem::exists(report_path)) {
-      revision_reports.push_back(read_json(report_path));
-      continue;
+      auto cached = read_json(report_path);
+      if (cached.value("pilot_revision_identity", std::string{}) ==
+          revision_identity) {
+        revision_reports.push_back(std::move(cached));
+        continue;
+      }
     }
     if (std::filesystem::exists(revision_output)) {
       const auto quarantined =
@@ -874,15 +906,21 @@ run_pilot_experiment(const std::filesystem::path &manifest_path,
         output / ("revision-" + std::to_string(index) + ".v1.json");
     persist(child_manifest, child);
     auto revision_report = run_head_experiment(child_manifest, compiler_probe);
+    revision_report["pilot_analysis_identity"] = pilot_analysis_identity;
+    revision_report["pilot_revision_identity"] = revision_identity;
     revision_report["workspace"] = {
         {"mode", workspace.full() ? "temporary_full" : "sparse"},
         {"closure_complete", materialization.closure_complete},
         {"requested_files", materialization.files.size()}};
+    persist(report_path, revision_report);
     revision_reports.push_back(std::move(revision_report));
   }
 
   std::map<std::tuple<std::string, std::string, std::string>, nlohmann::json>
       series;
+  std::map<std::tuple<std::string, std::string, std::string>,
+           std::set<std::string>>
+      observed_revisions;
   for (const auto &revision : revision_reports) {
     const auto manifest_directory =
         std::filesystem::path(revision.at("output").get<std::string>()) /
@@ -901,17 +939,39 @@ run_pilot_experiment(const std::filesystem::path &manifest_path,
       item["build_variant"] = tu.build_variant;
       item["translation_unit"] = tu.translation_unit;
       item["evidence_tier"] = "semantic";
-      item["coverage_complete"] =
-          progressive.at("coverage").value("history_complete", false);
+      observed_revisions[{tu.build_variant.variant_id, tu.configuration,
+                          tu.translation_unit}]
+          .insert(tu.source_revision);
       if (!item.contains("bundles"))
         item["bundles"] = nlohmann::json::array();
       item["bundles"].push_back(entry.path().string());
     }
   }
   nlohmann::json usable_series = nlohmann::json::array();
-  for (auto &[key, value] : series)
+  nlohmann::json series_evidence_gaps = nlohmann::json::array();
+  const std::set<std::string> required_revisions(semantic_revisions.begin(),
+                                                 semantic_revisions.end());
+  for (auto &[key, value] : series) {
+    std::vector<std::string> missing_revisions;
+    std::set_difference(required_revisions.begin(), required_revisions.end(),
+                        observed_revisions[key].begin(),
+                        observed_revisions[key].end(),
+                        std::back_inserter(missing_revisions));
+    value["coverage_complete"] =
+        progressive.at("coverage").value("history_complete", false) &&
+        missing_revisions.empty();
+    value["missing_revisions"] = missing_revisions;
+    if (!missing_revisions.empty())
+      series_evidence_gaps.push_back(
+          {{"kind", "semantic_revision_observation_missing"},
+           {"build_variant_id", std::get<0>(key)},
+           {"configuration", std::get<1>(key)},
+           {"translation_unit", std::get<2>(key)},
+           {"missing_revisions", missing_revisions},
+           {"effect", "classification_incomplete"}});
     if (value.at("bundles").size() >= 2)
       usable_series.push_back(std::move(value));
+  }
 
   std::map<std::string, std::string> revision_authors;
   std::map<std::string, std::int64_t> revision_times;
@@ -934,6 +994,8 @@ run_pilot_experiment(const std::filesystem::path &manifest_path,
   auto evidence_gaps = progressive.at("evidence_gaps");
   for (const auto &gap : change_evidence.at("evidence_gaps"))
     evidence_gaps.push_back(gap);
+  for (const auto &gap : series_evidence_gaps)
+    evidence_gaps.push_back(gap);
 
   const nlohmann::json progressive_summary = {
       {"artifact", (output / "progressive-screening.v1.json").generic_string()},
@@ -950,6 +1012,7 @@ run_pilot_experiment(const std::filesystem::path &manifest_path,
 
   nlohmann::json result = {{"schema_version", kSchemaVersion},
                            {"artifact_version", 1},
+                           {"pilot_analysis_identity", pilot_analysis_identity},
                            {"revisions", revisions},
                            {"revision_reports", revision_reports},
                            {"series", usable_series},

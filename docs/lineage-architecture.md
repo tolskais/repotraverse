@@ -157,10 +157,13 @@ independent histories; a mapping records which child revision is pinned by a
 parent revision. Cross-repository lineage is never inferred.
 
 HTTP is loopback-only and exposes durable request jobs rather than holding a
-connection for compiler work. The local catalog persists job and review state,
-uses a versioned SQLite schema, and can rebuild its fact index from validated
-schema-v1 Git artifacts. Imported producer records are size-bounded, schema
-checked, content-address verified, and optionally restricted by producer ID.
+connection for compiler work. Git is authoritative for shared facts, reviews,
+tasks, and leases. The versioned SQLite catalog provides a local transactional
+queue, durable request state, and indexes that can be rebuilt from validated
+schema-v1 Git artifacts. Imported compile contexts are local operational input
+and must be reimported after catalog replacement. Imported producer records are
+size-bounded, schema checked, content-address verified, and optionally restricted
+by producer ID.
 
 Functions, methods, records, enums, enumerators, aliases, fields, templates,
 specializations, and macro definitions are logical elements. Extract and inline

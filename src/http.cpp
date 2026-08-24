@@ -272,8 +272,9 @@ bool allowed_http_query(const nlohmann::json &request) {
 
 class RequestExecutor {
 public:
-  explicit RequestExecutor(QueryService &service)
-      : service_(service), worker_([this](std::stop_token stop) { run(stop); }) {}
+  RequestExecutor(QueryService &service, std::size_t maximum_queued)
+      : service_(service), maximum_queued_(maximum_queued),
+        worker_([this](std::stop_token stop) { run(stop); }) {}
 
   ~RequestExecutor() {
     worker_.request_stop();
@@ -287,12 +288,9 @@ public:
     const auto request_id = response.at("request_id").get<std::string>();
     {
       std::scoped_lock lock(mutex_);
-      if (!queued_.contains(request_id) && requests_.size() >= kMaximumQueued)
-        return {{"schema_version", kSchemaVersion},
-                {"ok", false},
-                {"request_id", request_id},
-                {"state", "queued"},
-                {"error", {{"code", "request_queue_full"}}}};
+      if (!queued_.contains(request_id) &&
+          requests_.size() >= maximum_queued_)
+        return service_.fail_request(request_id, "request_queue_full");
       if (queued_.insert(request_id).second)
         requests_.push_back({request_id, request});
     }
@@ -320,8 +318,15 @@ private:
         Telemetry::instance().increment("requests.executor_failures");
         Telemetry::instance().log(
             "error", "request.executor_failed",
-            {{"request_id", pending.first},
-             {"diagnostic_fingerprint", stable_hash(error.what())}});
+             {{"request_id", pending.first},
+              {"diagnostic_fingerprint", stable_hash(error.what())}});
+        try {
+          (void)service_.fail_request(pending.first,
+                                      "request_executor_failed");
+        } catch (...) {
+          Telemetry::instance().increment(
+              "requests.executor_failure_persistence_failures");
+        }
       }
       {
         std::scoped_lock lock(mutex_);
@@ -331,7 +336,7 @@ private:
   }
 
   QueryService &service_;
-  static constexpr std::size_t kMaximumQueued = 128;
+  std::size_t maximum_queued_;
   std::mutex mutex_;
   std::condition_variable_any changed_;
   std::deque<std::pair<std::string, nlohmann::json>> requests_;
@@ -359,7 +364,7 @@ void respond(Socket client, int status, const nlohmann::json &body) {
 void run_http_server(const HttpServerOptions &options, QueryService &service,
                      const nlohmann::json &identity) {
   (void)socket_runtime();
-  RequestExecutor requests(service);
+  RequestExecutor requests(service, options.max_queued_requests);
   const auto listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
   if (listener == kInvalidSocket)
     throw std::runtime_error("cannot create HTTP listener");

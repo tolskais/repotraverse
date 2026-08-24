@@ -85,8 +85,9 @@ add_library(CLI11::CLI11 ALIAS repotraverse-cli11)
 target_include_directories(repotraverse-cli11 SYSTEM INTERFACE
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/CLI11/include")
 
-# Pinned offline dependencies. SQLite is the disposable local materialized
-# index; xxHash supplies schema-fixed XXH3-128 identifiers.
+# Pinned offline dependencies. SQLite supplies the local transactional work
+# queue and rebuildable indexes; xxHash supplies schema-fixed XXH3-128
+# identifiers.
 find_package(Threads REQUIRED)
 
 add_library(repotraverse-xxhash STATIC third_party/xxhash/xxhash.c)
@@ -408,11 +409,8 @@ if(BUILD_TESTING)
     endif()
 endif()
 
-install(TARGETS history-core repotraverse repotraverse-compiler-probe
-    repotraverse-sqlite repotraverse-xxhash repotraverse-tree-sitter
-    RUNTIME DESTINATION bin
-    LIBRARY DESTINATION lib
-    ARCHIVE DESTINATION lib)
+install(TARGETS repotraverse repotraverse-compiler-probe
+    RUNTIME DESTINATION bin)
 if(TARGET clang-extractor)
     install(TARGETS clang-extractor RUNTIME DESTINATION bin)
     if(WIN32)
@@ -438,7 +436,7 @@ install(FILES third_party/tree_sitter_cpp/LICENSE
 install(FILES third_party/CLI11/LICENSE third_party/CLI11/VERSION
     DESTINATION licenses/CLI11)
 install(FILES README.md THIRD_PARTY.md docs/lineage-architecture.md
-    docs/operations.md docs/v1-experiment.md
+    docs/operations.md docs/poc-runbook.md docs/v1-experiment.md
     DESTINATION docs)
 install(FILES LICENSE DESTINATION .)
 install(FILES config/service.example.json config/experiment.example.json

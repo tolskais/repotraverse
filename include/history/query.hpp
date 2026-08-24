@@ -35,6 +35,8 @@ public:
   nlohmann::json request_status(const std::string &request_id,
                                 bool refresh = true) const;
   nlohmann::json cancel_request(const std::string &request_id) const;
+  nlohmann::json fail_request(const std::string &request_id,
+                              const std::string &code) const;
 
 private:
   std::shared_ptr<const FactStore> store_;

@@ -54,7 +54,6 @@ TEST_CASE("HTTP requests are queued and completed without blocking status") {
                                   catalog, coordinator);
     history::HttpServerOptions options;
     options.port = 0;
-    options.sync_seconds = 300;
     std::promise<std::uint16_t> listening;
     options.on_listening = [&](std::uint16_t port) { listening.set_value(port); };
     std::exception_ptr server_error;
@@ -107,6 +106,48 @@ TEST_CASE("HTTP requests are queued and completed without blocking status") {
             "HTTP review result was not persisted");
     server.request_stop();
     server.join();
+    if (server_error)
+      std::rethrow_exception(server_error);
+
+    options.max_queued_requests = 0;
+    std::promise<std::uint16_t> saturated_listening;
+    options.on_listening = [&](std::uint16_t port) {
+      saturated_listening.set_value(port);
+    };
+    server_error = nullptr;
+    std::jthread saturated_server([&, options](std::stop_token stop) mutable {
+      options.stop_token = stop;
+      try {
+        history::run_http_server(
+            options, service,
+            {{"ok", true}, {"producer_id", catalog->producer_id()}});
+      } catch (...) {
+        server_error = std::current_exception();
+        try {
+          saturated_listening.set_exception(server_error);
+        } catch (...) {
+        }
+      }
+    });
+    const auto saturated_endpoint =
+        "http://127.0.0.1:" +
+        std::to_string(saturated_listening.get_future().get());
+    const auto rejected = history::http_query(
+        saturated_endpoint,
+        {{"schema_version", history::kSchemaVersion},
+         {"query", "lineage.review.get"},
+         {"params", {{"relation_id", "not-queued"}}}});
+    require(!rejected.value("ok", true) && rejected.at("state") == "failed",
+            "saturated request did not enter a terminal state");
+    require(rejected.at("error").at("code") == "request_queue_full",
+            "saturated request did not report queue capacity");
+    const auto rejected_status = history::http_request_status(
+        saturated_endpoint,
+        rejected.at("request_id").get<std::string>());
+    require(rejected_status.at("state") == "failed",
+            "saturated request failure was not persisted");
+    saturated_server.request_stop();
+    saturated_server.join();
     if (server_error)
       std::rethrow_exception(server_error);
 }

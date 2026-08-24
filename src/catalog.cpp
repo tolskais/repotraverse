@@ -176,7 +176,7 @@ Catalog::Catalog(std::filesystem::path root) : root_(std::move(root)) {
           "element_dependencies(repository_id,revision,target_element_id);");
   execute("UPDATE scheduled_tasks SET state='pending',next_attempt_at=0 WHERE "
           "state IN ('dispatching','processing');");
-  execute("PRAGMA user_version=3;");
+  execute("PRAGMA user_version=1;");
 }
 
 Catalog::~Catalog() {

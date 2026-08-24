@@ -116,6 +116,40 @@ TEST_CASE("production catalog operations remain durable and consistent") {
             "reverse semantic dependency was not indexed");
 }
 
+TEST_CASE("v1 catalog reopens with its identity and request state intact") {
+  const auto root =
+      std::filesystem::temp_directory_path() /
+      ("repotraverse-catalog-reopen-" +
+       std::to_string(
+           std::chrono::steady_clock::now().time_since_epoch().count()));
+  struct Cleanup {
+    std::filesystem::path path;
+    ~Cleanup() {
+      std::error_code ignored;
+      std::filesystem::remove_all(path, ignored);
+    }
+  } cleanup{root};
+
+  const nlohmann::json request = {{"schema_version", history::kSchemaVersion},
+                                  {"query", "analysis.coverage"},
+                                  {"params", nlohmann::json::object()}};
+  std::string producer_id;
+  std::string request_id;
+  {
+    history::Catalog catalog(root);
+    producer_id = catalog.producer_id();
+    request_id = catalog.create_request(request);
+    catalog.update_request(request_id, "partial", {{"pending_work", 1}});
+  }
+
+  history::Catalog reopened(root);
+  REQUIRE(reopened.producer_id() == producer_id);
+  const auto job = reopened.request_job(request_id);
+  REQUIRE(job.has_value());
+  REQUIRE(job->at("state") == "partial");
+  REQUIRE(job->at("progress").at("pending_work") == 1);
+}
+
 TEST_CASE("reimporting a compile context removes stale file mappings") {
   const auto root =
       std::filesystem::temp_directory_path() /

@@ -245,13 +245,14 @@ repotraverse query --endpoint http://127.0.0.1:7341 --request request.json
 ```
 
 The service creates its producer identity on first startup; do not include the
-local catalog directory in a VM image. SQLite is a disposable materialized
-index and is never committed. Immutable results use producer branches, while
-expiring claims use `repotraverse/claims/<prefix>/<task-id>` branches. The
-service worker owns task acquisition, heartbeat, disk-bounded revision workspace
-reuse, extraction, and publication. A complete dependency closure uses an exact-path
-sparse checkout. Missing closure evidence uses a temporary full checkout and removes it
-when its final lease ends.
+local catalog directory in a VM image. Git is authoritative for shared immutable
+facts, accepted or rejected reviews, tasks, and leases. SQLite is never committed:
+it provides rebuildable indexes plus the local transactional work queue and durable
+request state. Imported compile contexts remain local input and must be reimported if
+the catalog is replaced. The service worker owns task acquisition, heartbeat,
+disk-bounded revision workspace reuse, extraction, and publication. A complete
+dependency closure uses an exact-path sparse checkout. Missing closure evidence uses a
+temporary full checkout and removes it when its final lease ends.
 
 An LLM normally issues only a high-level query:
 

@@ -28,8 +28,9 @@ the local producer. Grant the artifact Git credentials access only to
 .\tools\install-service.ps1 -Config C:\repotraverse\service.json
 ```
 
-Readiness is `GET http://127.0.0.1:7341/v1/status`; local metrics are available
-at `/v1/metrics`. Configure an HTTPS OTLP endpoint to export logs, metrics, and
+Readiness is `GET http://127.0.0.1:7341/v1/health/ready`; service identity and
+status are available at `/v1/status`, and local metrics are available at
+`/v1/metrics`. Configure an HTTPS OTLP endpoint to export logs, metrics, and
 request-planning spans. Export failure is counted locally and never blocks
 analysis.
 

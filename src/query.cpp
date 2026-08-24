@@ -216,6 +216,21 @@ QueryService::cancel_request(const std::string &request_id) const {
   return response;
 }
 
+nlohmann::json QueryService::fail_request(const std::string &request_id,
+                                          const std::string &code) const {
+  if (!catalog_ || !catalog_->request_job(request_id))
+    return {{"schema_version", kSchemaVersion},
+            {"ok", false},
+            {"error", {{"code", "not_found"}}}};
+  catalog_->cancel_request_tasks(request_id);
+  catalog_->update_request(request_id, "failed", {{"phase", "failed"}}, {},
+                           {{"code", code}});
+  auto response = *catalog_->request_job(request_id);
+  response["schema_version"] = kSchemaVersion;
+  response["ok"] = false;
+  return response;
+}
+
 nlohmann::json QueryService::execute(const nlohmann::json &request) const {
   try {
     if (request.value("schema_version", 0U) != kSchemaVersion)

@@ -192,7 +192,6 @@ int run_service(const std::filesystem::path &config_path,
   history::HttpServerOptions server;
   server.address = config.listen_address;
   server.port = config.port;
-  server.sync_seconds = config.sync_seconds;
   server.stop_token = service_stop;
   history::run_http_server(server, service,
                            {{"schema_version", history::kSchemaVersion},

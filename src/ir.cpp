@@ -2,11 +2,24 @@
 
 #include <set>
 #include <stdexcept>
+#include <utility>
 
 #include <xxhash.h>
 
 namespace history {
 namespace {
+std::string format_hash(XXH128_hash_t hash) {
+  char output[33]{};
+  static constexpr char digits[] = "0123456789abcdef";
+  XXH128_canonical_t canonical{};
+  XXH128_canonicalFromHash(&canonical, hash);
+  for (std::size_t index = 0; index < sizeof(canonical.digest); ++index) {
+    output[index * 2] = digits[canonical.digest[index] >> 4U];
+    output[index * 2 + 1] = digits[canonical.digest[index] & 0x0fU];
+  }
+  return output;
+}
+
 template <typename T>
 void optional(const nlohmann::json &value, const char *key, T &output) {
   if (const auto found = value.find(key);
@@ -295,17 +308,46 @@ void from_json(const nlohmann::json &v, SubmoduleRevision &x) {
   optional(v, "child_revision", x.child_revision);
 }
 std::string stable_hash(std::string_view input) {
-  const auto hash = XXH3_128bits(input.data(), input.size());
-  char output[33]{};
-  static constexpr char digits[] = "0123456789abcdef";
-  XXH128_canonical_t canonical{};
-  XXH128_canonicalFromHash(&canonical, hash);
-  for (std::size_t index = 0; index < sizeof(canonical.digest); ++index) {
-    output[index * 2] = digits[canonical.digest[index] >> 4U];
-    output[index * 2 + 1] = digits[canonical.digest[index] & 0x0fU];
-  }
-  return output;
+  return format_hash(XXH3_128bits(input.data(), input.size()));
 }
+
+struct StableHashBuilder::State {
+  State() : value(XXH3_createState()) {
+    if (!value)
+      throw std::runtime_error("cannot initialize stable hash state");
+    if (XXH3_128bits_reset(value) == XXH_ERROR) {
+      XXH3_freeState(value);
+      value = nullptr;
+      throw std::runtime_error("cannot initialize stable hash state");
+    }
+  }
+  ~State() {
+    if (value)
+      XXH3_freeState(value);
+  }
+  XXH3_state_t *value{};
+};
+
+StableHashBuilder::StableHashBuilder() : state_(std::make_unique<State>()) {}
+StableHashBuilder::~StableHashBuilder() = default;
+StableHashBuilder::StableHashBuilder(StableHashBuilder &&) noexcept = default;
+StableHashBuilder &
+StableHashBuilder::operator=(StableHashBuilder &&) noexcept = default;
+
+void StableHashBuilder::append(std::string_view input) {
+  if (!state_)
+    throw std::logic_error("stable hash builder was moved from");
+  if (XXH3_128bits_update(state_->value, input.data(), input.size()) ==
+      XXH_ERROR)
+    throw std::runtime_error("cannot update stable hash state");
+}
+
+std::string StableHashBuilder::digest() const {
+  if (!state_)
+    throw std::logic_error("stable hash builder was moved from");
+  return format_hash(XXH3_128bits_digest(state_->value));
+}
+
 std::string canonical_json(const nlohmann::json &value) {
   return value.dump(-1, ' ', false, nlohmann::json::error_handler_t::strict) +
          '\n';

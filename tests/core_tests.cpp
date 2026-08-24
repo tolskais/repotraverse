@@ -192,6 +192,11 @@ void test_producer_identity_round_trip() {
 void test_schema_hash() {
   require(history::stable_hash("") == "99aa06d3014798d86001c324468d497f",
           "XXH3-128 canonical encoding changed");
+  history::StableHashBuilder streaming;
+  streaming.append("canonical ");
+  streaming.append("body");
+  require(streaming.digest() == history::stable_hash("canonical body"),
+          "streaming XXH3-128 differs from one-shot hashing");
 }
 
 void test_production_config_validation() {

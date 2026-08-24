@@ -20,6 +20,26 @@ if(WIN32 AND NOT (MSVC AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang"))
         "Windows builds require clang-cl from REPOTRAVERSE_LLVM_ROOT; "
         "selected compiler: ${CMAKE_CXX_COMPILER_ID}")
 endif()
+if(WIN32 AND NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+    message(FATAL_ERROR "Repotraverse supports 64-bit Windows only")
+endif()
+
+if(WIN32)
+    enable_language(RC)
+    set(REPOTRAVERSE_WINDOWS_MANIFEST
+        "${CMAKE_CURRENT_SOURCE_DIR}/resources/windows/repotraverse.manifest")
+    configure_file(
+        "${CMAKE_CURRENT_SOURCE_DIR}/resources/windows/repotraverse.rc.in"
+        "${CMAKE_CURRENT_BINARY_DIR}/repotraverse.rc"
+        @ONLY)
+endif()
+
+function(repotraverse_add_windows_manifest target)
+    if(WIN32)
+        target_sources(${target} PRIVATE
+            "${CMAKE_CURRENT_BINARY_DIR}/repotraverse.rc")
+    endif()
+endfunction()
 
 if(REPOTRAVERSE_NATIVE_OPTIMIZATION)
     set(REPOTRAVERSE_BUILD_MODE "native")
@@ -28,6 +48,10 @@ else()
 endif()
 
 add_library(repotraverse-build-options INTERFACE)
+if(MSVC)
+    target_compile_options(repotraverse-build-options INTERFACE
+        $<$<COMPILE_LANGUAGE:CXX>:/utf-8>)
+endif()
 if(REPOTRAVERSE_NATIVE_OPTIMIZATION)
     if(MSVC AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
         target_compile_options(repotraverse-build-options INTERFACE
@@ -100,6 +124,7 @@ add_library(history-core
     src/catalog.cpp
     src/change_evidence.cpp
     src/config.cpp
+    src/encoding.cpp
     src/experiment.cpp
     src/file_history.cpp
     src/git_coordination.cpp
@@ -170,9 +195,42 @@ if(REPOTRAVERSE_CLANG_PROVIDER STREQUAL "package")
         find_package(Clang CONFIG REQUIRED)
     endif()
 
-    if(NOT TARGET clang-cpp OR NOT TARGET LLVM)
+    if(WIN32 AND TARGET clangTooling AND TARGET clangIndex)
+        set(_repotraverse_clang_libraries clangTooling clangIndex)
+        set(_repotraverse_clang_linkage "component")
+    elseif(TARGET clang-cpp AND TARGET LLVM)
+        set(_repotraverse_clang_libraries clang-cpp LLVM)
+        set(_repotraverse_clang_linkage "monolithic")
+    elseif(TARGET clangTooling AND TARGET clangIndex)
+        set(_repotraverse_clang_libraries clangTooling clangIndex)
+        set(_repotraverse_clang_linkage "component")
+    else()
         message(FATAL_ERROR
-            "The LLVM SDK must export the monolithic clang-cpp and LLVM CMake targets")
+            "The LLVM/Clang SDK must export either clangTooling and clangIndex "
+            "or the monolithic clang-cpp and LLVM CMake targets")
+    endif()
+    message(STATUS
+        "Repotraverse Clang linkage: ${_repotraverse_clang_linkage}")
+
+    if(WIN32)
+        if(NOT REPOTRAVERSE_LLVM_ROOT)
+            message(FATAL_ERROR
+                "Windows Clang builds require REPOTRAVERSE_LLVM_ROOT")
+        endif()
+        set(_repotraverse_clang_resource_include
+            "${REPOTRAVERSE_LLVM_ROOT}/lib/clang/${LLVM_VERSION_MAJOR}/include")
+        set(_repotraverse_llvm_license
+            "${REPOTRAVERSE_LLVM_ROOT}/LICENSE.TXT")
+        if(NOT IS_DIRECTORY "${_repotraverse_clang_resource_include}")
+            message(FATAL_ERROR
+                "The LLVM SDK does not contain Clang ${LLVM_VERSION_MAJOR} "
+                "resource headers: ${_repotraverse_clang_resource_include}")
+        endif()
+        if(NOT EXISTS "${_repotraverse_llvm_license}")
+            message(FATAL_ERROR
+                "The LLVM SDK does not contain LICENSE.TXT: "
+                "${REPOTRAVERSE_LLVM_ROOT}")
+        endif()
     endif()
 
     add_executable(clang-extractor extractor/main.cpp)
@@ -181,7 +239,8 @@ if(REPOTRAVERSE_CLANG_PROVIDER STREQUAL "package")
     separate_arguments(_llvm_definitions NATIVE_COMMAND "${LLVM_DEFINITIONS}")
     target_compile_options(clang-extractor PRIVATE ${_llvm_definitions})
     target_link_libraries(clang-extractor PRIVATE
-        history-core repotraverse-build-options clang-cpp LLVM)
+        history-core repotraverse-build-options
+        ${_repotraverse_clang_libraries})
 elseif(NOT REPOTRAVERSE_CLANG_PROVIDER STREQUAL "disabled")
     message(FATAL_ERROR
         "Unknown REPOTRAVERSE_CLANG_PROVIDER=${REPOTRAVERSE_CLANG_PROVIDER}")
@@ -221,6 +280,12 @@ if(BUILD_TESTING)
     target_link_libraries(process-tests PRIVATE
         history-core repotraverse-build-options)
     add_test(NAME process-tests COMMAND process-tests)
+    add_executable(encoding-tests tests/encoding_tests.cpp)
+    target_link_libraries(encoding-tests PRIVATE
+        history-core repotraverse-build-options)
+    target_compile_definitions(encoding-tests PRIVATE
+        PROBE_PATH="$<TARGET_FILE:repotraverse-compiler-probe>")
+    add_test(NAME encoding-tests COMMAND encoding-tests)
     add_executable(stability-tests tests/stability_tests.cpp)
     target_link_libraries(stability-tests PRIVATE
         history-core repotraverse-build-options)
@@ -326,6 +391,12 @@ install(TARGETS history-core repotraverse repotraverse-compiler-probe
     ARCHIVE DESTINATION lib)
 if(TARGET clang-extractor)
     install(TARGETS clang-extractor RUNTIME DESTINATION bin)
+    if(WIN32)
+        install(DIRECTORY "${_repotraverse_clang_resource_include}/"
+            DESTINATION "lib/clang/${LLVM_VERSION_MAJOR}/include")
+        install(FILES "${_repotraverse_llvm_license}"
+            DESTINATION licenses/llvm)
+    endif()
 endif()
 install(FILES third_party/nlohmann_json/LICENSE.MIT
     DESTINATION licenses/nlohmann_json)
@@ -343,11 +414,23 @@ install(FILES third_party/tree_sitter_cpp/LICENSE
 install(FILES README.md THIRD_PARTY.md docs/lineage-architecture.md
     docs/operations.md docs/v1-experiment.md
     DESTINATION docs)
-install(FILES INTERNAL_USE_ONLY.txt DESTINATION .)
+install(FILES LICENSE DESTINATION .)
 install(FILES config/service.example.json config/experiment.example.json
     DESTINATION config)
 if(WIN32)
     install(FILES tools/install-service.ps1 tools/uninstall-service.ps1
         tools/package-windows.ps1
         DESTINATION tools)
+
+    # Every executable that exercises history-core must opt in independently;
+    # a manifest on the parent process does not affect child executables.
+    get_property(_repotraverse_directory_targets DIRECTORY
+        PROPERTY BUILDSYSTEM_TARGETS)
+    foreach(_repotraverse_target IN LISTS _repotraverse_directory_targets)
+        get_target_property(_repotraverse_target_type
+            ${_repotraverse_target} TYPE)
+        if(_repotraverse_target_type STREQUAL "EXECUTABLE")
+            repotraverse_add_windows_manifest(${_repotraverse_target})
+        endif()
+    endforeach()
 endif()

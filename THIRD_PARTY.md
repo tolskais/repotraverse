@@ -1,5 +1,8 @@
 # Third-party components
 
+Repotraverse itself is licensed under the BSD 2-Clause License; see
+[`LICENSE`](LICENSE). The following components retain their upstream licenses.
+
 The v1 package contains these pinned source dependencies:
 
 | Component | Version | License |
@@ -17,5 +20,6 @@ network connection during configuration or compilation.
 
 The Clang-enabled executable is linked against the LLVM/Clang SDK supplied by
 the internal build environment. Its exact LLVM and Clang versions are embedded
-in `clang-extractor --version` and must be added to the release SBOM during the
-packaging step.
+in `clang-extractor --version`. Windows packaging records the LLVM project and
+version in the release SBOM and installs the SDK's `LICENSE.TXT` under
+`licenses/llvm`.

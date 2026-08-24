@@ -1,4 +1,5 @@
 #include "history/config.hpp"
+#include "history/encoding.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -72,13 +73,15 @@ ServiceConfig parse_service_config(const nlohmann::json &value) {
   if (!valid_name(result.repository_id))
     throw std::invalid_argument(
         "service config requires a valid repository_id");
-  result.catalog = value.value("catalog", std::string{});
-  result.artifact_repository =
-      value.value("artifact_repository", std::string{});
-  result.source_repository = value.value("source_repository", std::string{});
-  result.extractor = value.value("extractor", std::string{});
-  result.scratch_root =
-      value.value("scratch_root", (result.catalog / "scratch").string());
+  result.catalog = path_from_utf8(value.value("catalog", std::string{}));
+  result.artifact_repository = path_from_utf8(
+      value.value("artifact_repository", std::string{}));
+  result.source_repository =
+      path_from_utf8(value.value("source_repository", std::string{}));
+  result.extractor = path_from_utf8(value.value("extractor", std::string{}));
+  result.scratch_root = value.contains("scratch_root")
+                            ? path_from_utf8(value.at("scratch_root").get<std::string>())
+                            : result.catalog / "scratch";
   if (result.catalog.empty() || result.artifact_repository.empty())
     throw std::invalid_argument(
         "service config requires catalog and artifact_repository");

@@ -1,3 +1,0 @@
-Repotraverse is an internal engineering tool. Redistribution outside the
-organization is prohibited unless Legal and Security approve the release and
-provide an appropriate product license and support policy.

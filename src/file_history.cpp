@@ -1,4 +1,5 @@
 #include "history/file_history.hpp"
+#include "history/encoding.hpp"
 #include "history/history_plan.hpp"
 #include "history/ir.hpp"
 #include "history/process.hpp"
@@ -52,7 +53,7 @@ nlohmann::json changed_ranges(const std::filesystem::path &repository,
                               const std::string &after,
                               const std::string &before_path,
                               const std::string &after_path) {
-  std::vector<std::string> command = {"git", "-C", repository.string()};
+  std::vector<std::string> command = {"git", "-C", path_to_utf8(repository)};
   if (before.empty()) {
     command.insert(command.end(), {"diff-tree", "--root", "--no-commit-id",
                                    "-p", "--unified=0", after, "--"});
@@ -361,7 +362,7 @@ nlohmann::json plan_file_history(Catalog &catalog,
   const auto plan =
       catalog.root() /
       ("history-" +
-       stable_hash(std::filesystem::absolute(options.repository).string() +
+       stable_hash(path_to_utf8(std::filesystem::absolute(options.repository)) +
                    "\n" + options.ref) +
        ".jsonl");
   write_history_plan(
@@ -422,7 +423,7 @@ nlohmann::json plan_file_history(Catalog &catalog,
   std::reverse(selected.begin(), selected.end());
   std::reverse(path_segments.begin(), path_segments.end());
   const auto request_id = stable_hash(
-      std::filesystem::absolute(options.repository).string() + "\n" +
+      path_to_utf8(std::filesystem::absolute(options.repository)) + "\n" +
       options.ref + "\n" + options.path + "\n" + options.scope + "\n" +
       std::to_string(since) + "\n" + options.extractor_identity);
   std::size_t scheduled = 0, complete = 0;
@@ -482,7 +483,7 @@ nlohmann::json plan_file_history(Catalog &catalog,
           {"request_id", request_id},
           {"identity", identity},
           {"repository",
-           std::filesystem::absolute(options.repository).string()},
+           path_to_utf8(std::filesystem::absolute(options.repository))},
           {"source_commit", revision},
           {"translation_unit", context.translation_unit},
           {"requested_file", endpoint_path},
@@ -524,7 +525,7 @@ nlohmann::json plan_file_history(Catalog &catalog,
                                    options.path));
     }
   const auto resolved = run_process(
-      {"git", "-C", options.repository.string(), "rev-parse", options.ref});
+      {"git", "-C", path_to_utf8(options.repository), "rev-parse", options.ref});
   if (resolved.exit_code != 0)
     throw std::runtime_error("cannot resolve file.history ref: " +
                              resolved.error);

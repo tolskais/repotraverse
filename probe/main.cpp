@@ -14,6 +14,7 @@
 #include <nlohmann/json.hpp>
 
 #include "history/build_info.hpp"
+#include "history/encoding.hpp"
 #include "history/ir.hpp"
 #include "history/process.hpp"
 
@@ -26,9 +27,15 @@
 namespace {
 
 std::string environment(const char *name, bool required = false) {
+#ifdef _WIN32
+  const auto value = history::environment_utf8(name);
+  if (value && !value->empty())
+    return *value;
+#else
   const auto *value = std::getenv(name);
   if (value && *value)
     return value;
+#endif
   if (required)
     throw std::runtime_error(std::string("missing environment variable: ") +
                              name);
@@ -36,7 +43,7 @@ std::string environment(const char *name, bool required = false) {
 }
 
 bool source_extension(const std::filesystem::path &path) {
-  const auto extension = path.extension().string();
+  const auto extension = history::path_to_utf8(path.extension());
   return extension == ".c" || extension == ".cc" || extension == ".cpp" ||
          extension == ".cxx" || extension == ".C" || extension == ".s" ||
          extension == ".S";
@@ -47,7 +54,7 @@ dependency_argument(const std::string &argument) {
   for (const auto &prefix :
        {std::string{"-MF"}, std::string{"--dependency-file="}})
     if (argument.starts_with(prefix) && argument.size() > prefix.size())
-      return std::filesystem::path(argument.substr(prefix.size()));
+      return history::path_from_utf8(argument.substr(prefix.size()));
   if (argument.starts_with("-Wp,")) {
     std::vector<std::string> parts;
     std::string part;
@@ -64,9 +71,9 @@ dependency_argument(const std::string &argument) {
       if ((parts[index] == "-MD" || parts[index] == "-MMD" ||
            parts[index] == "-MF") &&
           index + 1 < parts.size() && !parts[index + 1].empty())
-        return std::filesystem::path(parts[index + 1]);
+        return history::path_from_utf8(parts[index + 1]);
       if (parts[index].starts_with("-MF") && parts[index].size() > 3)
-        return std::filesystem::path(parts[index].substr(3));
+        return history::path_from_utf8(parts[index].substr(3));
     }
   }
   return std::nullopt;
@@ -83,7 +90,7 @@ std::string repository_path(const std::filesystem::path &path,
       std::filesystem::relative(absolute.lexically_normal(), repository, error);
   if (error || relative.empty() || *relative.begin() == "..")
     return {};
-  return relative.generic_string();
+  return history::generic_path_to_utf8(relative);
 }
 
 void materialize(const std::filesystem::path &path,
@@ -96,22 +103,29 @@ void materialize(const std::filesystem::path &path,
   std::ofstream placeholder(output, std::ios::binary | std::ios::app);
 }
 
-std::vector<std::string>
+struct CapturedDependencies {
+  std::vector<std::string> paths;
+  std::string encoding;
+};
+
+CapturedDependencies
 dependencies(const std::filesystem::path &dependency_output,
              const std::filesystem::path &repository,
              const std::filesystem::path &cwd) {
   std::vector<std::string> result;
   if (dependency_output.empty())
-    return result;
+    return {result, {}};
   const auto path = dependency_output.is_absolute() ? dependency_output
                                                     : cwd / dependency_output;
   std::error_code error;
   const auto size = std::filesystem::file_size(path, error);
   if (error || size > 8ULL * 1024ULL * 1024ULL)
-    return result;
+    return {result, {}};
   std::ifstream input(path, std::ios::binary);
-  std::string content{std::istreambuf_iterator<char>(input),
-                      std::istreambuf_iterator<char>()};
+  const std::string bytes{std::istreambuf_iterator<char>(input),
+                          std::istreambuf_iterator<char>()};
+  auto decoded = history::decode_text(bytes, true);
+  auto &content = decoded.text;
   for (std::size_t position = 0;
        (position = content.find("\\\n", position)) != std::string::npos;)
     content.replace(position, 2, " ");
@@ -122,7 +136,8 @@ dependencies(const std::filesystem::path &dependency_output,
   const auto emit = [&] {
     if (token.empty())
       return;
-    const auto relative = repository_path(token, repository, cwd);
+    const auto relative =
+        repository_path(history::path_from_utf8(token), repository, cwd);
     if (!relative.empty())
       result.push_back(relative);
     token.clear();
@@ -137,22 +152,23 @@ dependencies(const std::filesystem::path &dependency_output,
   emit();
   std::sort(result.begin(), result.end());
   result.erase(std::unique(result.begin(), result.end()), result.end());
-  return result;
+  return {std::move(result), std::move(decoded.encoding)};
 }
 
 } // namespace
 
-int main(int argc, char **argv) {
+int compiler_probe_main(int argc, char **argv) {
   try {
     if (argc == 2 && std::string(argv[1]) == "--version") {
       std::cout << "repotraverse compiler-probe "
                 << history::build::kToolVersion << " artifact v1\n";
       return 0;
     }
-    const auto capture_directory = std::filesystem::path(
+    const auto capture_directory = history::path_from_utf8(
         environment("REPOTRAVERSE_CAPTURE_DIRECTORY", true));
     const auto repository = std::filesystem::weakly_canonical(
-        environment("REPOTRAVERSE_CAPTURE_REPOSITORY", true));
+        history::path_from_utf8(
+            environment("REPOTRAVERSE_CAPTURE_REPOSITORY", true)));
     const auto cwd = std::filesystem::current_path();
     std::vector<std::string> arguments;
     std::vector<std::string> response_files;
@@ -167,24 +183,25 @@ int main(int argc, char **argv) {
            argument == "--depend" || argument == "-MF" ||
            argument == "--dependency-file") &&
           index + 1 < argc) {
-        const auto value = std::filesystem::path(argv[index + 1]);
+        const auto value = history::path_from_utf8(argv[index + 1]);
         if (argument == "--depend" || argument == "-MF" ||
             argument == "--dependency-file")
           dependency_output = value;
         else
           output = value;
       } else if (argument.starts_with("--output=")) {
-        output = argument.substr(9);
+        output = history::path_from_utf8(argument.substr(9));
       } else if (argument.starts_with("--depend=")) {
-        dependency_output = argument.substr(9);
+        dependency_output = history::path_from_utf8(argument.substr(9));
       } else if (argument.size() > 2 && argument.starts_with("-o")) {
-        output = argument.substr(2);
+        output = history::path_from_utf8(argument.substr(2));
       } else if (const auto dependency = dependency_argument(argument)) {
         dependency_output = *dependency;
       } else if (argument == "-MD" || argument == "-MMD") {
         implicit_dependency_output = true;
-      } else if (!argument.starts_with('-') && source_extension(argument)) {
-        source = argument;
+      } else if (!argument.starts_with('-') &&
+                 source_extension(history::path_from_utf8(argument))) {
+        source = history::path_from_utf8(argument);
       }
     }
     if (dependency_output.empty() && implicit_dependency_output &&
@@ -194,18 +211,18 @@ int main(int argc, char **argv) {
     }
     std::filesystem::create_directories(capture_directory);
     std::map<std::string, std::string> response_file_contents;
+    std::map<std::string, std::string> response_file_encodings;
     for (const auto &response_file : response_files) {
-      const auto path = std::filesystem::path(response_file).is_absolute()
-                            ? std::filesystem::path(response_file)
-                            : cwd / response_file;
+      const auto response_path = history::path_from_utf8(response_file);
+      const auto path = response_path.is_absolute() ? response_path
+                                                    : cwd / response_path;
       std::error_code error;
       const auto size = std::filesystem::file_size(path, error);
       if (error || size > 1024ULL * 1024ULL)
         throw std::runtime_error("response file is missing or exceeds 1 MiB");
-      std::ifstream input(path, std::ios::binary);
-      response_file_contents[response_file] =
-          std::string(std::istreambuf_iterator<char>(input),
-                      std::istreambuf_iterator<char>());
+      auto decoded = history::read_text_file(path, true);
+      response_file_contents[response_file] = std::move(decoded.text);
+      response_file_encodings[response_file] = std::move(decoded.encoding);
     }
     nlohmann::json record = {
         {"schema_version", history::kSchemaVersion},
@@ -223,6 +240,7 @@ int main(int argc, char **argv) {
         {"arguments", arguments},
         {"response_files", response_files},
         {"response_file_contents", response_file_contents},
+        {"response_file_encodings", response_file_encodings},
         {"output", repository_path(output, repository, cwd)},
         {"environment",
          {{"LANG", environment("LANG")},
@@ -256,7 +274,12 @@ int main(int argc, char **argv) {
       materialize(output, cwd);
       materialize(dependency_output, cwd);
     }
-    record["project_files"] = dependencies(dependency_output, repository, cwd);
+    auto captured_dependencies =
+        dependencies(dependency_output, repository, cwd);
+    record["project_files"] = std::move(captured_dependencies.paths);
+    if (!captured_dependencies.encoding.empty())
+      record["dependency_file_encoding"] =
+          std::move(captured_dependencies.encoding);
     std::ofstream captured(destination, std::ios::binary);
     captured << record.dump() << '\n';
     captured.close();
@@ -273,3 +296,19 @@ int main(int argc, char **argv) {
     return 2;
   }
 }
+
+#ifdef _WIN32
+int wmain(int argc, wchar_t **wide_argv) {
+  std::vector<std::string> arguments;
+  arguments.reserve(static_cast<std::size_t>(argc));
+  for (int index = 0; index < argc; ++index)
+    arguments.push_back(history::wide_to_utf8(wide_argv[index]));
+  std::vector<char *> argv;
+  argv.reserve(arguments.size());
+  for (auto &argument : arguments)
+    argv.push_back(argument.data());
+  return compiler_probe_main(argc, argv.data());
+}
+#else
+int main(int argc, char **argv) { return compiler_probe_main(argc, argv); }
+#endif

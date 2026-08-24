@@ -1,4 +1,5 @@
 #include "history/http.hpp"
+#include "history/encoding.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -9,7 +10,9 @@
 #include <thread>
 
 #ifdef _WIN32
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
 using Socket = SOCKET;
@@ -45,6 +48,11 @@ struct SocketRuntime {
 #endif
   }
 };
+
+SocketRuntime &socket_runtime() {
+  static SocketRuntime runtime;
+  return runtime;
+}
 
 void close_socket(Socket socket) {
 #ifdef _WIN32
@@ -163,7 +171,7 @@ Socket connect_to(const std::string &host, std::uint16_t port) {
 nlohmann::json request_http(const std::string &endpoint,
                             std::string_view method, std::string_view path,
                             const nlohmann::json *body) {
-  SocketRuntime runtime;
+  (void)socket_runtime();
   const auto [host, port] = parse_endpoint(endpoint);
   const auto socket = connect_to(host, port);
   struct SocketGuard {
@@ -214,7 +222,7 @@ void respond(Socket client, int status, const nlohmann::json &body) {
 
 void run_http_server(const HttpServerOptions &options, QueryService &service,
                      const nlohmann::json &identity) {
-  SocketRuntime runtime;
+  (void)socket_runtime();
   const auto listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
   if (listener == kInvalidSocket)
     throw std::runtime_error("cannot create HTTP listener");
@@ -319,12 +327,13 @@ void run_http_server(const HttpServerOptions &options, QueryService &service,
     } catch (const std::exception &error) {
       Telemetry::instance().increment("http.request_errors");
       Telemetry::instance().log("warning", "http.request_failed",
-                                {{"message", error.what()}});
+                                {{"message", utf8_lossy(error.what())}});
       try {
         respond(client, 400,
                 {{"ok", false},
                  {"error",
-                  {{"code", "invalid_request"}, {"message", error.what()}}}});
+                  {{"code", "invalid_request"},
+                   {"message", utf8_lossy(error.what())}}}});
       } catch (...) {
       }
     }

@@ -1,4 +1,5 @@
 #include "history/change_evidence.hpp"
+#include "history/encoding.hpp"
 
 #include "history/ir.hpp"
 #include "history/process.hpp"
@@ -31,11 +32,7 @@ struct TuView {
 using ViewKey = std::tuple<std::string, std::string, std::string>;
 
 nlohmann::json read_json(const std::filesystem::path &path) {
-  std::ifstream input(path);
-  if (!input)
-    throw std::runtime_error("cannot read semantic evidence: " +
-                             path.string());
-  return nlohmann::json::parse(input);
+  return nlohmann::json::parse(read_text_file(path).text);
 }
 
 std::vector<nlohmann::json>
@@ -52,7 +49,7 @@ capture_records(const std::filesystem::path &directory) {
 
 std::map<ViewKey, TuView> views(const nlohmann::json &report) {
   const auto output =
-      std::filesystem::path(report.at("output").get<std::string>());
+      path_from_utf8(report.at("output").get<std::string>());
   std::map<std::string, std::set<std::string>> project_files;
   for (const auto &record : capture_records(output / "capture")) {
     const auto tu = record.value("translation_unit", std::string{});
@@ -103,7 +100,7 @@ std::map<ViewKey, TuView> views(const nlohmann::json &report) {
 std::set<std::string> changed_paths(const std::filesystem::path &repository,
                                     const std::string &before,
                                     const std::string &after) {
-  const auto process = run_process({"git", "-C", repository.string(), "diff",
+  const auto process = run_process({"git", "-C", path_to_utf8(repository), "diff",
                                     "--name-only", "-z", before, after,
                                     "--"});
   if (process.exit_code != 0 || process.timed_out || process.output_truncated)
@@ -114,8 +111,10 @@ std::set<std::string> changed_paths(const std::filesystem::path &repository,
     const auto end = process.output.find('\0', begin);
     const auto path = process.output.substr(
         begin, end == std::string::npos ? end : end - begin);
-    if (!path.empty())
+    if (!path.empty()) {
+      require_utf8(path, "Git path");
       result.insert(path);
+    }
     if (end == std::string::npos)
       break;
     begin = end + 1;

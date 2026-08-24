@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <filesystem>
 #include <iostream>
 #include <set>
@@ -44,6 +45,20 @@ int main() {
     }
     require(declaration && definition,
             "declaration and definition sites were not preserved separately");
+    const auto declared = std::find_if(
+        manifest.elements.begin(), manifest.elements.end(), [](const auto &item) {
+          return item.qualified_name == "declared" && item.kind == "function";
+        });
+    require(declared != manifest.elements.end(),
+            "golden function was not extracted");
+    const auto declared_variant = std::find_if(
+        manifest.variants.begin(), manifest.variants.end(),
+        [&](const auto &item) { return item.element_id == declared->element_id; });
+    require(declared_variant != manifest.variants.end(),
+            "golden function variant was not extracted");
+    require(declared_variant->implementation_fingerprint ==
+                "56446a49e36ec7fa690faa8ef99e9fb2",
+            "canonical body fingerprint changed");
     std::cout << "extractor entity tests passed\n";
     return 0;
   } catch (const std::exception &error) {

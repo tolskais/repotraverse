@@ -1,4 +1,5 @@
 #include "history/stability.hpp"
+#include "history/encoding.hpp"
 
 #include "history/ir.hpp"
 #include "history/lineage.hpp"
@@ -62,10 +63,7 @@ std::string developer_label(const nlohmann::json &partition,
 }
 
 nlohmann::json load_json(const std::filesystem::path &path) {
-  std::ifstream input(path);
-  if (!input)
-    throw std::runtime_error("cannot open stability experiment manifest");
-  return nlohmann::json::parse(input);
+  return nlohmann::json::parse(read_text_file(path).text);
 }
 
 void persist(const std::filesystem::path &path, const nlohmann::json &value) {
@@ -437,7 +435,7 @@ run_stability_experiment(const std::filesystem::path &manifest_path) {
       {"elements", std::move(rows)}};
   if (manifest.contains("report")) {
     const auto report =
-        std::filesystem::path(manifest.at("report").get<std::string>());
+        path_from_utf8(manifest.at("report").get<std::string>());
     persist(report, result);
     auto csv_report = report;
     csv_report.replace_extension(".csv");

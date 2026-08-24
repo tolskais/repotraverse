@@ -1,4 +1,5 @@
 #include "history/worker.hpp"
+#include "history/encoding.hpp"
 #include "history/ir.hpp"
 #include "history/process.hpp"
 #include "history/telemetry.hpp"
@@ -39,7 +40,7 @@ BackgroundWorker::BackgroundWorker(Catalog &c, GitCoordinator &g,
     : catalog_(c), coordinator_(g), options_(std::move(o)) {
   if (options_.extractor.empty() || options_.scratch_root.empty())
     throw std::invalid_argument("worker requires extractor and scratch_root");
-  const auto version = run_process({options_.extractor.string(), "--version"});
+  const auto version = run_process({path_to_utf8(options_.extractor), "--version"});
   git_ok(version, "identify extractor");
   extractor_identity_ = stable_hash(trim(version.output));
   std::filesystem::create_directories(options_.scratch_root);
@@ -76,8 +77,7 @@ nlohmann::json BackgroundWorker::run_once() {
     catalog_.set_task_state(task_id, "processing");
     const auto repository =
         options_.source_repository.empty()
-            ? std::filesystem::path(
-                  pending->at("repository").get<std::string>())
+            ? path_from_utf8(pending->at("repository").get<std::string>())
             : options_.source_repository;
     const auto revision = pending->at("source_commit").get<std::string>();
     if (revision.empty() || revision.starts_with('-'))
@@ -87,28 +87,28 @@ nlohmann::json BackgroundWorker::run_once() {
             options_.repository_id)
       throw std::runtime_error("task repository identity mismatch");
     const auto tu = pending->at("translation_unit").get<std::string>();
-    const auto relative = std::filesystem::path(tu).lexically_normal();
+    const auto relative = path_from_utf8(tu).lexically_normal();
     if (relative.is_absolute() || relative.empty() || *relative.begin() == "..")
       throw std::runtime_error("translation unit must be repository-relative");
     auto materialization = pending->value(
         "materialization",
-        MaterializationManifest{{relative.generic_string()},
+        MaterializationManifest{{generic_path_to_utf8(relative)},
                                 false,
                                 {"legacy task has no dependency closure"}});
     if (std::find(materialization.files.begin(), materialization.files.end(),
-                  relative.generic_string()) == materialization.files.end())
-      materialization.files.push_back(relative.generic_string());
+                  generic_path_to_utf8(relative)) == materialization.files.end())
+      materialization.files.push_back(generic_path_to_utf8(relative));
     auto workspace =
         options_.workspace_pool->acquire(repository, revision, materialization,
                                          !materialization.closure_complete);
     const auto &worktree = workspace.path();
     const RevisionTreeIndex tree(repository, revision);
-    const auto blob = tree.blob_at(relative.generic_string());
+    const auto blob = tree.blob_at(generic_path_to_utf8(relative));
     if (!blob)
       throw std::runtime_error(
           "resolve source blob: path is absent at revision");
     std::vector<std::string> command = {
-        options_.extractor.string(),
+        path_to_utf8(options_.extractor),
         "--source-revision",
         revision,
         "--configuration",
@@ -120,10 +120,10 @@ nlohmann::json BackgroundWorker::run_once() {
         "--source-blob",
         *blob,
         "--project-root",
-        worktree.string(),
+        path_to_utf8(worktree),
         "--repository-id",
         options_.repository_id,
-        (worktree / relative).string(),
+        path_to_utf8(worktree / relative),
         "--"};
     for (const auto &argument : pending->at("frontend_arguments")) {
       const auto value = argument.get<std::string>();
@@ -165,7 +165,7 @@ nlohmann::json BackgroundWorker::run_once() {
       if (!validate_tu_manifest(manifest, manifest_error))
         throw std::runtime_error(manifest_error);
       if (manifest.source_revision != revision ||
-          manifest.translation_unit != relative.generic_string() ||
+          manifest.translation_unit != generic_path_to_utf8(relative) ||
           manifest.context_id != pending->at("context_id").get<std::string>() ||
           (!options_.repository_id.empty() &&
            manifest.repository_id != options_.repository_id))

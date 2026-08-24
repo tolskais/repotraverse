@@ -1,4 +1,5 @@
 #include "history/query.hpp"
+#include "history/encoding.hpp"
 
 #include "history/build_import.hpp"
 #include "history/catalog.hpp"
@@ -26,16 +27,13 @@ std::filesystem::path path_parameter(const nlohmann::json &params,
                                      const char *name) {
   if (!params.contains(name) || !params.at(name).is_string())
     throw std::runtime_error(std::string("missing path parameter: ") + name);
-  return params.at(name).get<std::string>();
+  return path_from_utf8(params.at(name).get<std::string>());
 }
 std::vector<LineageAssertion> assertions_from(const nlohmann::json &params) {
   if (!params.contains("assertions"))
     return {};
-  std::ifstream input(path_parameter(params, "assertions"));
-  if (!input)
-    throw std::runtime_error("cannot open lineage assertions");
-  nlohmann::json value;
-  input >> value;
+  const auto value = nlohmann::json::parse(
+      read_text_file(path_parameter(params, "assertions")).text);
   if (value.value("schema_version", 0U) != kSchemaVersion ||
       !value.contains("assertions"))
     throw std::runtime_error("invalid lineage assertion resource");
@@ -58,11 +56,7 @@ std::vector<LineageAssertion> assertions_from(const nlohmann::json &params) {
 } // namespace
 
 EvidenceBundle MemoryFactStore::load(const std::filesystem::path &path) const {
-  std::ifstream input(path);
-  if (!input)
-    throw std::runtime_error("cannot open evidence bundle: " + path.string());
-  nlohmann::json value;
-  input >> value;
+  const auto value = nlohmann::json::parse(read_text_file(path).text);
   if (value.value("record_type", std::string{}) == "tu_manifest") {
     const auto manifest = value.get<TuManifest>();
     EvidenceBundle bundle;
@@ -605,10 +599,8 @@ nlohmann::json QueryService::execute(const nlohmann::json &request) const {
            {{"bundle_count", bundles.size()}, {"elements", std::move(rows)}}}};
     }
     if (query == "element.explain") {
-      std::ifstream input(path_parameter(params, "report"));
-      if (!input)
-        throw std::runtime_error("cannot open stability report");
-      const auto report = nlohmann::json::parse(input);
+      const auto report = nlohmann::json::parse(
+          read_text_file(path_parameter(params, "report")).text);
       if (report.value("schema_version", 0U) != kSchemaVersion ||
           !report.contains("elements") || !report.at("elements").is_array())
         throw std::runtime_error(
@@ -695,7 +687,9 @@ nlohmann::json QueryService::execute(const nlohmann::json &request) const {
     return {
         {"schema_version", kSchemaVersion},
         {"ok", false},
-        {"error", {{"code", "invalid_request"}, {"message", error.what()}}}};
+        {"error",
+         {{"code", "invalid_request"},
+          {"message", utf8_lossy(error.what())}}}};
   }
 }
 } // namespace history

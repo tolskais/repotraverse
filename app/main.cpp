@@ -9,6 +9,7 @@
 #include "history/build_info.hpp"
 #include "history/catalog.hpp"
 #include "history/config.hpp"
+#include "history/encoding.hpp"
 #include "history/experiment.hpp"
 #include "history/git_coordination.hpp"
 #include "history/http.hpp"
@@ -19,7 +20,9 @@
 #include "history/worker.hpp"
 
 #ifdef _WIN32
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #endif
 
@@ -29,6 +32,10 @@ nlohmann::json read_json(std::istream &input) {
   nlohmann::json value;
   input >> value;
   return value;
+}
+
+nlohmann::json read_json(const std::filesystem::path &path) {
+  return nlohmann::json::parse(history::read_text_file(path).text);
 }
 
 void usage() {
@@ -61,17 +68,15 @@ nlohmann::json experiment_summary(const std::string &action,
       {"command", "experiment " + action},
       {"output", result.value("output", std::string{})}};
   if (action == "capture") {
-    summary["report"] =
-        (std::filesystem::path(summary.at("output").get<std::string>()) /
-         "capture-report.v1.json")
-            .generic_string();
+    summary["report"] = history::generic_path_to_utf8(
+        history::path_from_utf8(summary.at("output").get<std::string>()) /
+        "capture-report.v1.json");
     summary["failed_runs"] = result.value("failed_runs", 0U);
     summary["import"] = result.value("import", nlohmann::json::object());
   } else if (action == "head") {
-    summary["report"] =
-        (std::filesystem::path(summary.at("output").get<std::string>()) /
-         "head-report.v1.json")
-            .generic_string();
+    summary["report"] = history::generic_path_to_utf8(
+        history::path_from_utf8(summary.at("output").get<std::string>()) /
+        "head-report.v1.json");
     for (const auto *field :
          {"revision", "translation_unit_contexts", "states", "failure_taxonomy",
           "extracted_elements", "cache_hits", "extraction_elapsed_ms",
@@ -79,10 +84,9 @@ nlohmann::json experiment_summary(const std::string &action,
       if (result.contains(field))
         summary[field] = result.at(field);
   } else if (action == "pilot") {
-    summary["report"] =
-        (std::filesystem::path(summary.at("output").get<std::string>()) /
-         "pilot-report.v1.json")
-            .generic_string();
+    summary["report"] = history::generic_path_to_utf8(
+        history::path_from_utf8(summary.at("output").get<std::string>()) /
+        "pilot-report.v1.json");
     summary["revision_count"] =
         result.value("revisions", nlohmann::json::array()).size();
     summary["semantic_series"] =
@@ -124,10 +128,7 @@ history::EvidenceBundle synthetic_bundle(std::size_t count, bool changed) {
 
 int run_service(const std::filesystem::path &config_path,
                 std::stop_token service_stop = {}) {
-  std::ifstream input(config_path);
-  if (!input)
-    throw std::runtime_error("cannot open service configuration");
-  const auto config = history::parse_service_config(read_json(input));
+  const auto config = history::parse_service_config(read_json(config_path));
   history::set_default_process_timeout(
       std::chrono::seconds(config.git_timeout_seconds));
   history::Telemetry::instance().configure(config.otlp_endpoint,
@@ -266,7 +267,7 @@ void WINAPI service_entry(DWORD, wchar_t **) {
 
 } // namespace
 
-int main(int argc, char **argv) {
+int repotraverse_main(int argc, char **argv) {
   if (argc < 2) {
     usage();
     return 2;
@@ -289,17 +290,21 @@ int main(int argc, char **argv) {
         usage();
         return 2;
       }
-      auto probe = std::filesystem::absolute(argv[0]).parent_path() /
+      auto probe = std::filesystem::absolute(history::path_from_utf8(argv[0]))
+                       .parent_path() /
                    "repotraverse-compiler-probe";
 #ifdef _WIN32
       probe += ".exe";
 #endif
       const auto action = std::string(argv[2]);
       const auto result =
-          action == "capture" ? history::run_capture_experiment(argv[4], probe)
-          : action == "head"  ? history::run_head_experiment(argv[4], probe)
-          : action == "pilot" ? history::run_pilot_experiment(argv[4], probe)
-                              : history::run_stability_experiment(argv[4]);
+          action == "capture"
+              ? history::run_capture_experiment(history::path_from_utf8(argv[4]), probe)
+          : action == "head"
+              ? history::run_head_experiment(history::path_from_utf8(argv[4]), probe)
+          : action == "pilot"
+              ? history::run_pilot_experiment(history::path_from_utf8(argv[4]), probe)
+              : history::run_stability_experiment(history::path_from_utf8(argv[4]));
       std::cout << history::canonical_json(
                        full_output ? result
                                    : experiment_summary(action, result))
@@ -311,7 +316,7 @@ int main(int argc, char **argv) {
         usage();
         return 2;
       }
-      return run_service(argv[3]);
+      return run_service(history::path_from_utf8(argv[3]));
     }
 #ifdef _WIN32
     if (command == "service") {
@@ -319,7 +324,7 @@ int main(int argc, char **argv) {
         usage();
         return 2;
       }
-      windows_service_config = argv[3];
+      windows_service_config = history::path_from_utf8(argv[3]);
       SERVICE_TABLE_ENTRYW table[] = {
           {const_cast<wchar_t *>(L"Repotraverse"), service_entry},
           {nullptr, nullptr}};
@@ -361,12 +366,14 @@ int main(int argc, char **argv) {
     }
     if (command == "identity" && argc == 5 && std::string(argv[2]) == "init" &&
         std::string(argv[3]) == "--catalog") {
-      history::Catalog catalog(argv[4]);
+      const auto catalog_path = history::path_from_utf8(argv[4]);
+      history::Catalog catalog(catalog_path);
       std::cout << history::canonical_json(
           {{"schema_version", history::kSchemaVersion},
            {"ok", true},
            {"producer_id", catalog.producer_id()},
-           {"catalog", std::filesystem::absolute(argv[4]).string()}});
+           {"catalog", history::path_to_utf8(
+                           std::filesystem::absolute(catalog_path))}});
       return 0;
     }
     if (command == "benchmark") {
@@ -395,10 +402,8 @@ int main(int argc, char **argv) {
     if (command == "facts" && argc >= 3 &&
         std::string(argv[2]) == "canonicalize") {
       if (argc >= 4) {
-        std::ifstream input(argv[3]);
-        if (!input)
-          throw std::runtime_error("cannot open input file");
-        std::cout << history::canonical_json(read_json(input));
+        std::cout << history::canonical_json(
+            read_json(history::path_from_utf8(argv[3])));
       } else {
         std::cout << history::canonical_json(read_json(std::cin));
       }
@@ -410,18 +415,12 @@ int main(int argc, char **argv) {
       if (argc == 6 && std::string(argv[2]) == "--endpoint" &&
           std::string(argv[4]) == "--request") {
         endpoint = argv[3];
-        std::ifstream input(argv[5]);
-        if (!input)
-          throw std::runtime_error("cannot open request file");
-        request = read_json(input);
+        request = read_json(history::path_from_utf8(argv[5]));
       } else if (argc == 4 && std::string(argv[2]) == "--endpoint") {
         endpoint = argv[3];
         request = read_json(std::cin);
       } else if (argc == 4 && std::string(argv[2]) == "--request") {
-        std::ifstream input(argv[3]);
-        if (!input)
-          throw std::runtime_error("cannot open request file");
-        request = read_json(input);
+        request = read_json(history::path_from_utf8(argv[3]));
       } else if (argc == 2) {
         request = read_json(std::cin);
       } else {
@@ -442,7 +441,24 @@ int main(int argc, char **argv) {
     std::cout << history::canonical_json(
         {{"schema_version", history::kSchemaVersion},
          {"ok", false},
-         {"error", {{"code", "fatal"}, {"message", error.what()}}}});
+         {"error", {{"code", "fatal"},
+                    {"message", history::utf8_lossy(error.what())}}}});
     return 1;
   }
 }
+
+#ifdef _WIN32
+int wmain(int argc, wchar_t **wide_argv) {
+  std::vector<std::string> arguments;
+  arguments.reserve(static_cast<std::size_t>(argc));
+  for (int index = 0; index < argc; ++index)
+    arguments.push_back(history::wide_to_utf8(wide_argv[index]));
+  std::vector<char *> argv;
+  argv.reserve(arguments.size());
+  for (auto &argument : arguments)
+    argv.push_back(argument.data());
+  return repotraverse_main(argc, argv.data());
+}
+#else
+int main(int argc, char **argv) { return repotraverse_main(argc, argv); }
+#endif

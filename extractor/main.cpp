@@ -21,11 +21,14 @@
 #include "clang/Lex/Preprocessor.h"
 #include "clang/Tooling/CommonOptionsParser.h"
 #include "clang/Tooling/Tooling.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/Config/llvm-config.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include "history/build_info.hpp"
+#include "history/encoding.hpp"
 #include "history/ir.hpp"
 
 namespace {
@@ -62,11 +65,12 @@ std::string usr(const clang::Decl *declaration) {
       sources.getSpellingLoc(declaration->getCanonicalDecl()->getLocation()));
   if (!location.isValid())
     return result;
-  std::filesystem::path file(location.getFilename());
+  auto file = history::path_from_utf8(location.getFilename());
   if (!project_root.empty()) {
     std::error_code error;
     const auto root =
-        std::filesystem::weakly_canonical(project_root.getValue(), error);
+        std::filesystem::weakly_canonical(
+            history::path_from_utf8(project_root.getValue()), error);
     const auto canonical = std::filesystem::weakly_canonical(file, error);
     if (!error) {
       const auto relative = canonical.lexically_relative(root);
@@ -74,26 +78,28 @@ std::string usr(const clang::Decl *declaration) {
         file = relative;
     }
   }
-  return result + "@anonymous:" + file.generic_string() + ":" +
+  return result + "@anonymous:" + history::generic_path_to_utf8(file) + ":" +
          std::to_string(location.getLine()) + ":" +
          std::to_string(location.getColumn());
 }
 
 std::string normalized_project_path(const std::string &path) {
   if (project_root.empty() || path.empty())
-    return std::filesystem::path(path).generic_string();
+    return history::generic_path_to_utf8(history::path_from_utf8(path));
   std::error_code error;
-  const auto file = std::filesystem::weakly_canonical(path, error);
+  const auto file = std::filesystem::weakly_canonical(
+      history::path_from_utf8(path), error);
   if (error)
-    return std::filesystem::path(path).generic_string();
+    return history::generic_path_to_utf8(history::path_from_utf8(path));
   const auto root =
-      std::filesystem::weakly_canonical(project_root.getValue(), error);
+      std::filesystem::weakly_canonical(
+          history::path_from_utf8(project_root.getValue()), error);
   if (error)
-    return std::filesystem::path(path).generic_string();
+    return history::generic_path_to_utf8(history::path_from_utf8(path));
   const auto relative = file.lexically_relative(root);
   if (!relative.empty() && *relative.begin() != "..")
-    return relative.generic_string();
-  return file.generic_string();
+    return history::generic_path_to_utf8(relative);
+  return history::generic_path_to_utf8(file);
 }
 
 std::string logical_id(const clang::NamedDecl *declaration,
@@ -151,15 +157,27 @@ public:
   BodyModel(const clang::FunctionDecl *function, std::string translation_unit)
       : translation_unit_(std::move(translation_unit)) {
     for (std::size_t index = 0; index < function->getNumParams(); ++index)
-      local_ids_.emplace(function->getParamDecl(index)->getCanonicalDecl(),
-                         index);
+      local_ids_.try_emplace(
+          function->getParamDecl(index)->getCanonicalDecl(), index);
     next_local_id_ = function->getNumParams();
   }
-  std::string build(const clang::Stmt *statement) {
-    if (!statement)
-      return "empty";
+  std::string fingerprint(const clang::Stmt *statement) {
+    history::StableHashBuilder hash;
+    emit(statement, hash);
+    return hash.digest();
+  }
+  std::vector<std::string> references() const {
+    return {references_.begin(), references_.end()};
+  }
+
+private:
+  void emit(const clang::Stmt *statement, history::StableHashBuilder &hash) {
+    if (!statement) {
+      hash.append("empty");
+      return;
+    }
     if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(statement))
-      return build(cast->getSubExpr());
+      return emit(cast->getSubExpr(), hash);
     std::string value = statement->getStmtClassName();
     if (const auto *reference = llvm::dyn_cast<clang::DeclRefExpr>(statement)) {
       const auto *declaration = reference->getDecl()->getCanonicalDecl();
@@ -167,7 +185,7 @@ public:
           (llvm::isa<clang::VarDecl>(declaration) &&
            llvm::cast<clang::VarDecl>(declaration)->isLocalVarDecl())) {
         auto [found, inserted] =
-            local_ids_.emplace(declaration, next_local_id_);
+            local_ids_.try_emplace(declaration, next_local_id_);
         if (inserted)
           ++next_local_id_;
         value += ":local" + std::to_string(found->second);
@@ -214,18 +232,17 @@ public:
                    llvm::dyn_cast<clang::StringLiteral>(statement)) {
       value += ":string:" + history::stable_hash(string->getString().str());
     }
-    value += "[";
+    hash.append(value);
+    hash.append("[");
     for (const auto *child : statement->children())
-      if (child)
-        value += build(child) + ";";
-    return value + "]";
-  }
-  std::vector<std::string> references() const {
-    return {references_.begin(), references_.end()};
+      if (child) {
+        emit(child, hash);
+        hash.append(";");
+      }
+    hash.append("]");
   }
 
-private:
-  std::map<const clang::Decl *, std::size_t> local_ids_;
+  llvm::DenseMap<const clang::Decl *, std::size_t> local_ids_;
   std::size_t next_local_id_{};
   std::set<std::string> references_;
   std::string translation_unit_;
@@ -339,7 +356,7 @@ private:
   clang::Preprocessor &preprocessor_;
   clang::SourceManager &sources_;
   State &state_;
-  std::map<const clang::MacroInfo *, std::string> macro_ids_;
+  llvm::DenseMap<const clang::MacroInfo *, std::string> macro_ids_;
 };
 
 class Visitor final : public clang::RecursiveASTVisitor<Visitor> {
@@ -392,7 +409,7 @@ public:
     BodyModel body(declaration, normalized_project_path(
                                     sources.getFilename(main_location).str()));
     element.implementation_fingerprint =
-        history::stable_hash(body.build(declaration->getBody()));
+        body.fingerprint(declaration->getBody());
     element.referenced_compiler_ids = body.references();
     const auto translation_unit =
         normalized_project_path(sources.getFilename(main_location).str());
@@ -577,7 +594,7 @@ public:
 private:
   clang::ASTContext &context_;
   State &state_;
-  std::set<const clang::Decl *> seen_;
+  llvm::DenseSet<const clang::Decl *> seen_;
 };
 
 class Consumer final : public clang::ASTConsumer {
@@ -754,7 +771,7 @@ public:
 };
 } // namespace
 
-int main(int argc, const char **argv) {
+int extractor_main(int argc, const char **argv) {
   if (argc == 2 && std::string(argv[1]) == "--version") {
     llvm::outs() << "repotraverse clang-extractor "
                  << history::build::kToolVersion << " (LLVM/Clang "
@@ -773,3 +790,19 @@ int main(int argc, const char **argv) {
   Factory factory;
   return tool.run(&factory);
 }
+
+#ifdef _WIN32
+int wmain(int argc, wchar_t **wide_argv) {
+  std::vector<std::string> arguments;
+  arguments.reserve(static_cast<std::size_t>(argc));
+  for (int index = 0; index < argc; ++index)
+    arguments.push_back(history::wide_to_utf8(wide_argv[index]));
+  std::vector<const char *> argv;
+  argv.reserve(arguments.size());
+  for (const auto &argument : arguments)
+    argv.push_back(argument.c_str());
+  return extractor_main(argc, argv.data());
+}
+#else
+int main(int argc, const char **argv) { return extractor_main(argc, argv); }
+#endif

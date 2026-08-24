@@ -6,7 +6,9 @@
 #include <vector>
 
 #ifdef _WIN32
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #include <winhttp.h>
 #endif
@@ -106,6 +108,26 @@ void Telemetry::span(const std::string &name, std::int64_t duration_ms,
 
 namespace {
 #ifdef _WIN32
+class unique_hinternet {
+public:
+  unique_hinternet() = default;
+  explicit unique_hinternet(HINTERNET handle) noexcept : handle_(handle) {}
+  ~unique_hinternet() { reset(); }
+
+  unique_hinternet(const unique_hinternet &) = delete;
+  unique_hinternet &operator=(const unique_hinternet &) = delete;
+  explicit operator bool() const noexcept { return handle_ != nullptr; }
+  HINTERNET get() const noexcept { return handle_; }
+  void reset(HINTERNET handle = nullptr) noexcept {
+    if (handle_)
+      WinHttpCloseHandle(handle_);
+    handle_ = handle;
+  }
+
+private:
+  HINTERNET handle_{};
+};
+
 std::wstring wide(std::string_view value) {
   if (value.empty()) return {};
   const auto size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
@@ -119,57 +141,70 @@ std::wstring wide(std::string_view value) {
   return result;
 }
 
-bool post_otlp(const std::string &endpoint, const wchar_t *suffix,
-               const nlohmann::json &value) {
-  const auto url = wide(endpoint);
-  if (url.empty()) return false;
-  URL_COMPONENTS parts{};
-  parts.dwStructSize = sizeof(parts);
-  parts.dwSchemeLength = static_cast<DWORD>(-1);
-  parts.dwHostNameLength = static_cast<DWORD>(-1);
-  parts.dwUrlPathLength = static_cast<DWORD>(-1);
-  if (!WinHttpCrackUrl(url.c_str(), 0, 0, &parts) ||
-      parts.nScheme != INTERNET_SCHEME_HTTPS)
-    return false;
-  const std::wstring host(parts.lpszHostName, parts.dwHostNameLength);
-  std::wstring path(parts.lpszUrlPath, parts.dwUrlPathLength);
-  if (!path.empty() && path.back() == L'/') path.pop_back();
-  path += suffix;
-  const auto session = WinHttpOpen(
-      L"repotraverse/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-      WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-  if (!session) return false;
-  WinHttpSetTimeouts(session, 5000, 5000, 5000, 5000);
-  const auto connection = WinHttpConnect(session, host.c_str(), parts.nPort, 0);
-  const auto request = connection
-                           ? WinHttpOpenRequest(
-                                 connection, L"POST", path.c_str(), nullptr,
-                                 WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
-                                 WINHTTP_FLAG_SECURE)
-                           : nullptr;
-  const auto payload = value.dump();
-  const wchar_t headers[] = L"Content-Type: application/json\r\n";
-  const bool sent = request &&
-                    WinHttpSendRequest(
-                        request, headers, static_cast<DWORD>(-1),
-                        const_cast<char *>(payload.data()),
-                        static_cast<DWORD>(payload.size()),
-                        static_cast<DWORD>(payload.size()), 0) &&
-                    WinHttpReceiveResponse(request, nullptr);
-  DWORD status = 0, status_size = sizeof(status);
-  const bool accepted = sent &&
-                        WinHttpQueryHeaders(
-                            request,
-                            WINHTTP_QUERY_STATUS_CODE |
-                                WINHTTP_QUERY_FLAG_NUMBER,
-                            WINHTTP_HEADER_NAME_BY_INDEX, &status, &status_size,
-                            WINHTTP_NO_HEADER_INDEX) &&
-                        status >= 200 && status < 300;
-  if (request) WinHttpCloseHandle(request);
-  if (connection) WinHttpCloseHandle(connection);
-  WinHttpCloseHandle(session);
-  return accepted;
-}
+class WinHttpClient {
+public:
+  bool post(const std::string &endpoint, const wchar_t *suffix,
+            const nlohmann::json &value) {
+    const auto url = wide(endpoint);
+    if (url.empty())
+      return false;
+    URL_COMPONENTS parts{};
+    parts.dwStructSize = sizeof(parts);
+    parts.dwSchemeLength = static_cast<DWORD>(-1);
+    parts.dwHostNameLength = static_cast<DWORD>(-1);
+    parts.dwUrlPathLength = static_cast<DWORD>(-1);
+    if (!WinHttpCrackUrl(url.c_str(), 0, 0, &parts) ||
+        parts.nScheme != INTERNET_SCHEME_HTTPS)
+      return false;
+    const std::wstring host(parts.lpszHostName, parts.dwHostNameLength);
+    const auto origin = host + L":" + std::to_wstring(parts.nPort);
+    if (!session_) {
+      session_.reset(WinHttpOpen(
+          L"repotraverse/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+          WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
+      if (!session_)
+        return false;
+      WinHttpSetTimeouts(session_.get(), 5000, 5000, 5000, 5000);
+    }
+    if (!connection_ || origin != origin_) {
+      connection_.reset();
+      connection_.reset(
+          WinHttpConnect(session_.get(), host.c_str(), parts.nPort, 0));
+      if (!connection_)
+        return false;
+      origin_ = origin;
+    }
+    std::wstring path(parts.lpszUrlPath, parts.dwUrlPathLength);
+    if (!path.empty() && path.back() == L'/')
+      path.pop_back();
+    path += suffix;
+    unique_hinternet request{WinHttpOpenRequest(
+        connection_.get(), L"POST", path.c_str(), nullptr,
+        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+        WINHTTP_FLAG_SECURE)};
+    const auto payload = value.dump();
+    const wchar_t headers[] = L"Content-Type: application/json\r\n";
+    const bool sent = request &&
+                      WinHttpSendRequest(
+                          request.get(), headers, static_cast<DWORD>(-1),
+                          const_cast<char *>(payload.data()),
+                          static_cast<DWORD>(payload.size()),
+                          static_cast<DWORD>(payload.size()), 0) &&
+                      WinHttpReceiveResponse(request.get(), nullptr);
+    DWORD status = 0, status_size = sizeof(status);
+    return sent && WinHttpQueryHeaders(
+                       request.get(),
+                       WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                       WINHTTP_HEADER_NAME_BY_INDEX, &status, &status_size,
+                       WINHTTP_NO_HEADER_INDEX) &&
+           status >= 200 && status < 300;
+  }
+
+private:
+  unique_hinternet session_;
+  unique_hinternet connection_;
+  std::wstring origin_;
+};
 void write_event_log(const std::string &payload, bool error) {
   const auto source = RegisterEventSourceW(nullptr, L"Repotraverse");
   if (!source) return;
@@ -180,9 +215,12 @@ void write_event_log(const std::string &payload, bool error) {
   DeregisterEventSource(source);
 }
 #else
-bool post_otlp(const std::string &, const wchar_t *, const nlohmann::json &) {
-  return false;
-}
+class WinHttpClient {
+public:
+  bool post(const std::string &, const wchar_t *, const nlohmann::json &) {
+    return false;
+  }
+};
 void write_event_log(const std::string &, bool) {}
 #endif
 
@@ -195,6 +233,7 @@ std::string unix_nanos() {
 } // namespace
 
 void Telemetry::export_loop(std::stop_token stop) {
+  WinHttpClient client;
   while (!stop.stop_requested()) {
     std::deque<nlohmann::json> logs;
     std::deque<nlohmann::json> spans;
@@ -226,7 +265,7 @@ void Telemetry::export_loop(std::stop_token stop) {
            {{{"resource", resource},
              {"scopeLogs", {{{"scope", {{"name", "repotraverse"}}},
                               {"logRecords", records}}}}}}}};
-      if (!post_otlp(endpoint, L"/v1/logs", payload)) {
+      if (!client.post(endpoint, L"/v1/logs", payload)) {
         std::scoped_lock lock(mutex_);
         counters_["telemetry.export_failures"]++;
       }
@@ -237,7 +276,7 @@ void Telemetry::export_loop(std::stop_token stop) {
            {{{"resource", resource},
              {"scopeSpans", {{{"scope", {{"name", "repotraverse"}}},
                                {"spans", spans}}}}}}}};
-      if (!post_otlp(endpoint, L"/v1/traces", payload)) {
+      if (!client.post(endpoint, L"/v1/traces", payload)) {
         std::scoped_lock lock(mutex_);
         counters_["telemetry.export_failures"]++;
       }
@@ -254,7 +293,7 @@ void Telemetry::export_loop(std::stop_token stop) {
                          {"gauge", {{"dataPoints", {{{"timeUnixNano", unix_nanos()},
                                                      {"asInt", std::to_string(value)}}}}}}});
     if (!metrics.empty())
-      post_otlp(endpoint, L"/v1/metrics",
+      client.post(endpoint, L"/v1/metrics",
                 {{"resourceMetrics",
                   {{{"resource", resource},
                     {"scopeMetrics", {{{"scope", {{"name", "repotraverse"}}},

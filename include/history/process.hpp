@@ -30,6 +30,7 @@ struct ProcessOptions {
 
 ProcessOutput run_process(const std::vector<std::string> &arguments,
                           const ProcessOptions &options);
+// String arguments and environment overrides are UTF-8 on every platform.
 void set_default_process_timeout(std::chrono::milliseconds timeout);
 
 ProcessOutput run_process(const std::vector<std::string> &arguments,

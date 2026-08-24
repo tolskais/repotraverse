@@ -1,4 +1,5 @@
 #include "history/build_import.hpp"
+#include "history/encoding.hpp"
 #include "history/ir.hpp"
 
 #include <algorithm>
@@ -6,13 +7,14 @@
 #include <fstream>
 #include <map>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 
 namespace history {
 namespace {
 
 bool source_argument(const std::string &value) {
-  const auto extension = std::filesystem::path(value).extension().string();
+  const auto extension = path_to_utf8(path_from_utf8(value).extension());
   return extension == ".c" || extension == ".cc" || extension == ".cpp" ||
          extension == ".cxx" || extension == ".C" || extension == ".s" ||
          extension == ".S";
@@ -40,11 +42,11 @@ std::string semantic_path(const std::string &value,
                           const std::filesystem::path &working_directory,
                           const std::filesystem::path &repository,
                           Coverage &coverage) {
-  std::filesystem::path path(value);
+  auto path = path_from_utf8(value);
   if (path.is_absolute()) {
     if (repository.empty()) {
       gap(coverage, "absolute semantic path cannot be made portable: " + value);
-      return path.generic_string();
+      return generic_path_to_utf8(path);
     }
     std::error_code error;
     path = std::filesystem::relative(path, repository, error);
@@ -55,7 +57,7 @@ std::string semantic_path(const std::string &value,
   } else {
     path = working_directory / path;
   }
-  return safe_relative(path, "semantic path").generic_string();
+  return generic_path_to_utf8(safe_relative(path, "semantic path"));
 }
 
 std::vector<std::string> tokenize_response(std::string_view input) {
@@ -111,7 +113,7 @@ expand_response_files(const std::vector<std::string> &arguments,
       continue;
     }
     const auto relative =
-        safe_relative(working_directory / name, "response file");
+        safe_relative(working_directory / path_from_utf8(name), "response file");
     std::string content;
     if (const auto found = embedded.find(name); found != embedded.end()) {
       content = found->second;
@@ -121,10 +123,8 @@ expand_response_files(const std::vector<std::string> &arguments,
       const auto size = std::filesystem::file_size(path, error);
       if (error || size > 1024ULL * 1024ULL)
         throw std::runtime_error("response file is missing or exceeds 1 MiB: " +
-                                 relative.generic_string());
-      std::ifstream input(path, std::ios::binary);
-      content.assign(std::istreambuf_iterator<char>(input),
-                     std::istreambuf_iterator<char>());
+                                 generic_path_to_utf8(relative));
+      content = read_text_file(path, true).text;
     }
     auto expanded = tokenize_response(content);
     if (std::any_of(expanded.begin(), expanded.end(),
@@ -260,15 +260,11 @@ std::vector<nlohmann::json> load_records(const std::filesystem::path &input) {
       if (entry.is_regular_file() && entry.path().extension() == ".json")
         files.push_back(entry.path());
     std::sort(files.begin(), files.end());
-    for (const auto &file : files) {
-      std::ifstream stream(file);
-      records.push_back(nlohmann::json::parse(stream));
-    }
+    for (const auto &file : files)
+      records.push_back(nlohmann::json::parse(read_text_file(file).text));
     return records;
   }
-  std::ifstream stream(input);
-  if (!stream)
-    throw std::runtime_error("cannot open captured build log");
+  std::istringstream stream(read_text_file(input).text);
   std::string line;
   while (std::getline(stream, line)) {
     if (line.find_first_not_of(" \t\r\n") == std::string::npos)
@@ -302,11 +298,11 @@ nlohmann::json import_build_log(Catalog &catalog,
     context.source_revision = record.at("source_revision").get<std::string>();
     context.translation_unit = record.at("translation_unit").get<std::string>();
     context.toolchain = record.at("toolchain").get<std::string>();
-    context.working_directory =
-        safe_relative(record.value("working_directory", "."),
-                      "working directory")
-            .generic_string();
-    const auto tu = safe_relative(context.translation_unit, "translation unit");
+    context.working_directory = generic_path_to_utf8(safe_relative(
+        path_from_utf8(record.value("working_directory", ".")),
+        "working directory"));
+    const auto tu = safe_relative(path_from_utf8(context.translation_unit),
+                                  "translation unit");
     if (context.configuration.empty() || context.configuration.size() > 256 ||
         context.source_revision.empty() ||
         context.source_revision.starts_with('-') ||
@@ -314,7 +310,7 @@ nlohmann::json import_build_log(Catalog &catalog,
         (context.toolchain != "armcc5" && context.toolchain != "armclang6"))
       throw std::runtime_error(
           "captured build record has invalid identity fields");
-    context.translation_unit = tu.generic_string();
+    context.translation_unit = generic_path_to_utf8(tu);
     context.adapter_version =
         context.toolchain == "armcc5" ? "armcc5_v1" : "armclang6_v1";
     context.target = record.value("target", BuildTarget{});
@@ -344,7 +340,7 @@ nlohmann::json import_build_log(Catalog &catalog,
       gap(context.coverage, "project dependency map was not captured");
     context.frontend_arguments =
         normalize(record.at("arguments").get<std::vector<std::string>>(),
-                  context.working_directory, repository,
+                  path_from_utf8(context.working_directory), repository,
                   record.value("response_file_contents",
                                std::map<std::string, std::string>{}),
                   context.coverage);
@@ -356,7 +352,8 @@ nlohmann::json import_build_log(Catalog &catalog,
       throw std::runtime_error("captured frontend arguments exceed limits");
     for (auto &project_file : context.project_files)
       project_file =
-          safe_relative(project_file, "project path").generic_string();
+          generic_path_to_utf8(safe_relative(path_from_utf8(project_file),
+                                             "project path"));
     const nlohmann::json identity = {
         {"translation_unit", context.translation_unit},
         {"working_directory", context.working_directory},

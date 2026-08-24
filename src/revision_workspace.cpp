@@ -1,4 +1,5 @@
 #include "history/revision_workspace.hpp"
+#include "history/encoding.hpp"
 
 #include "history/ir.hpp"
 #include "history/process.hpp"
@@ -49,7 +50,7 @@ RevisionTreeIndex::RevisionTreeIndex(const std::filesystem::path &repository,
   if (revision.empty() || revision.starts_with('-'))
     throw std::invalid_argument("invalid revision for tree index");
   const auto listed = run_process(
-      {"git", "-C", repository.string(), "ls-tree", "-lrz", revision});
+      {"git", "-C", path_to_utf8(repository), "ls-tree", "-lrz", revision});
   git_ok(listed, "index revision tree");
   std::size_t offset = 0;
   while (offset < listed.output.size()) {
@@ -62,6 +63,7 @@ RevisionTreeIndex::RevisionTreeIndex(const std::filesystem::path &repository,
       continue;
     const auto metadata = record.substr(0, tab);
     const auto path = record.substr(tab + 1);
+    require_utf8(path, "Git tree path");
     std::istringstream fields(metadata);
     std::string mode, type, id;
     std::uint64_t bytes{};
@@ -169,7 +171,7 @@ RevisionWorkspacePool::~RevisionWorkspacePool() {
       estimated_bytes_ -= entries_.begin()->second.estimated_bytes;
       entries_.erase(entries_.begin());
       try {
-        run_process({"git", "-C", repository.string(), "worktree", "prune"});
+        run_process({"git", "-C", path_to_utf8(repository), "worktree", "prune"});
       } catch (...) {
       }
     }
@@ -179,12 +181,12 @@ RevisionWorkspacePool::~RevisionWorkspacePool() {
 std::string RevisionWorkspacePool::normalize_path(const std::string &input) {
   if (input.find_first_of("\r\n") != std::string::npos)
     throw std::runtime_error("materialization path contains a line break");
-  const auto path = std::filesystem::path(input).lexically_normal();
+  const auto path = path_from_utf8(input).lexically_normal();
   if (path.empty() || path == "." || path.is_absolute() ||
       *path.begin() == "..")
     throw std::runtime_error(
         "materialization path must be repository-relative");
-  return path.generic_string();
+  return generic_path_to_utf8(path);
 }
 
 void RevisionWorkspacePool::evict_for(std::uint64_t additional_bytes,
@@ -220,10 +222,10 @@ void RevisionWorkspacePool::remove_entry(const std::string &key) {
   const auto found = entries_.find(key);
   if (found == entries_.end())
     return;
-  run_process({"git", "-C", found->second.repository.string(), "worktree",
-               "remove", "--force", found->second.path.string()});
+  run_process({"git", "-C", path_to_utf8(found->second.repository), "worktree",
+               "remove", "--force", path_to_utf8(found->second.path)});
   run_process(
-      {"git", "-C", found->second.repository.string(), "worktree", "prune"});
+      {"git", "-C", path_to_utf8(found->second.repository), "worktree", "prune"});
   estimated_bytes_ -= found->second.estimated_bytes;
   entries_.erase(found);
 }
@@ -233,7 +235,7 @@ RevisionWorkspacePool::Lease RevisionWorkspacePool::acquire(
     const MaterializationManifest &manifest, bool require_full) {
   std::scoped_lock lock(mutex_);
   const auto canonical = std::filesystem::weakly_canonical(repository);
-  const auto key = stable_hash(canonical.generic_string() + "\n" + revision);
+  const auto key = stable_hash(generic_path_to_utf8(canonical) + "\n" + revision);
   std::set<std::string> requested;
   for (const auto &file : manifest.files)
     requested.insert(normalize_path(file));
@@ -245,20 +247,20 @@ RevisionWorkspacePool::Lease RevisionWorkspacePool::acquire(
         full ? index.total_blob_bytes() : index.size_of(requested);
     evict_for(bytes, 1);
     const auto path = root_ / key;
-    run_process({"git", "-C", canonical.string(), "worktree", "remove",
-                 "--force", path.string()});
-    std::vector<std::string> add = {"git",      "-C",  canonical.string(),
+    run_process({"git", "-C", path_to_utf8(canonical), "worktree", "remove",
+                 "--force", path_to_utf8(path)});
+    std::vector<std::string> add = {"git",      "-C",  path_to_utf8(canonical),
                                     "worktree", "add", "--detach"};
     if (!full)
       add.push_back("--no-checkout");
-    add.push_back(path.string());
+    add.push_back(path_to_utf8(path));
     add.push_back(revision);
     git_ok(run_process(add), "materialize revision workspace");
     Entry entry{canonical, path, revision, requested,
                 bytes,     1,    full,     std::chrono::steady_clock::now()};
     try {
       if (!full) {
-        git_ok(run_process({"git", "-C", path.string(), "sparse-checkout",
+        git_ok(run_process({"git", "-C", path_to_utf8(path), "sparse-checkout",
                             "init", "--no-cone"}),
                "initialize sparse revision workspace");
         std::string patterns;
@@ -271,14 +273,14 @@ RevisionWorkspacePool::Lease RevisionWorkspacePool::acquire(
                    {"git", "sparse-checkout", "set", "--no-cone", "--stdin"},
                    options),
                "populate sparse revision workspace");
-        git_ok(run_process({"git", "-C", path.string(), "checkout", "--force",
+        git_ok(run_process({"git", "-C", path_to_utf8(path), "checkout", "--force",
                             revision}),
                "checkout sparse revision workspace");
       }
     } catch (...) {
-      run_process({"git", "-C", canonical.string(), "worktree", "remove",
-                   "--force", path.string()});
-      run_process({"git", "-C", canonical.string(), "worktree", "prune"});
+      run_process({"git", "-C", path_to_utf8(canonical), "worktree", "remove",
+                   "--force", path_to_utf8(path)});
+      run_process({"git", "-C", path_to_utf8(canonical), "worktree", "prune"});
       throw;
     }
     estimated_bytes_ += bytes;
@@ -292,7 +294,7 @@ RevisionWorkspacePool::Lease RevisionWorkspacePool::acquire(
     const auto additional =
         bytes > entry.estimated_bytes ? bytes - entry.estimated_bytes : 0;
     evict_for(additional, 0, key);
-    git_ok(run_process({"git", "-C", entry.path.string(), "sparse-checkout",
+    git_ok(run_process({"git", "-C", path_to_utf8(entry.path), "sparse-checkout",
                         "disable"}),
            "expand full revision workspace");
     estimated_bytes_ += additional;

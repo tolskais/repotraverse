@@ -1,4 +1,5 @@
 #include "history/progressive.hpp"
+#include "history/encoding.hpp"
 
 #include "history/ir.hpp"
 #include "history/process.hpp"
@@ -75,7 +76,7 @@ bool source_or_header(std::string path) {
   std::transform(path.begin(), path.end(), path.begin(), [](unsigned char c) {
     return static_cast<char>(std::tolower(c));
   });
-  const auto extension = std::filesystem::path(path).extension().string();
+  const auto extension = path_to_utf8(path_from_utf8(path).extension());
   static const std::set<std::string> extensions = {
       ".c",   ".cc",  ".cpp", ".cxx", ".h",   ".hh",
       ".hpp", ".hxx", ".inc", ".inl", ".ipp", ".tpp"};
@@ -86,14 +87,14 @@ bool header_path(std::string path) {
   std::transform(path.begin(), path.end(), path.begin(), [](unsigned char c) {
     return static_cast<char>(std::tolower(c));
   });
-  const auto extension = std::filesystem::path(path).extension().string();
+  const auto extension = path_to_utf8(path_from_utf8(path).extension());
   static const std::set<std::string> extensions = {
       ".h", ".hh", ".hpp", ".hxx", ".inc", ".inl", ".ipp", ".tpp"};
   return extensions.contains(extension);
 }
 
 std::string screening_language(const std::string &path) {
-  auto extension = std::filesystem::path(path).extension().string();
+  auto extension = path_to_utf8(path_from_utf8(path).extension());
   std::transform(
       extension.begin(), extension.end(), extension.begin(),
       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
@@ -115,6 +116,7 @@ std::vector<std::string> nul_tokens(std::string_view value) {
     result.emplace_back(value.substr(begin, end == std::string_view::npos
                                                 ? value.size() - begin
                                                 : end - begin));
+    require_utf8(result.back(), "Git output token");
     if (end == std::string_view::npos)
       break;
     begin = end + 1;
@@ -125,7 +127,7 @@ std::vector<std::string> nul_tokens(std::string_view value) {
 std::map<std::string, std::pair<std::uint64_t, std::uint64_t>>
 numstat(const std::filesystem::path &repository, const std::string &before,
         const std::string &after) {
-  const auto result = run_process({"git", "-C", repository.string(), "diff",
+  const auto result = run_process({"git", "-C", path_to_utf8(repository), "diff",
                                    "--numstat", "-z", before, after, "--"});
   require_git(result, "read file churn");
   std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> values;
@@ -154,6 +156,7 @@ numstat(const std::filesystem::path &repository, const std::string &before,
       path = result.output.substr(cursor, new_end - cursor);
       cursor = new_end + 1;
     }
+    require_utf8(path, "Git path");
     if (added != "-" && deleted != "-")
       values[path] = {std::stoull(added), std::stoull(deleted)};
   }
@@ -164,7 +167,7 @@ std::vector<PathChange> path_changes(const std::filesystem::path &repository,
                                      const std::string &before,
                                      const std::string &after) {
   const auto result =
-      run_process({"git", "-C", repository.string(), "diff", "--name-status",
+      run_process({"git", "-C", path_to_utf8(repository), "diff", "--name-status",
                    "-M", "-z", before, after, "--"});
   require_git(result, "read changed paths");
   const auto tokens = nul_tokens(result.output);
@@ -202,7 +205,7 @@ std::vector<PathChange> path_changes(const std::filesystem::path &repository,
 
 std::int64_t revision_time(const std::filesystem::path &repository,
                            const std::string &revision) {
-  const auto result = run_process({"git", "-C", repository.string(), "show",
+  const auto result = run_process({"git", "-C", path_to_utf8(repository), "show",
                                    "-s", "--format=%ct", revision});
   require_git(result, "read revision time");
   return std::stoll(result.output);
@@ -217,7 +220,7 @@ std::int64_t calendar_month(std::int64_t timestamp) {
 
 std::vector<std::string> tracked_paths(const std::filesystem::path &repository,
                                        const std::string &revision) {
-  const auto result = run_process({"git", "-C", repository.string(), "ls-tree",
+  const auto result = run_process({"git", "-C", path_to_utf8(repository), "ls-tree",
                                    "-r", "--name-only", "-z", revision});
   require_git(result, "list tracked screening files");
   return nul_tokens(result.output);
@@ -242,7 +245,7 @@ void measure_include_fanout(const std::filesystem::path &repository,
   ProcessOptions options;
   options.max_output_bytes = 512ULL * 1024ULL * 1024ULL;
   const auto result = run_process(
-      {"git", "-C", repository.string(), "grep", "-I", "-n", "-z", "-E",
+      {"git", "-C", path_to_utf8(repository), "grep", "-I", "-n", "-z", "-E",
        "^[[:space:]]*#[[:space:]]*include[[:space:]]*[<\"]", revision, "--",
        "*.c", "*.cc", "*.cpp", "*.cxx", "*.h", "*.hh", "*.hpp", "*.hxx"},
       options);
@@ -257,6 +260,7 @@ void measure_include_fanout(const std::filesystem::path &repository,
     if (path_end == std::string::npos)
       break;
     auto includer = result.output.substr(cursor, path_end - cursor);
+    require_utf8(includer, "Git grep path");
     cursor = path_end + 1;
     const auto line_end = result.output.find('\0', cursor);
     if (line_end == std::string::npos)
@@ -292,7 +296,7 @@ std::optional<std::string> blob(const std::filesystem::path &repository,
   ProcessOptions options;
   options.max_output_bytes = 512ULL * 1024ULL * 1024ULL;
   const auto result = run_process(
-      {"git", "-C", repository.string(), "show", revision + ":" + path},
+      {"git", "-C", path_to_utf8(repository), "show", revision + ":" + path},
       options);
   if (result.exit_code != 0 || result.timed_out || result.output_truncated)
     return std::nullopt;
@@ -532,7 +536,7 @@ void collect_sites(TSNode node, std::string_view source,
 nlohmann::json changed_ranges(const std::filesystem::path &repository,
                               const Touch &touch) {
   std::vector<std::string> command = {
-      "git",        "-C",          repository.string(),   "diff",
+      "git",        "-C",          path_to_utf8(repository),   "diff",
       "--no-color", "--unified=0", touch.before_revision, touch.after_revision,
       "--"};
   if (!touch.before_path.empty())
@@ -705,8 +709,8 @@ plan_progressive_screening(const ProgressiveScreeningOptions &options) {
           facts.erase(old);
           moved.path = change.after_path;
           ++moved.renames;
-          if (std::filesystem::path(change.before_path).parent_path() !=
-              std::filesystem::path(change.after_path).parent_path())
+          if (path_from_utf8(change.before_path).parent_path() !=
+              path_from_utf8(change.after_path).parent_path())
             ++moved.moves;
           facts[change.after_path] = std::move(moved);
         }

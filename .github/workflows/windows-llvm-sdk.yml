@@ -1,0 +1,61 @@
+name: Windows LLVM SDK verification
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: read
+
+jobs:
+  windows-x64:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialize the x64 MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Download and verify the official LLVM SDK
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = "22.1.8"
+          $asset = "clang+llvm-$version-x86_64-pc-windows-msvc.tar.xz"
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$version/$asset"
+          curl.exe -L --fail --retry 3 --output $asset $url
+          if ($LASTEXITCODE -ne 0) { throw "LLVM SDK download failed." }
+          gh attestation verify --repo llvm/llvm-project $asset
+          if ($LASTEXITCODE -ne 0) { throw "LLVM SDK attestation failed." }
+          New-Item -ItemType Directory -Path llvm-sdk | Out-Null
+          tar.exe -xf $asset -C llvm-sdk
+          if ($LASTEXITCODE -ne 0) { throw "LLVM SDK extraction failed." }
+          $root = Get-ChildItem -LiteralPath llvm-sdk -Directory
+          if ($root.Count -ne 1) { throw "Unexpected LLVM SDK archive layout." }
+          "REPOTRAVERSE_LLVM_ROOT=$($root[0].FullName)" >> $env:GITHUB_ENV
+
+      - name: Enable Win32 long paths
+        shell: pwsh
+        run: |
+          New-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" `
+            -Name LongPathsEnabled -Value 1 -PropertyType DWORD -Force
+
+      - name: Build and test
+        shell: pwsh
+        run: .\tools\build-windows.ps1 -Mode Generic -Jobs 2
+
+      - name: Package and smoke test
+        shell: pwsh
+        run: .\tools\package-windows.ps1 -Mode Generic
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: repotraverse-windows-x64-generic
+          path: out/package/repotraverse-windows-x64-generic.zip
+          if-no-files-found: error

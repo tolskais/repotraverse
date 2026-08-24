@@ -1,4 +1,5 @@
 #include "history/catalog.hpp"
+#include "history/encoding.hpp"
 
 #include <chrono>
 #include <fstream>
@@ -33,7 +34,8 @@ std::string load_or_create_producer(const std::filesystem::path &root) {
   const auto value =
       stable_hash(std::to_string(now) + ":" + std::to_string(random()) + ":" +
                   std::to_string(random()));
-  const auto temporary = path.string() + ".tmp";
+  auto temporary = path;
+  temporary += ".tmp";
   {
     std::ofstream output(temporary, std::ios::binary);
     if (!output)
@@ -62,7 +64,8 @@ Catalog::Catalog(std::filesystem::path root) : root_(std::move(root)) {
   std::filesystem::create_directories(root_);
   producer_id_ = load_or_create_producer(root_);
   const auto database_path = root_ / "catalog.sqlite3";
-  check(sqlite3_open_v2(database_path.string().c_str(), &database_,
+  const auto database_name = path_to_utf8(database_path);
+  check(sqlite3_open_v2(database_name.c_str(), &database_,
                         SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE |
                             SQLITE_OPEN_FULLMUTEX,
                         nullptr),

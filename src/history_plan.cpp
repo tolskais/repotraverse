@@ -1,4 +1,5 @@
 #include "history/history_plan.hpp"
+#include "history/encoding.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -16,7 +17,9 @@
 #include <vector>
 
 #ifdef _WIN32
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #else
 #include <fcntl.h>
@@ -61,20 +64,6 @@ std::filesystem::path temporary_sibling(const std::filesystem::path &path,
 }
 
 #ifdef _WIN32
-std::wstring wide(std::string_view value) {
-  if (value.empty())
-    return {};
-  const auto size =
-      MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
-                          static_cast<int>(value.size()), nullptr, 0);
-  if (size <= 0)
-    throw std::runtime_error("cannot convert process argument to UTF-16");
-  std::wstring result(static_cast<std::size_t>(size), L'\0');
-  MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
-                      static_cast<int>(value.size()), result.data(), size);
-  return result;
-}
-
 std::wstring quote_windows_argument(const std::wstring &argument) {
   if (!argument.empty() &&
       argument.find_first_of(L" \t\n\v\"") == std::wstring::npos)
@@ -122,7 +111,7 @@ ProcessResult run_to_file(const std::vector<std::string> &arguments,
   for (const auto &argument : arguments) {
     if (!command_line.empty())
       command_line.push_back(L' ');
-    command_line += quote_windows_argument(wide(argument));
+    command_line += quote_windows_argument(utf8_to_wide(argument));
   }
   std::vector<wchar_t> mutable_command(command_line.begin(),
                                        command_line.end());
@@ -257,6 +246,7 @@ void read_git_history(const std::filesystem::path &input_path,
       current->tree = fields[3];
       current->committer_time = std::stoll(fields[4]);
       current->subject = fields[5];
+      require_utf8(current->subject, "Git commit subject");
       continue;
     }
     if (!current)
@@ -274,6 +264,9 @@ void read_git_history(const std::filesystem::path &input_path,
     } else {
       change.path = std::move(first_path);
     }
+    require_utf8(change.path, "Git path");
+    if (!change.old_path.empty())
+      require_utf8(change.old_path, "Git path");
     current->changes.push_back(std::move(change));
   }
   if (current)
@@ -291,7 +284,7 @@ PrFacts read_pr_facts(const std::filesystem::path &path) {
     return result;
   std::ifstream input(path);
   if (!input)
-    throw std::runtime_error("cannot open PR facts: " + path.string());
+    throw std::runtime_error("cannot open PR facts: " + path_to_utf8(path));
   std::string line;
   std::size_t line_number = 0;
   while (std::getline(input, line)) {
@@ -343,7 +336,7 @@ bool source_path(std::string path) {
                  [](unsigned char value) {
                    return static_cast<char>(std::tolower(value));
                  });
-  const auto extension = std::filesystem::path(path).extension().string();
+  const auto extension = path_to_utf8(path_from_utf8(path).extension());
   static const std::set<std::string> extensions = {
       ".asm", ".c",   ".cc",  ".cpp", ".cxx", ".h", ".hh",
       ".hpp", ".hxx", ".inc", ".inl", ".ipp", ".s", ".tpp"};
@@ -355,8 +348,8 @@ bool build_path(std::string path) {
                  [](unsigned char value) {
                    return static_cast<char>(std::tolower(value));
                  });
-  const auto filename = std::filesystem::path(path).filename().string();
-  const auto extension = std::filesystem::path(path).extension().string();
+  const auto filename = path_to_utf8(path_from_utf8(path).filename());
+  const auto extension = path_to_utf8(path_from_utf8(path).extension());
   return filename.starts_with("makefile") || filename == "gnumakefile" ||
          filename == "cmakelists.txt" || extension == ".cmake" ||
          extension == ".mk" || extension == ".mak" || extension == ".sln" ||
@@ -392,11 +385,11 @@ nlohmann::json write_history_plan(const HistoryPlanOptions &options) {
     throw std::runtime_error("invalid start_exclusive revision");
   if (!std::filesystem::is_directory(options.repository))
     throw std::runtime_error("repository is not a directory: " +
-                             options.repository.string());
+                             path_to_utf8(options.repository));
   if (std::filesystem::exists(options.output) &&
       !std::filesystem::is_regular_file(options.output))
     throw std::runtime_error("history plan output is not a regular file: " +
-                             options.output.string());
+                             path_to_utf8(options.output));
   if (!options.output.parent_path().empty())
     std::filesystem::create_directories(options.output.parent_path());
 
@@ -415,9 +408,11 @@ nlohmann::json write_history_plan(const HistoryPlanOptions &options) {
   std::vector<std::string> command = {
       "git",
       "-c",
+      "core.quotepath=false",
+      "-c",
       "i18n.logOutputEncoding=UTF-8",
       "-C",
-      options.repository.string(),
+      path_to_utf8(options.repository),
       "log",
       "--first-parent",
       "--reverse",
@@ -437,13 +432,12 @@ nlohmann::json write_history_plan(const HistoryPlanOptions &options) {
   std::ofstream output(plan_output, std::ios::binary);
   if (!output)
     throw std::runtime_error("cannot create history plan: " +
-                             plan_output.string());
+                             path_to_utf8(plan_output));
   output << canonical_json(
       {{"schema_version", kSchemaVersion},
        {"record_type", "history_plan"},
-       {"repository", std::filesystem::absolute(options.repository)
-                          .lexically_normal()
-                          .string()},
+       {"repository", path_to_utf8(std::filesystem::absolute(options.repository)
+                                        .lexically_normal())},
        {"ref", options.ref},
        {"start_exclusive", options.start_exclusive},
        {"traversal", "first_parent"}});
@@ -556,7 +550,7 @@ nlohmann::json write_history_plan(const HistoryPlanOptions &options) {
   if (error)
     throw std::runtime_error("cannot publish history plan: " + error.message());
 
-  return {{"output", options.output.string()},
+  return {{"output", path_to_utf8(options.output)},
           {"ref", options.ref},
           {"resolved_head", resolved_head},
           {"commit_count", commits},

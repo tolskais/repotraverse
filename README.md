@@ -13,16 +13,34 @@ Windows builds use `clang-cl` from a prebuilt LLVM/Clang SDK. Run the build from
 an initialized x64 Visual Studio developer environment so the Windows SDK,
 linker, and runtime are available. CMake and Ninja must also be on `PATH`.
 
+Repotraverse uses UTF-8 for command data, JSON, Git paths, and persisted text.
+Windows filesystem, command-line, environment, and process boundaries are
+converted to native UTF-16, so paths may contain non-ASCII characters. JSON
+files may be UTF-8 (with or without a BOM) or BOM-marked UTF-16; redirected
+stdin and stdout are UTF-8 byte streams.
+
 The SDK must contain:
 
 ```text
 <llvm-root>/bin/clang-cl.exe
 <llvm-root>/lib/cmake/llvm/LLVMConfig.cmake
 <llvm-root>/lib/cmake/clang/ClangConfig.cmake
+<llvm-root>/lib/clang/<major>/include/
 ```
 
-The CMake packages must export the monolithic `clang-cpp` and `LLVM` library
-targets. This keeps the VM build independent of LLVM's internal component list.
+The official `clang+llvm-<version>-x86_64-pc-windows-msvc` archive is the
+reference Windows SDK. Its CMake packages export component targets;
+Repotraverse links `clangTooling` and `clangIndex` through those imported
+targets so their transitive libraries and Windows compile definitions are
+preserved. SDKs exporting the monolithic `clang-cpp` and `LLVM` targets remain
+supported on other platforms and as a Windows fallback.
+
+Windows builds are x64-only. The packaged executables embed a
+`longPathAware` manifest and Git subprocesses enable `core.longpaths`, but the
+host must also enable the Windows **Enable Win32 long paths** policy (or the
+equivalent `LongPathsEnabled` registry value). Clang builtin resource headers
+are copied into the package under `lib/clang/<major>/include` so the extractor
+does not depend on the build SDK after installation.
 
 For a portable executable:
 
@@ -339,3 +357,9 @@ These controls harden deployment and coordination; they do not make the provisio
 multirevision classifier analytically complete. Promotion of historical conclusions
 requires the element/build-variant aggregation milestone and validation in the real
 build environment.
+
+## License
+
+Repotraverse is licensed under the [BSD 2-Clause License](LICENSE).
+Third-party components retain their respective licenses as documented in
+[THIRD_PARTY.md](THIRD_PARTY.md).

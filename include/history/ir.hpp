@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -166,6 +167,24 @@ void to_json(nlohmann::json &, const SubmoduleRevision &);
 void from_json(const nlohmann::json &, SubmoduleRevision &);
 
 std::string stable_hash(std::string_view input);
+
+class StableHashBuilder {
+public:
+  StableHashBuilder();
+  ~StableHashBuilder();
+  StableHashBuilder(StableHashBuilder &&) noexcept;
+  StableHashBuilder &operator=(StableHashBuilder &&) noexcept;
+  StableHashBuilder(const StableHashBuilder &) = delete;
+  StableHashBuilder &operator=(const StableHashBuilder &) = delete;
+
+  void append(std::string_view input);
+  std::string digest() const;
+
+private:
+  struct State;
+  std::unique_ptr<State> state_;
+};
+
 std::string canonical_json(const nlohmann::json &value);
 bool validate_tu_manifest(const TuManifest &manifest, std::string &error);
 

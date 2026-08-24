@@ -3,7 +3,7 @@
 Repotraverse itself is licensed under the BSD 2-Clause License; see
 [`LICENSE`](LICENSE). The following components retain their upstream licenses.
 
-The v1 package contains these pinned source dependencies:
+The source tree contains these pinned dependencies; Catch2 is test-only:
 
 | Component | Version | License |
 | --- | --- | --- |
@@ -13,10 +13,15 @@ The v1 package contains these pinned source dependencies:
 | Tree-sitter runtime | 0.26.11 | MIT |
 | Tree-sitter C grammar | 0.24.2 | MIT |
 | Tree-sitter C++ grammar | 0.23.4 | MIT |
+| CLI11 | 2.7.0 | BSD 3-Clause |
+| Catch2 | 3.15.0 | Boost Software License 1.0 |
 
 Tree-sitter is built from the vendored runtime and generated parser sources.
 RepoTraverse does not require the Tree-sitter CLI, a package manager, or a
 network connection during configuration or compilation.
+CLI11 is built from its official single-header distribution. Catch2 is used
+only by test targets and is built from its official amalgamated source
+distribution.
 
 The Clang-enabled executable is linked against the LLVM/Clang SDK supplied by
 the internal build environment. Its exact LLVM and Clang versions are embedded

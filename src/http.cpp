@@ -2,8 +2,14 @@
 #include "history/encoding.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
+#include <cctype>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
+#include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 #include <set>
@@ -93,6 +99,56 @@ void send_all(Socket socket, std::string_view data) {
   }
 }
 
+std::string_view trim_ascii(std::string_view value) {
+  while (!value.empty() &&
+         std::isspace(static_cast<unsigned char>(value.front())))
+    value.remove_prefix(1);
+  while (!value.empty() &&
+         std::isspace(static_cast<unsigned char>(value.back())))
+    value.remove_suffix(1);
+  return value;
+}
+
+std::optional<std::size_t> content_length(std::string_view data,
+                                          std::size_t header_end) {
+  const auto first_line_end = data.find("\r\n");
+  if (first_line_end == std::string_view::npos || first_line_end >= header_end)
+    throw std::runtime_error("invalid HTTP start line");
+  std::optional<std::size_t> result;
+  auto begin = first_line_end + 2;
+  while (begin < header_end) {
+    const auto end = data.find("\r\n", begin);
+    if (end == std::string_view::npos || end > header_end)
+      throw std::runtime_error("invalid HTTP header line");
+    const auto line = data.substr(begin, end - begin);
+    const auto separator = line.find(':');
+    if (separator == std::string_view::npos)
+      throw std::runtime_error("invalid HTTP header line");
+    auto name = line.substr(0, separator);
+    const auto is_content_length =
+        name.size() == std::strlen("content-length") &&
+        std::equal(name.begin(), name.end(), "content-length",
+                   [](char left, char right) {
+                     return std::tolower(static_cast<unsigned char>(left)) ==
+                            right;
+                   });
+    if (is_content_length) {
+      if (result)
+        throw std::runtime_error("duplicate HTTP Content-Length");
+      const auto value = trim_ascii(line.substr(separator + 1));
+      std::size_t parsed = 0;
+      const auto converted =
+          std::from_chars(value.data(), value.data() + value.size(), parsed);
+      if (value.empty() || converted.ec != std::errc{} ||
+          converted.ptr != value.data() + value.size())
+        throw std::runtime_error("invalid HTTP Content-Length");
+      result = parsed;
+    }
+    begin = end + 2;
+  }
+  return result;
+}
+
 std::string receive_all(Socket socket, std::size_t maximum = 256ULL * 1024ULL * 1024ULL,
                         std::size_t maximum_header = 32ULL * 1024ULL) {
   std::string data;
@@ -109,20 +165,18 @@ std::string receive_all(Socket socket, std::size_t maximum = 256ULL * 1024ULL * 
     if (header_end == std::string::npos && data.size() > maximum_header)
       throw std::runtime_error("HTTP headers exceed size limit");
     if (header_end != std::string::npos && expected == std::string::npos) {
-      const auto key = data.find("Content-Length:");
-      std::size_t length = 0;
-      if (key != std::string::npos && key < header_end) {
-        const auto begin = key + std::strlen("Content-Length:");
-        length =
-            std::stoull(data.substr(begin, data.find("\r\n", begin) - begin));
-        if (length > maximum)
-          throw std::runtime_error("HTTP body exceeds size limit");
-      }
+      const auto length = content_length(data, header_end).value_or(0);
+      if (length > maximum)
+        throw std::runtime_error("HTTP body exceeds size limit");
       expected = header_end + 4 + length;
     }
     if (expected != std::string::npos && data.size() >= expected)
       break;
   }
+  if (expected != std::string::npos && data.size() < expected)
+    throw std::runtime_error("incomplete HTTP body");
+  if (expected != std::string::npos && data.size() > expected)
+    throw std::runtime_error("unexpected bytes after HTTP body");
   return data;
 }
 
@@ -190,6 +244,19 @@ nlohmann::json request_http(const std::string &endpoint,
   const auto split = response.find("\r\n\r\n");
   if (split == std::string::npos)
     throw std::runtime_error("invalid HTTP response");
+  const auto line_end = response.find("\r\n");
+  if (line_end == std::string::npos ||
+      !std::string_view(response).substr(0, line_end).starts_with("HTTP/1.1 "))
+    throw std::runtime_error("invalid HTTP response status");
+  const auto status_text =
+      std::string_view(response).substr(std::strlen("HTTP/1.1 "), 3);
+  int status = 0;
+  const auto converted = std::from_chars(
+      status_text.data(), status_text.data() + status_text.size(), status);
+  if (converted.ec != std::errc{} ||
+      converted.ptr != status_text.data() + status_text.size() || status < 100 ||
+      status > 599)
+    throw std::runtime_error("invalid HTTP response status");
   return nlohmann::json::parse(response.substr(split + 4));
 }
 
@@ -202,6 +269,75 @@ bool allowed_http_query(const nlohmann::json &request) {
       "submodule.revisions"};
   return allowed.contains(request.at("query").get<std::string>());
 }
+
+class RequestExecutor {
+public:
+  explicit RequestExecutor(QueryService &service)
+      : service_(service), worker_([this](std::stop_token stop) { run(stop); }) {}
+
+  ~RequestExecutor() {
+    worker_.request_stop();
+    changed_.notify_all();
+  }
+
+  nlohmann::json enqueue(const nlohmann::json &request) {
+    auto response = service_.enqueue(request);
+    if (response.value("state", std::string{}) != "queued")
+      return response;
+    const auto request_id = response.at("request_id").get<std::string>();
+    {
+      std::scoped_lock lock(mutex_);
+      if (!queued_.contains(request_id) && requests_.size() >= kMaximumQueued)
+        return {{"schema_version", kSchemaVersion},
+                {"ok", false},
+                {"request_id", request_id},
+                {"state", "queued"},
+                {"error", {{"code", "request_queue_full"}}}};
+      if (queued_.insert(request_id).second)
+        requests_.push_back({request_id, request});
+    }
+    changed_.notify_all();
+    return response;
+  }
+
+private:
+  void run(std::stop_token stop) {
+    while (!stop.stop_requested()) {
+      std::pair<std::string, nlohmann::json> pending;
+      {
+        std::unique_lock lock(mutex_);
+        changed_.wait(lock, stop, [this] { return !requests_.empty(); });
+        if (stop.stop_requested())
+          return;
+        pending = std::move(requests_.front());
+        requests_.pop_front();
+      }
+      try {
+        const auto status = service_.request_status(pending.first, false);
+        if (status.value("state", std::string{}) != "cancelled")
+          (void)service_.submit(pending.second);
+      } catch (const std::exception &error) {
+        Telemetry::instance().increment("requests.executor_failures");
+        Telemetry::instance().log(
+            "error", "request.executor_failed",
+            {{"request_id", pending.first},
+             {"diagnostic_fingerprint", stable_hash(error.what())}});
+      }
+      {
+        std::scoped_lock lock(mutex_);
+        queued_.erase(pending.first);
+      }
+    }
+  }
+
+  QueryService &service_;
+  static constexpr std::size_t kMaximumQueued = 128;
+  std::mutex mutex_;
+  std::condition_variable_any changed_;
+  std::deque<std::pair<std::string, nlohmann::json>> requests_;
+  std::set<std::string> queued_;
+  std::jthread worker_;
+};
 
 void respond(Socket client, int status, const nlohmann::json &body) {
   const auto payload = body.dump();
@@ -223,6 +359,7 @@ void respond(Socket client, int status, const nlohmann::json &body) {
 void run_http_server(const HttpServerOptions &options, QueryService &service,
                      const nlohmann::json &identity) {
   (void)socket_runtime();
+  RequestExecutor requests(service);
   const auto listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
   if (listener == kInvalidSocket)
     throw std::runtime_error("cannot create HTTP listener");
@@ -242,6 +379,25 @@ void run_http_server(const HttpServerOptions &options, QueryService &service,
       listen(listener, 16) != 0) {
     close_socket(listener);
     throw std::runtime_error("cannot bind local HTTP service");
+  }
+  if (options.on_listening) {
+    sockaddr_in bound{};
+#ifdef _WIN32
+    int bound_size = sizeof(bound);
+#else
+    socklen_t bound_size = sizeof(bound);
+#endif
+    if (getsockname(listener, reinterpret_cast<sockaddr *>(&bound),
+                    &bound_size) != 0) {
+      close_socket(listener);
+      throw std::runtime_error("cannot identify HTTP listener port");
+    }
+    try {
+      options.on_listening(ntohs(bound.sin_port));
+    } catch (...) {
+      close_socket(listener);
+      throw;
+    }
   }
 
   std::uint32_t handled = 0;
@@ -271,6 +427,9 @@ void run_http_server(const HttpServerOptions &options, QueryService &service,
       if (line_end == std::string::npos || header_end == std::string::npos)
         throw std::runtime_error("invalid HTTP request");
       const auto first = raw.substr(0, line_end);
+      const auto declared_length = content_length(raw, header_end);
+      if (first.starts_with("POST ") && !declared_length)
+        throw std::runtime_error("POST requires Content-Length");
       if (first.starts_with("GET /v1/health/live ")) {
         respond(client, 200,
                 {{"schema_version", kSchemaVersion}, {"ok", true}});
@@ -296,7 +455,8 @@ void run_http_server(const HttpServerOptions &options, QueryService &service,
             nlohmann::json::parse(raw.substr(header_end + 4));
         if (!allowed_http_query(request))
           throw std::runtime_error("query is restricted to the local CLI");
-        respond(client, 202, service.submit(request));
+        const auto queued = requests.enqueue(request);
+        respond(client, queued.value("ok", false) ? 202 : 503, queued);
       } else if (first.starts_with("POST /v1/queries ")) {
         throw std::runtime_error("direct HTTP queries are disabled; use /v1/requests");
       } else if (first.starts_with("GET /v1/requests/")) {
@@ -305,7 +465,7 @@ void run_http_server(const HttpServerOptions &options, QueryService &service,
         auto resource = first.substr(begin, end - begin);
         const auto results_suffix = resource.find("/results");
         const auto request_id = resource.substr(0, results_suffix);
-        const auto status = service.request_status(request_id);
+        const auto status = service.request_status(request_id, false);
         if (results_suffix == std::string::npos)
           respond(client, status.value("ok", true) ? 200 : 404, status);
         else
@@ -351,6 +511,11 @@ nlohmann::json http_query(const std::string &endpoint,
 
 nlohmann::json http_status(const std::string &endpoint) {
   return request_http(endpoint, "GET", "/v1/status", nullptr);
+}
+
+nlohmann::json http_request_status(const std::string &endpoint,
+                                   const std::string &request_id) {
+  return request_http(endpoint, "GET", "/v1/requests/" + request_id, nullptr);
 }
 
 } // namespace history

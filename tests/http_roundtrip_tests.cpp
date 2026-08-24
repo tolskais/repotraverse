@@ -1,9 +1,10 @@
 #include <chrono>
 #include <filesystem>
-#include <iostream>
+#include <future>
 #include <memory>
-#include <stdexcept>
 #include <thread>
+
+#include "catch_amalgamated.hpp"
 
 #include "history/catalog.hpp"
 #include "history/git_coordination.hpp"
@@ -12,8 +13,8 @@
 
 namespace {
 void require(bool condition, const char *message) {
-  if (!condition)
-    throw std::runtime_error(message);
+  INFO(message);
+  REQUIRE(condition);
 }
 void git(const std::vector<std::string> &arguments) {
   auto command = std::vector<std::string>{"git"};
@@ -24,8 +25,7 @@ void git(const std::vector<std::string> &arguments) {
 }
 } // namespace
 
-int main() {
-  try {
+TEST_CASE("HTTP requests are queued and completed without blocking status") {
     const auto nonce =
         std::chrono::steady_clock::now().time_since_epoch().count();
     const auto root = std::filesystem::temp_directory_path() /
@@ -44,21 +44,36 @@ int main() {
     git({"clone", remote.string(), repository.string()});
 
     auto catalog = std::make_shared<history::Catalog>(root / "catalog");
-    auto coordinator = std::make_shared<history::GitCoordinator>(
-        *catalog, history::CoordinationOptions{repository, "origin", 30, 0});
+    history::CoordinationOptions coordination;
+    coordination.repository = repository;
+    coordination.lease_seconds = 30;
+    coordination.grace_seconds = 0;
+    auto coordinator =
+        std::make_shared<history::GitCoordinator>(*catalog, coordination);
     history::QueryService service(std::make_shared<history::MemoryFactStore>(),
                                   catalog, coordinator);
     history::HttpServerOptions options;
-    options.port = static_cast<std::uint16_t>(20000 + (nonce % 10000));
+    options.port = 0;
     options.sync_seconds = 300;
-    options.max_requests = 2;
-    std::thread server([&] {
-      history::run_http_server(
-          options, service,
-          {{"ok", true}, {"producer_id", catalog->producer_id()}});
+    std::promise<std::uint16_t> listening;
+    options.on_listening = [&](std::uint16_t port) { listening.set_value(port); };
+    std::exception_ptr server_error;
+    std::jthread server([&, options](std::stop_token stop) mutable {
+      options.stop_token = stop;
+      try {
+        history::run_http_server(
+            options, service,
+            {{"ok", true}, {"producer_id", catalog->producer_id()}});
+      } catch (...) {
+        server_error = std::current_exception();
+        try {
+          listening.set_exception(server_error);
+        } catch (...) {
+        }
+      }
     });
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    const auto endpoint = "http://127.0.0.1:" + std::to_string(options.port);
+    const auto endpoint =
+        "http://127.0.0.1:" + std::to_string(listening.get_future().get());
     const auto status = history::http_status(endpoint);
     require(status.value("producer_id", std::string{}) ==
                 catalog->producer_id(),
@@ -74,15 +89,24 @@ int main() {
                        {"target_element_ids", {"after"}},
                        {"review_state", "accepted"},
                        {"reviewer", "test"}}}}}});
-    require(response.value("ok", false), "HTTP query failed");
-    require(response.at("result").at("result").at("kind") ==
-                "extract",
+    require(response.value("ok", false) && response.at("state") == "queued",
+            "HTTP query was not queued");
+    const auto request_id = response.at("request_id").get<std::string>();
+    nlohmann::json completed;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    do {
+      completed = history::http_request_status(endpoint, request_id);
+      if (completed.value("state", std::string{}) == "complete")
+        break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    } while (std::chrono::steady_clock::now() < deadline);
+    require(completed.value("state", std::string{}) == "complete",
+            "queued HTTP query did not complete");
+    require(completed.at("result").at("result").at("kind") == "extract",
             "HTTP review result was not persisted");
+    server.request_stop();
     server.join();
-    std::cout << "HTTP roundtrip tests passed\n";
-    return 0;
-  } catch (const std::exception &error) {
-    std::cerr << error.what() << '\n';
-    return 1;
-  }
+    if (server_error)
+      std::rethrow_exception(server_error);
 }

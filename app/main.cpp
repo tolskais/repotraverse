@@ -6,6 +6,8 @@
 #include <thread>
 #include <vector>
 
+#include <CLI/CLI.hpp>
+
 #include "history/build_info.hpp"
 #include "history/catalog.hpp"
 #include "history/config.hpp"
@@ -36,26 +38,6 @@ nlohmann::json read_json(std::istream &input) {
 
 nlohmann::json read_json(const std::filesystem::path &path) {
   return nlohmann::json::parse(history::read_text_file(path).text);
-}
-
-void usage() {
-  std::cerr
-      << "usage:\n"
-      << "  repotraverse --version\n"
-      << "  repotraverse serve --config FILE\n"
-#ifdef _WIN32
-      << "  repotraverse service --config FILE\n"
-#endif
-      << "  repotraverse query [--request FILE]\n"
-      << "  repotraverse query --endpoint URL [--request FILE]\n"
-      << "  repotraverse status [--endpoint URL]\n"
-      << "  repotraverse identity init --catalog DIRECTORY\n"
-      << "  repotraverse experiment capture --manifest FILE [--full-output]\n"
-      << "  repotraverse experiment head --manifest FILE [--full-output]\n"
-      << "  repotraverse experiment pilot --manifest FILE [--full-output]\n"
-      << "  repotraverse experiment classify --manifest FILE [--full-output]\n"
-      << "  repotraverse benchmark [--elements N]\n"
-      << "  repotraverse facts canonicalize [FILE]\n";
 }
 
 nlohmann::json experiment_summary(const std::string &action,
@@ -268,63 +250,115 @@ void WINAPI service_entry(DWORD, wchar_t **) {
 } // namespace
 
 int repotraverse_main(int argc, char **argv) {
-  if (argc < 2) {
-    usage();
-    return 2;
-  }
-  const std::string command = argv[1];
+  CLI::App cli{"Compiler-derived C/C++ element history across Git revisions",
+               "repotraverse"};
+  cli.require_subcommand(1);
+  const auto version =
+      std::string{"repotraverse "} +
+      std::string{history::build::kToolVersion} + " (build mode: " +
+      std::string{history::build::kBuildMode} + "; host: " +
+      std::string{history::build::kHostArchitecture} + ")";
+  cli.set_version_flag("--version", version);
+
+  std::string experiment_manifest;
+  bool full_output = false;
+  auto *experiment = cli.add_subcommand("experiment", "Run v1 experiments");
+  experiment->require_subcommand(1);
+  const auto add_experiment = [&](const char *name, const char *description) {
+    auto *subcommand = experiment->add_subcommand(name, description);
+    subcommand->add_option("--manifest", experiment_manifest, "Manifest file")
+        ->required();
+    subcommand->add_flag("--full-output", full_output,
+                         "Print the complete persisted report");
+    return subcommand;
+  };
+  auto *capture = add_experiment("capture", "Capture build contexts");
+  auto *head = add_experiment("head", "Analyze the head revision");
+  auto *pilot = add_experiment("pilot", "Run progressive history analysis");
+  auto *classify =
+      add_experiment("classify", "Classify a completed experiment");
+
+  std::string service_config;
+  auto *serve = cli.add_subcommand("serve", "Run the local service");
+  serve->add_option("--config", service_config, "Service configuration file")
+      ->required();
+#ifdef _WIN32
+  auto *windows_service =
+      cli.add_subcommand("service", "Run under Windows Service Control Manager");
+  windows_service
+      ->add_option("--config", service_config, "Service configuration file")
+      ->required();
+#endif
+
+  std::string status_endpoint;
+  auto *status = cli.add_subcommand("status", "Show local or service status");
+  status->add_option("--endpoint", status_endpoint, "Service HTTP endpoint");
+
+  std::string catalog_path_value;
+  auto *identity = cli.add_subcommand("identity", "Manage producer identity");
+  identity->require_subcommand(1);
+  auto *identity_init = identity->add_subcommand("init", "Initialize identity");
+  identity_init
+      ->add_option("--catalog", catalog_path_value, "Catalog directory")
+      ->required();
+
+  std::size_t elements = 50'000;
+  auto *benchmark = cli.add_subcommand("benchmark", "Run a synthetic benchmark");
+  benchmark->add_option("--elements", elements, "Synthetic element count")
+      ->check(CLI::PositiveNumber);
+
+  std::string facts_file;
+  auto *facts = cli.add_subcommand("facts", "Manage fact documents");
+  facts->require_subcommand(1);
+  auto *canonicalize =
+      facts->add_subcommand("canonicalize", "Write canonical JSON");
+  canonicalize->add_option("file", facts_file, "Input file; defaults to stdin");
+
+  std::string query_endpoint, request_file;
+  auto *query = cli.add_subcommand("query", "Execute a JSON request");
+  query->add_option("--endpoint", query_endpoint, "Service HTTP endpoint");
+  query->add_option("--request", request_file, "Request file; defaults to stdin");
+
   try {
-    if (command == "--version") {
-      std::cout << "repotraverse " << history::build::kToolVersion
-                << " (build mode: " << history::build::kBuildMode
-                << "; host: " << history::build::kHostArchitecture << ")\n";
-      return 0;
-    }
-    if (command == "experiment") {
-      const bool full_output =
-          argc == 6 && std::string(argv[5]) == "--full-output";
-      if ((argc != 5 && !full_output) || std::string(argv[3]) != "--manifest" ||
-          (std::string(argv[2]) != "capture" &&
-           std::string(argv[2]) != "head" && std::string(argv[2]) != "pilot" &&
-           std::string(argv[2]) != "classify")) {
-        usage();
-        return 2;
-      }
+    cli.parse(argc, argv);
+  } catch (const CLI::ParseError &error) {
+    const auto code = cli.exit(error);
+    return code == 0 ? 0 : 2;
+  }
+
+  try {
+    if (capture->parsed() || head->parsed() || pilot->parsed() ||
+        classify->parsed()) {
       auto probe = std::filesystem::absolute(history::path_from_utf8(argv[0]))
                        .parent_path() /
                    "repotraverse-compiler-probe";
 #ifdef _WIN32
       probe += ".exe";
 #endif
-      const auto action = std::string(argv[2]);
+      const auto action = capture->parsed()  ? std::string{"capture"}
+                          : head->parsed()   ? std::string{"head"}
+                          : pilot->parsed()  ? std::string{"pilot"}
+                                             : std::string{"classify"};
+      const auto manifest = history::path_from_utf8(experiment_manifest);
       const auto result =
           action == "capture"
-              ? history::run_capture_experiment(history::path_from_utf8(argv[4]), probe)
+              ? history::run_capture_experiment(manifest, probe)
           : action == "head"
-              ? history::run_head_experiment(history::path_from_utf8(argv[4]), probe)
+              ? history::run_head_experiment(manifest, probe)
           : action == "pilot"
-              ? history::run_pilot_experiment(history::path_from_utf8(argv[4]), probe)
-              : history::run_stability_experiment(history::path_from_utf8(argv[4]));
+              ? history::run_pilot_experiment(manifest, probe)
+              : history::run_stability_experiment(manifest);
       std::cout << history::canonical_json(
                        full_output ? result
                                    : experiment_summary(action, result))
                 << '\n';
       return 0;
     }
-    if (command == "serve") {
-      if (argc != 4 || std::string(argv[2]) != "--config") {
-        usage();
-        return 2;
-      }
-      return run_service(history::path_from_utf8(argv[3]));
-    }
+    if (serve->parsed())
+      return run_service(history::path_from_utf8(service_config));
 #ifdef _WIN32
-    if (command == "service") {
-      if (argc != 4 || std::string(argv[2]) != "--config") {
-        usage();
-        return 2;
-      }
-      windows_service_config = history::path_from_utf8(argv[3]);
+    if (windows_service->parsed()) {
+      windows_service_config = history::path_from_utf8(service_config);
       SERVICE_TABLE_ENTRYW table[] = {
           {const_cast<wchar_t *>(L"Repotraverse"), service_entry},
           {nullptr, nullptr}};
@@ -334,14 +368,11 @@ int repotraverse_main(int argc, char **argv) {
       return 0;
     }
 #endif
-    if (command == "status") {
-      if (argc == 4 && std::string(argv[2]) == "--endpoint") {
-        std::cout << history::canonical_json(history::http_status(argv[3]));
+    if (status->parsed()) {
+      if (!status_endpoint.empty()) {
+        std::cout << history::canonical_json(
+            history::http_status(status_endpoint));
         return 0;
-      }
-      if (argc != 2) {
-        usage();
-        return 2;
       }
       std::cout << history::canonical_json(
           {{"schema_version", history::kSchemaVersion},
@@ -364,9 +395,8 @@ int repotraverse_main(int argc, char **argv) {
            {"persistent_raw_source", false}});
       return 0;
     }
-    if (command == "identity" && argc == 5 && std::string(argv[2]) == "init" &&
-        std::string(argv[3]) == "--catalog") {
-      const auto catalog_path = history::path_from_utf8(argv[4]);
+    if (identity_init->parsed()) {
+      const auto catalog_path = history::path_from_utf8(catalog_path_value);
       history::Catalog catalog(catalog_path);
       std::cout << history::canonical_json(
           {{"schema_version", history::kSchemaVersion},
@@ -376,14 +406,7 @@ int repotraverse_main(int argc, char **argv) {
                            std::filesystem::absolute(catalog_path))}});
       return 0;
     }
-    if (command == "benchmark") {
-      std::size_t elements = 50'000;
-      if (argc == 4 && std::string(argv[2]) == "--elements") {
-        elements = std::stoull(argv[3]);
-      } else if (argc != 2) {
-        usage();
-        return 2;
-      }
+    if (benchmark->parsed()) {
       const auto before = synthetic_bundle(elements, false);
       const auto after = synthetic_bundle(elements, true);
       const auto start = std::chrono::steady_clock::now();
@@ -399,43 +422,30 @@ int repotraverse_main(int argc, char **argv) {
            {"seed", 1}});
       return 0;
     }
-    if (command == "facts" && argc >= 3 &&
-        std::string(argv[2]) == "canonicalize") {
-      if (argc >= 4) {
+    if (canonicalize->parsed()) {
+      if (!facts_file.empty()) {
         std::cout << history::canonical_json(
-            read_json(history::path_from_utf8(argv[3])));
+            read_json(history::path_from_utf8(facts_file)));
       } else {
         std::cout << history::canonical_json(read_json(std::cin));
       }
       return 0;
     }
-    if (command == "query") {
+    if (query->parsed()) {
       nlohmann::json request;
-      std::string endpoint;
-      if (argc == 6 && std::string(argv[2]) == "--endpoint" &&
-          std::string(argv[4]) == "--request") {
-        endpoint = argv[3];
-        request = read_json(history::path_from_utf8(argv[5]));
-      } else if (argc == 4 && std::string(argv[2]) == "--endpoint") {
-        endpoint = argv[3];
+      if (!request_file.empty())
+        request = read_json(history::path_from_utf8(request_file));
+      else
         request = read_json(std::cin);
-      } else if (argc == 4 && std::string(argv[2]) == "--request") {
-        request = read_json(history::path_from_utf8(argv[3]));
-      } else if (argc == 2) {
-        request = read_json(std::cin);
-      } else {
-        usage();
-        return 2;
-      }
       const auto response =
-          endpoint.empty() ? history::QueryService(
-                                 std::make_shared<history::MemoryFactStore>())
-                                 .execute(request)
-                           : history::http_query(endpoint, request);
+          query_endpoint.empty()
+              ? history::QueryService(
+                    std::make_shared<history::MemoryFactStore>())
+                    .execute(request)
+              : history::http_query(query_endpoint, request);
       std::cout << history::canonical_json(response);
       return response.value("ok", false) ? 0 : 1;
     }
-    usage();
     return 2;
   } catch (const std::exception &error) {
     std::cout << history::canonical_json(

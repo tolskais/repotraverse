@@ -137,6 +137,14 @@ nlohmann::json QueryService::submit(const nlohmann::json &request) const {
                            .count();
   Telemetry::instance().increment("requests.submitted");
   Telemetry::instance().gauge("requests.last_latency_ms", elapsed);
+  if (const auto current = catalog_->request_job(request_id);
+      current && current->value("state", std::string{}) == "cancelled") {
+    catalog_->cancel_request_tasks(request_id);
+    auto cancelled = *current;
+    cancelled["schema_version"] = kSchemaVersion;
+    cancelled["ok"] = true;
+    return cancelled;
+  }
   const auto state =
       !response.value("ok", false) ? "failed"
       : response.value("result_status", std::string{}) == "complete"
@@ -157,6 +165,26 @@ nlohmann::json QueryService::submit(const nlohmann::json &request) const {
   job["schema_version"] = kSchemaVersion;
   job["ok"] = state != std::string{"failed"};
   return job;
+}
+
+nlohmann::json QueryService::enqueue(const nlohmann::json &request) const {
+  if (!catalog_)
+    return execute(request);
+  const auto request_id = catalog_->create_request(request);
+  const auto existing = catalog_->request_job(request_id);
+  const auto state = existing ? existing->value("state", std::string{})
+                              : std::string{};
+  if (state == "complete" || state == "cancelled") {
+    auto response = *existing;
+    response["schema_version"] = kSchemaVersion;
+    response["ok"] = state != "failed";
+    return response;
+  }
+  catalog_->update_request(request_id, "queued", {{"phase", "queued"}});
+  auto response = *catalog_->request_job(request_id);
+  response["schema_version"] = kSchemaVersion;
+  response["ok"] = true;
+  return response;
 }
 
 nlohmann::json QueryService::request_status(const std::string &request_id,

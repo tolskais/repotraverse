@@ -15,7 +15,9 @@
 
 namespace history {
 namespace {
+#ifdef _WIN32
 void write_event_log(const std::string &payload, bool error);
+#endif
 }
 
 Telemetry &Telemetry::instance() {
@@ -221,7 +223,6 @@ public:
     return false;
   }
 };
-void write_event_log(const std::string &, bool) {}
 #endif
 
 std::string unix_nanos() {

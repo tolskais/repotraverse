@@ -6,15 +6,11 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-set(REPOTRAVERSE_CLANG_PROVIDER "package" CACHE STRING
-    "Clang provider: package or disabled")
-set_property(CACHE REPOTRAVERSE_CLANG_PROVIDER PROPERTY STRINGS package disabled)
 set(REPOTRAVERSE_LLVM_ROOT "" CACHE PATH
     "Root of the prebuilt LLVM/Clang SDK")
 option(REPOTRAVERSE_NATIVE_OPTIMIZATION
        "Optimize for the build VM CPU; the resulting executable is not portable"
        OFF)
-
 if(WIN32 AND NOT (MSVC AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang"))
     message(FATAL_ERROR
         "Windows builds require clang-cl from REPOTRAVERSE_LLVM_ROOT; "
@@ -50,7 +46,15 @@ endif()
 add_library(repotraverse-build-options INTERFACE)
 if(MSVC)
     target_compile_options(repotraverse-build-options INTERFACE
-        $<$<COMPILE_LANGUAGE:CXX>:/utf-8>)
+        $<$<COMPILE_LANGUAGE:CXX>:/utf-8>
+        $<$<COMPILE_LANGUAGE:CXX>:/W4>
+        $<$<COMPILE_LANGUAGE:CXX>:/WX>)
+else()
+    target_compile_options(repotraverse-build-options INTERFACE
+        $<$<COMPILE_LANGUAGE:CXX>:-Wall>
+        $<$<COMPILE_LANGUAGE:CXX>:-Wextra>
+        $<$<COMPILE_LANGUAGE:CXX>:-Wpedantic>
+        $<$<COMPILE_LANGUAGE:CXX>:-Werror>)
 endif()
 if(REPOTRAVERSE_NATIVE_OPTIMIZATION)
     if(MSVC AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
@@ -73,6 +77,13 @@ add_library(repotraverse-json INTERFACE)
 add_library(nlohmann_json::nlohmann_json ALIAS repotraverse-json)
 target_include_directories(repotraverse-json SYSTEM INTERFACE
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nlohmann_json/include")
+
+# Pinned CLI11 v2.7.0 single-header distribution. It is vendored so command
+# parsing remains available in fully offline builds.
+add_library(repotraverse-cli11 INTERFACE)
+add_library(CLI11::CLI11 ALIAS repotraverse-cli11)
+target_include_directories(repotraverse-cli11 SYSTEM INTERFACE
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/CLI11/include")
 
 # Pinned offline dependencies. SQLite is the disposable local materialized
 # index; xxHash supplies schema-fixed XXH3-128 identifiers.
@@ -151,13 +162,15 @@ endif()
 target_compile_features(history-core PUBLIC cxx_std_20)
 
 add_executable(repotraverse app/main.cpp)
-target_link_libraries(repotraverse PRIVATE history-core repotraverse-build-options)
+target_link_libraries(repotraverse PRIVATE history-core repotraverse-build-options
+    CLI11::CLI11)
 
 add_executable(repotraverse-compiler-probe probe/main.cpp)
 target_link_libraries(repotraverse-compiler-probe PRIVATE
     history-core repotraverse-build-options)
 
-if(REPOTRAVERSE_CLANG_PROVIDER STREQUAL "package")
+set(_repotraverse_clang_enabled OFF)
+if(REPOTRAVERSE_LLVM_ROOT OR Clang_DIR)
     if(REPOTRAVERSE_LLVM_ROOT)
         cmake_path(ABSOLUTE_PATH REPOTRAVERSE_LLVM_ROOT NORMALIZE)
         unset(_llvm_config CACHE)
@@ -189,12 +202,15 @@ if(REPOTRAVERSE_CLANG_PROVIDER STREQUAL "package")
         find_package(LLVM CONFIG REQUIRED PATHS "${_llvm_cmake}" NO_DEFAULT_PATH)
         find_package(Clang CONFIG REQUIRED PATHS "${_clang_cmake}" NO_DEFAULT_PATH)
     else()
-        # Connected developer builds may use an installed package. The Windows
-        # offline presets and build script require REPOTRAVERSE_LLVM_ROOT.
-        find_package(LLVM CONFIG REQUIRED)
+        # ClangConfig locates its matching LLVM package. The Windows offline
+        # presets and build script use REPOTRAVERSE_LLVM_ROOT instead.
         find_package(Clang CONFIG REQUIRED)
     endif()
 
+    set(_repotraverse_clang_enabled ON)
+endif()
+
+if(_repotraverse_clang_enabled)
     if(WIN32 AND TARGET clangTooling AND TARGET clangIndex)
         set(_repotraverse_clang_libraries clangTooling clangIndex)
         set(_repotraverse_clang_linkage "component")
@@ -234,21 +250,25 @@ if(REPOTRAVERSE_CLANG_PROVIDER STREQUAL "package")
     endif()
 
     add_executable(clang-extractor extractor/main.cpp)
-    target_include_directories(clang-extractor PRIVATE
+    target_include_directories(clang-extractor SYSTEM PRIVATE
         ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
     separate_arguments(_llvm_definitions NATIVE_COMMAND "${LLVM_DEFINITIONS}")
     target_compile_options(clang-extractor PRIVATE ${_llvm_definitions})
     target_link_libraries(clang-extractor PRIVATE
         history-core repotraverse-build-options
         ${_repotraverse_clang_libraries})
-elseif(NOT REPOTRAVERSE_CLANG_PROVIDER STREQUAL "disabled")
-    message(FATAL_ERROR
-        "Unknown REPOTRAVERSE_CLANG_PROVIDER=${REPOTRAVERSE_CLANG_PROVIDER}")
 endif()
 
 include(CTest)
 if(BUILD_TESTING)
     find_package(Git REQUIRED)
+    # Catch2 v3.15.0 official amalgamated distribution keeps the test build
+    # offline without importing Catch2's own development targets.
+    add_library(repotraverse-catch2 STATIC
+        third_party/Catch2/extras/catch_amalgamated.cpp)
+    target_include_directories(repotraverse-catch2 SYSTEM PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Catch2/extras")
+    add_library(Catch2::Catch2WithMain ALIAS repotraverse-catch2)
     add_executable(history-core-tests tests/core_tests.cpp)
     target_link_libraries(history-core-tests PRIVATE
         history-core repotraverse-build-options)
@@ -270,11 +290,11 @@ if(BUILD_TESTING)
     add_test(NAME build-import-tests COMMAND build-import-tests)
     add_executable(http-roundtrip-tests tests/http_roundtrip_tests.cpp)
     target_link_libraries(http-roundtrip-tests PRIVATE
-        history-core repotraverse-build-options)
+        history-core repotraverse-build-options Catch2::Catch2WithMain)
     add_test(NAME http-roundtrip-tests COMMAND http-roundtrip-tests)
     add_executable(catalog-production-tests tests/catalog_production_tests.cpp)
     target_link_libraries(catalog-production-tests PRIVATE
-        history-core repotraverse-build-options)
+        history-core repotraverse-build-options Catch2::Catch2WithMain)
     add_test(NAME catalog-production-tests COMMAND catalog-production-tests)
     add_executable(process-tests tests/process_tests.cpp)
     target_link_libraries(process-tests PRIVATE
@@ -288,7 +308,7 @@ if(BUILD_TESTING)
     add_test(NAME encoding-tests COMMAND encoding-tests)
     add_executable(stability-tests tests/stability_tests.cpp)
     target_link_libraries(stability-tests PRIVATE
-        history-core repotraverse-build-options)
+        history-core repotraverse-build-options Catch2::Catch2WithMain)
     add_test(NAME stability-tests COMMAND stability-tests)
     add_executable(revision-workspace-tests tests/revision_workspace_tests.cpp)
     target_link_libraries(revision-workspace-tests PRIVATE
@@ -317,6 +337,9 @@ if(BUILD_TESTING)
     set_tests_properties(repotraverse-version PROPERTIES
         PASS_REGULAR_EXPRESSION
             "repotraverse ${PROJECT_VERSION}.*build mode: ${REPOTRAVERSE_BUILD_MODE}")
+    add_test(NAME repotraverse-help COMMAND repotraverse --help)
+    set_tests_properties(repotraverse-help PROPERTIES
+        PASS_REGULAR_EXPRESSION "experiment.*serve.*query")
     add_test(
         NAME public-version-v1
         COMMAND ${CMAKE_COMMAND}
@@ -335,6 +358,7 @@ if(BUILD_TESTING)
         add_executable(fake-make tests/fake_make.cpp)
         target_link_libraries(fake-make PRIVATE history-core repotraverse-build-options)
         add_executable(fake-arm-compiler tests/fake_arm_compiler.cpp)
+        target_link_libraries(fake-arm-compiler PRIVATE repotraverse-build-options)
         add_executable(experiment-tests tests/experiment_tests.cpp)
         target_link_libraries(experiment-tests PRIVATE
             history-core repotraverse-build-options)
@@ -411,6 +435,8 @@ install(FILES third_party/tree_sitter_c/LICENSE third_party/tree_sitter_c/VERSIO
 install(FILES third_party/tree_sitter_cpp/LICENSE
     third_party/tree_sitter_cpp/VERSION
     DESTINATION licenses/tree_sitter_cpp)
+install(FILES third_party/CLI11/LICENSE third_party/CLI11/VERSION
+    DESTINATION licenses/CLI11)
 install(FILES README.md THIRD_PARTY.md docs/lineage-architecture.md
     docs/operations.md docs/v1-experiment.md
     DESTINATION docs)

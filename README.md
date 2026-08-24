@@ -58,10 +58,12 @@ Native mode passes `-march=native` through clang-cl. Its executable must not be
 copied to a VM that may expose fewer CPU features. Both modes use at most two
 build jobs by default; pass `-Jobs N` to override this.
 
-The build is offline: nlohmann/json v3.12.0, SQLite 3.53.4, xxHash 0.8.3,
-Tree-sitter 0.26.11, and the generated C 0.24.2/C++ 0.23.4 grammars are vendored.
-CMake contains no dependency download or parser-generation path. Upstream license and
-public-domain notices are retained under `third_party/` and installed with the tool.
+The build is offline: CLI11 2.7.0, nlohmann/json v3.12.0, SQLite 3.53.4,
+xxHash 0.8.3, Tree-sitter 0.26.11, the generated C 0.24.2/C++ 0.23.4
+grammars, and the Catch2 3.15.0 test distribution are vendored. CMake contains
+no dependency download or parser-generation path. Upstream license and
+public-domain notices are retained under `third_party/` and installed with the
+tool.
 
 The core-only preset still uses clang-cl as the compiler but does not link the
 Clang libraries:
@@ -72,19 +74,19 @@ Clang libraries:
 
 ## Developer build
 
-Non-Windows developer machines can select an installed Clang package explicitly:
+The extractor is omitted by default. Non-Windows developer machines can build
+it by explicitly selecting an installed LLVM/Clang CMake package:
 
 ```sh
 cmake -S . -B build -G Ninja \
-  -DREPOTRAVERSE_CLANG_PROVIDER=package \
   -DLLVM_DIR=/usr/lib/llvm/22/lib64/cmake/llvm \
   -DClang_DIR=/usr/lib/llvm/22/lib64/cmake/clang
 cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-The core can be built without linking LLVM using
-`-DREPOTRAVERSE_CLANG_PROVIDER=disabled`.
+Without `Clang_DIR` or `REPOTRAVERSE_LLVM_ROOT`, configuration does not search
+for LLVM/Clang and builds only the core executables.
 
 ## Extract snapshots
 
@@ -268,11 +270,13 @@ An LLM normally issues only a high-level query:
 }
 ```
 
-Remote queries create durable request jobs. `POST /v1/requests` returns a
-stable request ID, `GET /v1/requests/<id>` refreshes status, and
-`GET /v1/requests/<id>/results` returns the current result. Jobs and review
-decisions survive process restarts. The service rejects non-loopback bind
-addresses and bounds request size and idle time.
+Remote queries create durable request jobs. `POST /v1/requests` queues planning
+and immediately returns a stable request ID, `GET /v1/requests/<id>` reads
+status without running planning on the HTTP thread, and
+`GET /v1/requests/<id>/results` returns the current result. Reposting the same
+request resumes a partial or interrupted plan under the same ID. Jobs and
+review decisions survive process restarts. The service rejects non-loopback
+bind addresses and bounds request size and idle time.
 
 The first job result can be `partial`: it includes Git/PR change units,
 zero-context changed-line ranges, the materialized `snapshot_id`, coverage gaps,

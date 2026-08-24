@@ -1,18 +1,18 @@
 #include <chrono>
 #include <filesystem>
-#include <iostream>
-#include <stdexcept>
+
+#include "catch_amalgamated.hpp"
 
 #include "history/catalog.hpp"
 
 namespace {
 void require(bool condition, const char *message) {
-  if (!condition)
-    throw std::runtime_error(message);
+  INFO(message);
+  REQUIRE(condition);
 }
 } // namespace
 
-int main() {
+TEST_CASE("production catalog operations remain durable and consistent") {
   const auto root =
       std::filesystem::temp_directory_path() /
       ("repotraverse-production-catalog-" +
@@ -25,8 +25,7 @@ int main() {
       std::filesystem::remove_all(path, ignored);
     }
   } cleanup{root};
-  try {
-    history::Catalog catalog(root);
+  history::Catalog catalog(root);
     const nlohmann::json request = {{"schema_version", history::kSchemaVersion},
                                     {"query", "analysis.coverage"},
                                     {"params", {{"bundle", "fixture.json"}}}};
@@ -115,10 +114,58 @@ int main() {
                 dependents.at("dependents").front().at("element_id") ==
                     source.element_id,
             "reverse semantic dependency was not indexed");
-    std::cout << "production catalog tests passed\n";
-    return 0;
-  } catch (const std::exception &error) {
-    std::cerr << error.what() << '\n';
-    return 1;
-  }
+}
+
+TEST_CASE("reimporting a compile context removes stale file mappings") {
+  const auto root =
+      std::filesystem::temp_directory_path() /
+      ("repotraverse-context-reimport-" +
+       std::to_string(
+           std::chrono::steady_clock::now().time_since_epoch().count()));
+  struct Cleanup {
+    std::filesystem::path path;
+    ~Cleanup() {
+      std::error_code ignored;
+      std::filesystem::remove_all(path, ignored);
+    }
+  } cleanup{root};
+
+  history::Catalog catalog(root);
+  history::CompileContext context;
+  context.context_id = "context";
+  context.configuration = "debug";
+  context.source_revision = "revision";
+  context.translation_unit = "source.cpp";
+  context.project_files = {"include/old.hpp"};
+  catalog.store_compile_context(context);
+  REQUIRE(catalog.compile_contexts("include/old.hpp", "revision").size() == 1);
+
+  context.project_files = {"include/new.hpp"};
+  catalog.store_compile_context(context);
+  REQUIRE(catalog.compile_contexts("include/old.hpp", "revision").empty());
+  REQUIRE(catalog.compile_contexts("include/new.hpp", "revision").size() == 1);
+  REQUIRE(catalog.compile_contexts("source.cpp", "revision").size() == 1);
+}
+
+TEST_CASE("fact indexing rolls back when manifest decoding fails") {
+  const auto root =
+      std::filesystem::temp_directory_path() /
+      ("repotraverse-fact-rollback-" +
+       std::to_string(
+           std::chrono::steady_clock::now().time_since_epoch().count()));
+  struct Cleanup {
+    std::filesystem::path path;
+    ~Cleanup() {
+      std::error_code ignored;
+      std::filesystem::remove_all(path, ignored);
+    }
+  } cleanup{root};
+
+  history::Catalog catalog(root);
+  REQUIRE_THROWS(catalog.store_fact(
+      "invalid-fact", "invalid-task",
+      {{"result",
+        {{"record_type", "tu_manifest"}, {"schema_version", 2}}}},
+      "commit"));
+  REQUIRE_FALSE(catalog.fact_for_task("invalid-task").has_value());
 }

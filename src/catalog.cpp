@@ -20,6 +20,38 @@ void check(int code, sqlite3 *database, const char *action) {
                              sqlite3_errmsg(database));
 }
 
+void execute_sql(sqlite3 *database, const char *sql, const char *action) {
+  char *detail = nullptr;
+  const auto code = sqlite3_exec(database, sql, nullptr, nullptr, &detail);
+  if (code == SQLITE_OK)
+    return;
+  const std::string message = detail ? detail : sqlite3_errmsg(database);
+  sqlite3_free(detail);
+  throw std::runtime_error(std::string(action) + ": " + message);
+}
+
+class Transaction {
+public:
+  explicit Transaction(sqlite3 *database) : database_(database) {
+    execute_sql(database_, "BEGIN IMMEDIATE", "begin catalog transaction");
+  }
+  ~Transaction() {
+    if (active_)
+      sqlite3_exec(database_, "ROLLBACK", nullptr, nullptr, nullptr);
+  }
+  Transaction(const Transaction &) = delete;
+  Transaction &operator=(const Transaction &) = delete;
+
+  void commit() {
+    execute_sql(database_, "COMMIT", "commit catalog transaction");
+    active_ = false;
+  }
+
+private:
+  sqlite3 *database_;
+  bool active_{true};
+};
+
 std::string load_or_create_producer(const std::filesystem::path &root) {
   const auto path = root / "producer-id";
   {
@@ -278,6 +310,7 @@ void Catalog::store_fact(const std::string &fact_id, const std::string &task_id,
                          const nlohmann::json &fact,
                          const std::string &source_commit) {
   std::scoped_lock lock(mutex_);
+  Transaction transaction(database_);
   sqlite3_stmt *statement = nullptr;
   check(sqlite3_prepare_v2(
             database_,
@@ -361,6 +394,7 @@ void Catalog::store_fact(const std::string &fact_id, const std::string &task_id,
   const auto update_code = sqlite3_step(statement);
   sqlite3_finalize(statement);
   check(update_code, database_, "mark completed task");
+  transaction.commit();
 }
 
 std::optional<nlohmann::json>
@@ -416,6 +450,23 @@ void Catalog::mark_imported(const std::string &commit) {
 
 void Catalog::store_compile_context(const CompileContext &context) {
   std::scoped_lock lock(mutex_);
+  Transaction transaction(database_);
+  sqlite3_stmt *delete_files = nullptr;
+  check(sqlite3_prepare_v2(
+            database_,
+            "DELETE FROM compile_context_files WHERE context_id=? AND "
+            "configuration=? AND revision=?",
+            -1, &delete_files, nullptr),
+        database_, "prepare stale compile context file deletion");
+  sqlite3_bind_text(delete_files, 1, context.context_id.c_str(), -1,
+                    SQLITE_TRANSIENT);
+  sqlite3_bind_text(delete_files, 2, context.configuration.c_str(), -1,
+                    SQLITE_TRANSIENT);
+  sqlite3_bind_text(delete_files, 3, context.source_revision.c_str(), -1,
+                    SQLITE_TRANSIENT);
+  const auto delete_code = sqlite3_step(delete_files);
+  sqlite3_finalize(delete_files);
+  check(delete_code, database_, "delete stale compile context files");
   sqlite3_stmt *s = nullptr;
   check(sqlite3_prepare_v2(database_,
                            "INSERT OR REPLACE INTO "
@@ -456,6 +507,7 @@ void Catalog::store_compile_context(const CompileContext &context) {
   store_file(context.translation_unit);
   for (const auto &path : context.project_files)
     store_file(path);
+  transaction.commit();
 }
 
 std::vector<CompileContext>
@@ -491,6 +543,7 @@ Catalog::compile_contexts(const std::string &tu,
 void Catalog::schedule_task(const std::string &task_id,
                             const nlohmann::json &task) {
   std::scoped_lock lock(mutex_);
+  Transaction transaction(database_);
   sqlite3_stmt *s = nullptr;
   check(sqlite3_prepare_v2(database_,
                            "INSERT OR IGNORE INTO "
@@ -521,6 +574,7 @@ void Catalog::schedule_task(const std::string &task_id,
   const auto request_code = sqlite3_step(s);
   sqlite3_finalize(s);
   check(request_code, database_, "store task request");
+  transaction.commit();
 }
 
 nlohmann::json Catalog::pending_tasks(const std::string &request) const {

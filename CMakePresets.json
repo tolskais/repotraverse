@@ -19,8 +19,6 @@
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_C_COMPILER": "$env{REPOTRAVERSE_LLVM_ROOT}/bin/clang-cl.exe",
         "CMAKE_CXX_COMPILER": "$env{REPOTRAVERSE_LLVM_ROOT}/bin/clang-cl.exe",
-        "REPOTRAVERSE_CLANG_PROVIDER": "package",
-        "REPOTRAVERSE_LLVM_ROOT": "$env{REPOTRAVERSE_LLVM_ROOT}",
         "BUILD_TESTING": true
       }
     },
@@ -30,6 +28,7 @@
       "inherits": "windows-x64-base",
       "binaryDir": "${sourceDir}/out/build/windows-x64-generic",
       "cacheVariables": {
+        "REPOTRAVERSE_LLVM_ROOT": "$env{REPOTRAVERSE_LLVM_ROOT}",
         "REPOTRAVERSE_NATIVE_OPTIMIZATION": false
       }
     },
@@ -39,6 +38,7 @@
       "inherits": "windows-x64-base",
       "binaryDir": "${sourceDir}/out/build/windows-x64-native",
       "cacheVariables": {
+        "REPOTRAVERSE_LLVM_ROOT": "$env{REPOTRAVERSE_LLVM_ROOT}",
         "REPOTRAVERSE_NATIVE_OPTIMIZATION": true
       }
     },
@@ -48,7 +48,7 @@
       "inherits": "windows-x64-base",
       "binaryDir": "${sourceDir}/out/build/windows-x64-core-only",
       "cacheVariables": {
-        "REPOTRAVERSE_CLANG_PROVIDER": "disabled",
+        "REPOTRAVERSE_LLVM_ROOT": "",
         "REPOTRAVERSE_NATIVE_OPTIMIZATION": false
       }
     }

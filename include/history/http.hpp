@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <stop_token>
 
@@ -19,6 +20,7 @@ struct HttpServerOptions {
   std::size_t max_request_bytes{1024ULL * 1024ULL};
   std::size_t max_header_bytes{32ULL * 1024ULL};
   std::stop_token stop_token;
+  std::function<void(std::uint16_t)> on_listening;
 };
 
 void run_http_server(const HttpServerOptions &options, QueryService &service,
@@ -26,5 +28,7 @@ void run_http_server(const HttpServerOptions &options, QueryService &service,
 nlohmann::json http_query(const std::string &endpoint,
                           const nlohmann::json &request);
 nlohmann::json http_status(const std::string &endpoint);
+nlohmann::json http_request_status(const std::string &endpoint,
+                                   const std::string &request_id);
 
 } // namespace history

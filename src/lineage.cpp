@@ -91,8 +91,14 @@ void to_json(nlohmann::json& value, const TransitionResult& item) {
 
 TransitionResult trace_transition(const EvidenceBundle& before, const EvidenceBundle& after,
                                   const std::vector<LineageAssertion>& assertions) {
-    TransitionResult result{before.source_revision, after.source_revision, after.configuration,
-                            coverage_for(before, after)};
+    TransitionResult result{before.source_revision,
+                            after.source_revision,
+                            after.configuration,
+                            coverage_for(before, after),
+                            {},
+                            {},
+                            {},
+                            {}};
     if (before.configuration != after.configuration) {
         result.coverage.status = "partial";
         result.coverage.gaps.push_back("configuration mismatch");

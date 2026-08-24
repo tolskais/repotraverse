@@ -5,14 +5,14 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
-#include <iostream>
 #include <memory>
-#include <stdexcept>
+
+#include "catch_amalgamated.hpp"
 
 namespace {
 void require(bool condition, const char *message) {
-  if (!condition)
-    throw std::runtime_error(message);
+  INFO(message);
+  REQUIRE(condition);
 }
 
 history::EvidenceBundle bundle(std::string revision, int index) {
@@ -37,8 +37,7 @@ history::EvidenceBundle bundle(std::string revision, int index) {
 }
 } // namespace
 
-int main() {
-  try {
+TEST_CASE("stability classification and explanations preserve evidence") {
     const auto root =
         std::filesystem::temp_directory_path() /
         ("repotraverse-stability-" +
@@ -143,10 +142,4 @@ int main() {
                 partial.at("classifications").value("stable", 0U) == 0 &&
                 partial.at("classifications").value("variable", 0U) == 0,
             "truncated progressive history reached a definitive classifier");
-    std::cout << "stability tests passed\n";
-    return 0;
-  } catch (const std::exception &error) {
-    std::cerr << error.what() << '\n';
-    return 1;
-  }
 }

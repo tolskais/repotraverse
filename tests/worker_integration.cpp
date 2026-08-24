@@ -84,18 +84,29 @@ int main() {
     context.context_id = history::stable_hash("device.cpp\n-std=c++17");
     catalog.store_compile_context(context);
 
-    history::GitCoordinator coordinator(
-        catalog, history::CoordinationOptions{artifacts, "origin", 30, 0});
+    history::CoordinationOptions coordination_options;
+    coordination_options.repository = artifacts;
+    coordination_options.lease_seconds = 30;
+    coordination_options.grace_seconds = 0;
+    history::GitCoordinator coordinator(catalog, coordination_options);
     history::Catalog peer_catalog(root / "peer-catalog");
-    history::GitCoordinator peer_coordinator(
-        peer_catalog,
-        history::CoordinationOptions{peer_artifacts, "origin", 30, 0});
-    history::WorkerOptions peer_options{EXTRACTOR_PATH, root / "scratch", source};
+    history::CoordinationOptions peer_coordination_options;
+    peer_coordination_options.repository = peer_artifacts;
+    peer_coordination_options.lease_seconds = 30;
+    peer_coordination_options.grace_seconds = 0;
+    history::GitCoordinator peer_coordinator(peer_catalog,
+                                             peer_coordination_options);
+    history::WorkerOptions peer_options;
+    peer_options.extractor = EXTRACTOR_PATH;
+    peer_options.scratch_root = root / "scratch";
+    peer_options.source_repository = source;
     peer_options.repository_id = "fixture-main";
     history::BackgroundWorker worker(peer_catalog, peer_coordinator,
                                      std::move(peer_options));
-    history::WorkerOptions scheduler_options{
-        EXTRACTOR_PATH, root / "scheduler-scratch", source};
+    history::WorkerOptions scheduler_options;
+    scheduler_options.extractor = EXTRACTOR_PATH;
+    scheduler_options.scratch_root = root / "scheduler-scratch";
+    scheduler_options.source_repository = source;
     scheduler_options.repository_id = "fixture-main";
     auto scheduler_worker = std::make_shared<history::BackgroundWorker>(
         catalog, coordinator, std::move(scheduler_options));

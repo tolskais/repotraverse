@@ -1,6 +1,9 @@
 name: Windows LLVM SDK verification
 
 on:
+  push:
+    branches: [main]
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -11,6 +14,11 @@ permissions:
 jobs:
   windows-x64:
     runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      LLVM_VERSION: "22.1.8"
+      LLVM_ASSET: clang+llvm-22.1.8-x86_64-pc-windows-msvc.tar.xz
+      SEGMENT_DOWNLOAD_TIMEOUT_MINS: 5
     steps:
       - uses: actions/checkout@v4
 
@@ -19,24 +27,66 @@ jobs:
         with:
           arch: x64
 
-      - name: Download and verify the official LLVM SDK
+      - name: Restore the LLVM SDK archive
+        id: llvm-sdk-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.LLVM_ASSET }}
+          key: llvm-sdk-archive-${{ runner.os }}-${{ env.LLVM_VERSION }}
+
+      - name: Download the official LLVM SDK
+        if: steps.llvm-sdk-cache.outputs.cache-hit != 'true'
         shell: pwsh
+        timeout-minutes: 15
+        run: |
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$env:LLVM_VERSION/$env:LLVM_ASSET"
+          Write-Host "Downloading $url"
+          curl.exe `
+            --location `
+            --fail `
+            --show-error `
+            --retry 3 `
+            --retry-all-errors `
+            --connect-timeout 30 `
+            --max-time 840 `
+            --output $env:LLVM_ASSET `
+            $url
+          if ($LASTEXITCODE -ne 0) { throw "LLVM SDK download failed." }
+          Write-Host "Downloaded $((Get-Item -LiteralPath $env:LLVM_ASSET).Length) bytes."
+
+      - name: Verify the official LLVM SDK attestation
+        shell: pwsh
+        timeout-minutes: 5
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $version = "22.1.8"
-          $asset = "clang+llvm-$version-x86_64-pc-windows-msvc.tar.xz"
-          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$version/$asset"
-          curl.exe -L --fail --retry 3 --output $asset $url
-          if ($LASTEXITCODE -ne 0) { throw "LLVM SDK download failed." }
-          gh attestation verify --repo llvm/llvm-project $asset
+          Write-Host "Verifying $env:LLVM_ASSET"
+          gh attestation verify --repo llvm/llvm-project $env:LLVM_ASSET
           if ($LASTEXITCODE -ne 0) { throw "LLVM SDK attestation failed." }
+
+      - name: Cache the verified LLVM SDK archive
+        if: steps.llvm-sdk-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        timeout-minutes: 15
+        with:
+          path: ${{ env.LLVM_ASSET }}
+          key: ${{ steps.llvm-sdk-cache.outputs.cache-primary-key }}
+
+      - name: Extract the official LLVM SDK
+        shell: pwsh
+        timeout-minutes: 15
+        run: |
+          Write-Host "Extracting $env:LLVM_ASSET"
           New-Item -ItemType Directory -Path llvm-sdk | Out-Null
-          tar.exe -xf $asset -C llvm-sdk
+          tar.exe -xf $env:LLVM_ASSET -C llvm-sdk
           if ($LASTEXITCODE -ne 0) { throw "LLVM SDK extraction failed." }
           $root = Get-ChildItem -LiteralPath llvm-sdk -Directory
           if ($root.Count -ne 1) { throw "Unexpected LLVM SDK archive layout." }
+          if (-not (Test-Path -LiteralPath (Join-Path $root[0].FullName "bin/clang-cl.exe"))) {
+            throw "LLVM SDK does not contain bin/clang-cl.exe."
+          }
           "REPOTRAVERSE_LLVM_ROOT=$($root[0].FullName)" >> $env:GITHUB_ENV
+          Write-Host "LLVM SDK root: $($root[0].FullName)"
 
       - name: Enable Win32 long paths
         shell: pwsh

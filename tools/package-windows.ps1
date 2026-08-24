@@ -52,7 +52,11 @@ $sbom = [ordered]@{
         @{ name = "llvm-project"; SPDXID = "SPDXRef-Package-LLVM"; versionInfo = $llvmVersion; downloadLocation = "NOASSERTION"; filesAnalyzed = $false; licenseConcluded = "Apache-2.0 WITH LLVM-exception" },
         @{ name = "nlohmann-json"; SPDXID = "SPDXRef-Package-Json"; versionInfo = "3.12.0"; downloadLocation = "NOASSERTION"; filesAnalyzed = $false; licenseConcluded = "MIT" },
         @{ name = "sqlite"; SPDXID = "SPDXRef-Package-SQLite"; versionInfo = "3.53.4"; downloadLocation = "NOASSERTION"; filesAnalyzed = $false; licenseConcluded = "LicenseRef-Public-Domain" },
-        @{ name = "xxhash"; SPDXID = "SPDXRef-Package-xxHash"; versionInfo = "0.8.3"; downloadLocation = "NOASSERTION"; filesAnalyzed = $false; licenseConcluded = "BSD-2-Clause" }
+        @{ name = "xxhash"; SPDXID = "SPDXRef-Package-xxHash"; versionInfo = "0.8.3"; downloadLocation = "NOASSERTION"; filesAnalyzed = $false; licenseConcluded = "BSD-2-Clause" },
+        @{ name = "cli11"; SPDXID = "SPDXRef-Package-CLI11"; versionInfo = "2.7.0"; downloadLocation = "NOASSERTION"; filesAnalyzed = $false; licenseConcluded = "BSD-3-Clause" },
+        @{ name = "tree-sitter"; SPDXID = "SPDXRef-Package-TreeSitter"; versionInfo = "0.26.11"; downloadLocation = "NOASSERTION"; filesAnalyzed = $false; licenseConcluded = "MIT" },
+        @{ name = "tree-sitter-c"; SPDXID = "SPDXRef-Package-TreeSitterC"; versionInfo = "0.24.2"; downloadLocation = "NOASSERTION"; filesAnalyzed = $false; licenseConcluded = "MIT" },
+        @{ name = "tree-sitter-cpp"; SPDXID = "SPDXRef-Package-TreeSitterCpp"; versionInfo = "0.23.4"; downloadLocation = "NOASSERTION"; filesAnalyzed = $false; licenseConcluded = "MIT" }
     )
 }
 $sbom | ConvertTo-Json -Depth 8 | Out-File -LiteralPath `

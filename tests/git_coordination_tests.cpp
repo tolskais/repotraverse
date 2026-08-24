@@ -50,8 +50,14 @@ int main() {
 
     history::Catalog first_catalog(root / "first-catalog");
     history::Catalog second_catalog(root / "second-catalog");
-    history::CoordinationOptions first_options{first_repo, "origin", 5, 0};
-    history::CoordinationOptions second_options{second_repo, "origin", 5, 0};
+    history::CoordinationOptions first_options;
+    first_options.repository = first_repo;
+    first_options.lease_seconds = 5;
+    first_options.grace_seconds = 0;
+    history::CoordinationOptions second_options;
+    second_options.repository = second_repo;
+    second_options.lease_seconds = 5;
+    second_options.grace_seconds = 0;
     history::GitCoordinator first(first_catalog, first_options);
     history::GitCoordinator second(second_catalog, second_options);
     const nlohmann::json task = {{"source_commit", "0123456789abcdef"},
@@ -123,9 +129,12 @@ int main() {
             "lineage review did not propagate");
 
     history::Catalog offline_catalog(root / "offline-catalog");
-    history::GitCoordinator offline(
-        offline_catalog,
-        history::CoordinationOptions{first_repo, "missing-remote", 1, 0});
+    history::CoordinationOptions offline_options;
+    offline_options.repository = first_repo;
+    offline_options.remote = "missing-remote";
+    offline_options.lease_seconds = 1;
+    offline_options.grace_seconds = 0;
+    history::GitCoordinator offline(offline_catalog, offline_options);
     const auto unavailable = offline.acquire({{"task", "offline"}});
     require(unavailable.value("state", std::string{}) ==
                 "waiting_for_coordination",

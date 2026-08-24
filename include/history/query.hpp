@@ -30,6 +30,7 @@ public:
                std::shared_ptr<GitCoordinator> coordinator,
                std::shared_ptr<BackgroundWorker> worker = {});
   nlohmann::json execute(const nlohmann::json &request) const;
+  nlohmann::json enqueue(const nlohmann::json &request) const;
   nlohmann::json submit(const nlohmann::json &request) const;
   nlohmann::json request_status(const std::string &request_id,
                                 bool refresh = true) const;

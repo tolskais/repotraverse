@@ -170,6 +170,10 @@ nlohmann::json BackgroundWorker::run_once() {
           (!options_.repository_id.empty() &&
            manifest.repository_id != options_.repository_id))
         throw std::runtime_error("extractor manifest identity mismatch");
+    } else if (process.timed_out || process.output_truncated) {
+      throw std::runtime_error(process.timed_out
+                                   ? "extractor_timeout"
+                                   : "extractor_output_limit");
     } else
       result = {
           {"schema_version", kSchemaVersion},

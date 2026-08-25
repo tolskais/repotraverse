@@ -13,11 +13,12 @@ struct ServiceConfig {
   std::uint32_t schema_version{1};
   std::string repository_id;
   std::filesystem::path catalog;
-  std::filesystem::path artifact_repository;
+  std::filesystem::path analysis_repository;
   std::filesystem::path source_repository;
   std::filesystem::path extractor;
   std::filesystem::path scratch_root;
   std::string remote{"origin"};
+  std::string knowledge_ref{"refs/heads/repotraverse/v1/knowledge/accepted"};
   std::string listen_address{"127.0.0.1"};
   std::uint16_t port{7341};
   std::uint32_t sync_seconds{30};
@@ -28,6 +29,8 @@ struct ServiceConfig {
   std::uint32_t git_timeout_seconds{300};
   std::uint32_t extractor_timeout_seconds{1800};
   std::uint64_t max_manifest_bytes{256ULL * 1024ULL * 1024ULL};
+  std::uint32_t local_cache_max_facts{10000};
+  std::uint64_t local_cache_max_bytes{4ULL * 1024ULL * 1024ULL * 1024ULL};
   std::string workspace_mode{"auto"};
   std::uint32_t workspace_max_revisions{2};
   std::uint64_t workspace_max_bytes{};

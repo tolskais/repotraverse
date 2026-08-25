@@ -686,7 +686,7 @@ public:
       auto location = snapshot.location;
       location.path = element.owner_file;
       manifest.observations.push_back(
-          {element.element_id, variant.variant_id, std::move(location)});
+          {element.element_id, variant.variant_id, std::move(location), {}});
     }
     std::map<std::string, std::string> element_by_compiler;
     std::map<std::string, std::string> variant_by_element;
@@ -723,7 +723,7 @@ public:
         continue;
       manifest.observations.push_back({element->second,
                                        variant_by_element.at(element->second),
-                                       std::move(site.location)});
+                                       std::move(site.location), {}});
     }
     for (const auto &use : state_.macro_uses) {
       const auto macro = element_by_compiler.find(use.compiler_id);
@@ -746,6 +746,14 @@ public:
       }
       manifest.macro_expansions.push_back(
           {macro->second, containing, use.location});
+    }
+    for (auto &observation : manifest.observations) {
+      observation.observation_id = history::stable_hash(
+          manifest.repository_id + "\n" + manifest.source_revision + "\n" +
+          manifest.translation_unit + "\n" + manifest.context_id + "\n" +
+          manifest.build_variant.variant_id + "\n" + observation.element_id +
+          "\n" + observation.variant_id + "\n" +
+          nlohmann::json(observation.location).dump());
     }
     nlohmann::json identity = {{"repository", manifest.repository_id},
                                {"revision", manifest.source_revision},

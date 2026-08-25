@@ -3,9 +3,11 @@
 
 #include <chrono>
 #include <fstream>
+#include <map>
 #include <random>
 #include <set>
 #include <stdexcept>
+#include <unordered_map>
 
 #include <sqlite3.h>
 
@@ -90,7 +92,10 @@ std::string load_or_create_producer(const std::filesystem::path &root) {
 
 } // namespace
 
-Catalog::Catalog(std::filesystem::path root) : root_(std::move(root)) {
+Catalog::Catalog(std::filesystem::path root, std::size_t maximum_cached_facts,
+                 std::uint64_t maximum_cached_fact_bytes)
+    : root_(std::move(root)), maximum_cached_facts_(maximum_cached_facts),
+      maximum_cached_fact_bytes_(maximum_cached_fact_bytes) {
   if (root_.empty())
     throw std::invalid_argument("catalog root cannot be empty");
   std::filesystem::create_directories(root_);
@@ -110,6 +115,10 @@ Catalog::Catalog(std::filesystem::path root) : root_(std::move(root)) {
   if (catalog_version != 0 && catalog_version != kSchemaVersion)
     throw std::runtime_error(
         "catalog schema is incompatible; remove and rebuild the prototype catalog");
+  if (catalog_version == kSchemaVersion &&
+      integer_pragma("SELECT count(*) FROM pragma_table_info('facts') WHERE name='accessed_at';") == 0)
+    throw std::runtime_error(
+        "the pre-reset v1 catalog is unsupported; remove and rebuild the local cache");
   if (catalog_version == 0 &&
       integer_pragma("SELECT count(*) FROM sqlite_master WHERE type='table' "
                      "AND name IN ('facts','scheduled_tasks','compile_contexts');") >
@@ -127,7 +136,8 @@ Catalog::Catalog(std::filesystem::path root) : root_(std::move(root)) {
   execute("CREATE TABLE IF NOT EXISTS facts("
           "fact_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, fact_json TEXT NOT "
           "NULL,"
-          "source_commit TEXT NOT NULL);");
+          "source_commit TEXT NOT NULL,created_at INTEGER NOT NULL DEFAULT 0,"
+          "accessed_at INTEGER NOT NULL DEFAULT 0);");
   execute("CREATE INDEX IF NOT EXISTS facts_by_task ON facts(task_id);");
   execute("CREATE TABLE IF NOT EXISTS imported_commits(commit_id TEXT PRIMARY "
           "KEY);");
@@ -174,6 +184,43 @@ Catalog::Catalog(std::filesystem::path root) : root_(std::move(root)) {
           "context_id,source_element_id,target_element_id,manifest_id));");
   execute("CREATE INDEX IF NOT EXISTS reverse_element_dependencies ON "
           "element_dependencies(repository_id,revision,target_element_id);");
+  execute("CREATE TABLE IF NOT EXISTS logical_elements("
+          "repository_id TEXT NOT NULL,revision TEXT NOT NULL,context_id TEXT "
+          "NOT NULL,manifest_id TEXT NOT NULL,element_id TEXT NOT NULL,"
+          "kind TEXT NOT NULL,qualified_name TEXT NOT NULL,owner_path TEXT NOT "
+          "NULL,element_json TEXT NOT NULL,PRIMARY KEY(manifest_id,element_id));");
+  execute("CREATE INDEX IF NOT EXISTS elements_by_name ON logical_elements("
+          "repository_id,revision,qualified_name,kind,owner_path);");
+  execute("CREATE TABLE IF NOT EXISTS element_observations("
+          "observation_id TEXT PRIMARY KEY,repository_id TEXT NOT NULL,"
+          "revision TEXT NOT NULL,context_id TEXT NOT NULL,variant_scope TEXT "
+          "NOT NULL,translation_unit TEXT NOT NULL,owner_path TEXT NOT NULL,"
+          "element_id TEXT NOT NULL,semantic_variant_id TEXT NOT NULL,"
+          "manifest_id TEXT NOT NULL,observation_json TEXT NOT NULL);");
+  execute("CREATE INDEX IF NOT EXISTS observations_by_file ON "
+          "element_observations(repository_id,revision,owner_path,element_id);");
+  execute("CREATE TABLE IF NOT EXISTS evidence_receipts("
+          "receipt_id TEXT PRIMARY KEY,transition_id TEXT NOT NULL,"
+          "receipt_json TEXT NOT NULL,created_at INTEGER NOT NULL);");
+  execute("CREATE INDEX IF NOT EXISTS receipts_by_transition ON "
+          "evidence_receipts(transition_id);");
+  execute("CREATE TABLE IF NOT EXISTS inference_claims("
+          "claim_id TEXT PRIMARY KEY,transition_id TEXT NOT NULL,predicate "
+          "TEXT NOT NULL,claim_json TEXT NOT NULL,created_at INTEGER NOT NULL);");
+  execute("CREATE INDEX IF NOT EXISTS claims_by_transition ON "
+          "inference_claims(transition_id,predicate);");
+  execute("CREATE TABLE IF NOT EXISTS knowledge_decisions("
+          "decision_id TEXT PRIMARY KEY,claim_id TEXT NOT NULL,state TEXT NOT "
+          "NULL,knowledge_commit TEXT NOT NULL,decision_json TEXT NOT NULL,"
+          "created_at INTEGER NOT NULL);");
+  execute("CREATE INDEX IF NOT EXISTS decisions_by_claim ON "
+          "knowledge_decisions(claim_id,created_at);");
+  execute("CREATE TABLE IF NOT EXISTS pr_imports("
+          "import_id TEXT PRIMARY KEY,repository_id TEXT NOT NULL,"
+          "record_json TEXT NOT NULL,source_commit TEXT NOT NULL,"
+          "created_at INTEGER NOT NULL);");
+  execute("CREATE INDEX IF NOT EXISTS pr_imports_by_repository ON "
+          "pr_imports(repository_id,import_id);");
   execute("UPDATE scheduled_tasks SET state='pending',next_attempt_at=0 WHERE "
           "state IN ('dispatching','processing');");
   execute("PRAGMA user_version=1;");
@@ -315,7 +362,8 @@ void Catalog::store_fact(const std::string &fact_id, const std::string &task_id,
   check(sqlite3_prepare_v2(
             database_,
             "INSERT OR IGNORE INTO "
-            "facts(fact_id,task_id,fact_json,source_commit) VALUES(?,?,?,?)",
+            "facts(fact_id,task_id,fact_json,source_commit,created_at,accessed_at) "
+            "VALUES(?,?,?,?,strftime('%s','now'),strftime('%s','now'))",
             -1, &statement, nullptr),
         database_, "prepare fact");
   const auto serialized = fact.dump();
@@ -330,6 +378,91 @@ void Catalog::store_fact(const std::string &fact_id, const std::string &task_id,
   if (result.is_object() &&
       result.value("record_type", std::string{}) == "tu_manifest") {
     const auto manifest = result.get<TuManifest>();
+    std::unordered_map<std::string, LogicalElement> elements;
+    for (const auto &element : manifest.elements) {
+      elements.emplace(element.element_id, element);
+      sqlite3_stmt *indexed = nullptr;
+      check(sqlite3_prepare_v2(
+                database_,
+                "INSERT OR REPLACE INTO logical_elements("
+                "repository_id,revision,context_id,manifest_id,element_id,"
+                "kind,qualified_name,owner_path,element_json) VALUES(?,?,?,?,?,?,?,?,?)",
+                -1, &indexed, nullptr),
+            database_, "prepare logical element");
+      const auto element_json = nlohmann::json(element).dump();
+      sqlite3_bind_text(indexed, 1, manifest.repository_id.c_str(), -1,
+                        SQLITE_TRANSIENT);
+      sqlite3_bind_text(indexed, 2, manifest.source_revision.c_str(), -1,
+                        SQLITE_TRANSIENT);
+      sqlite3_bind_text(indexed, 3, manifest.context_id.c_str(), -1,
+                        SQLITE_TRANSIENT);
+      sqlite3_bind_text(indexed, 4, manifest.manifest_id.c_str(), -1,
+                        SQLITE_TRANSIENT);
+      sqlite3_bind_text(indexed, 5, element.element_id.c_str(), -1,
+                        SQLITE_TRANSIENT);
+      sqlite3_bind_text(indexed, 6, element.kind.c_str(), -1,
+                        SQLITE_TRANSIENT);
+      sqlite3_bind_text(indexed, 7, element.qualified_name.c_str(), -1,
+                        SQLITE_TRANSIENT);
+      sqlite3_bind_text(indexed, 8, element.owner_file.c_str(), -1,
+                        SQLITE_TRANSIENT);
+      sqlite3_bind_text(indexed, 9, element_json.c_str(), -1,
+                        SQLITE_TRANSIENT);
+      const auto indexed_code = sqlite3_step(indexed);
+      sqlite3_finalize(indexed);
+      check(indexed_code, database_, "store logical element");
+    }
+    std::unordered_map<std::string, SemanticVariant> variants;
+    for (const auto &variant : manifest.variants)
+      variants.emplace(variant.variant_id, variant);
+    for (auto observation : manifest.observations) {
+      const auto element = elements.find(observation.element_id);
+      if (element == elements.end())
+        continue;
+      if (observation.observation_id.empty())
+        observation.observation_id = stable_hash(
+            manifest.repository_id + "\n" + manifest.source_revision + "\n" +
+            manifest.translation_unit + "\n" + manifest.context_id + "\n" +
+            manifest.build_variant.variant_id + "\n" +
+            observation.element_id + "\n" + observation.variant_id + "\n" +
+            canonical_json(observation.location));
+      sqlite3_stmt *indexed = nullptr;
+      check(sqlite3_prepare_v2(
+                database_,
+                "INSERT OR REPLACE INTO element_observations("
+                "observation_id,repository_id,revision,context_id,variant_scope,"
+                "translation_unit,owner_path,element_id,semantic_variant_id,"
+                "manifest_id,observation_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                -1, &indexed, nullptr),
+            database_, "prepare element observation");
+      const auto observation_json = nlohmann::json(observation).dump();
+      sqlite3_bind_text(indexed, 1, observation.observation_id.c_str(), -1,
+                        SQLITE_TRANSIENT);
+      sqlite3_bind_text(indexed, 2, manifest.repository_id.c_str(), -1,
+                        SQLITE_TRANSIENT);
+      sqlite3_bind_text(indexed, 3, manifest.source_revision.c_str(), -1,
+                        SQLITE_TRANSIENT);
+      sqlite3_bind_text(indexed, 4, manifest.context_id.c_str(), -1,
+                        SQLITE_TRANSIENT);
+      sqlite3_bind_text(indexed, 5,
+                        manifest.build_variant.variant_id.c_str(), -1,
+                        SQLITE_TRANSIENT);
+      sqlite3_bind_text(indexed, 6, manifest.translation_unit.c_str(), -1,
+                        SQLITE_TRANSIENT);
+      sqlite3_bind_text(indexed, 7, element->second.owner_file.c_str(), -1,
+                        SQLITE_TRANSIENT);
+      sqlite3_bind_text(indexed, 8, observation.element_id.c_str(), -1,
+                        SQLITE_TRANSIENT);
+      sqlite3_bind_text(indexed, 9, observation.variant_id.c_str(), -1,
+                        SQLITE_TRANSIENT);
+      sqlite3_bind_text(indexed, 10, manifest.manifest_id.c_str(), -1,
+                        SQLITE_TRANSIENT);
+      sqlite3_bind_text(indexed, 11, observation_json.c_str(), -1,
+                        SQLITE_TRANSIENT);
+      const auto indexed_code = sqlite3_step(indexed);
+      sqlite3_finalize(indexed);
+      check(indexed_code, database_, "store element observation");
+    }
     for (const auto &variant : manifest.variants)
       for (const auto &target : variant.referenced_element_ids) {
         sqlite3_stmt *dependency = nullptr;
@@ -394,6 +527,48 @@ void Catalog::store_fact(const std::string &fact_id, const std::string &task_id,
   const auto update_code = sqlite3_step(statement);
   sqlite3_finalize(statement);
   check(update_code, database_, "mark completed task");
+  sqlite3_stmt *usage = nullptr;
+  check(sqlite3_prepare_v2(database_,
+                           "SELECT count(*),COALESCE(sum(length(fact_json)),0) FROM facts",
+                           -1, &usage, nullptr),
+        database_, "prepare cache usage");
+  check(sqlite3_step(usage), database_, "read cache usage");
+  auto count = static_cast<std::uint64_t>(sqlite3_column_int64(usage, 0));
+  auto bytes = static_cast<std::uint64_t>(sqlite3_column_int64(usage, 1));
+  sqlite3_finalize(usage);
+  while (count > maximum_cached_facts_ || bytes > maximum_cached_fact_bytes_) {
+    sqlite3_stmt *oldest = nullptr;
+    check(sqlite3_prepare_v2(
+              database_,
+              "DELETE FROM facts WHERE fact_id IN (SELECT fact_id FROM facts "
+              "ORDER BY accessed_at,created_at,fact_id LIMIT 100) RETURNING length(fact_json)",
+              -1, &oldest, nullptr),
+          database_, "prepare cache eviction");
+    std::uint64_t removed = 0, removed_bytes = 0;
+    while (sqlite3_step(oldest) == SQLITE_ROW) {
+      ++removed;
+      removed_bytes += static_cast<std::uint64_t>(sqlite3_column_int64(oldest, 0));
+    }
+    sqlite3_finalize(oldest);
+    if (removed == 0) break;
+    count -= std::min(count, removed);
+    bytes -= std::min(bytes, removed_bytes);
+  }
+  execute_sql(database_,
+              "DELETE FROM element_dependencies WHERE manifest_id NOT IN "
+              "(SELECT json_extract(fact_json,'$.result.manifest_id') FROM facts);"
+              "DELETE FROM element_observations WHERE manifest_id NOT IN "
+              "(SELECT json_extract(fact_json,'$.result.manifest_id') FROM facts);"
+              "DELETE FROM logical_elements WHERE manifest_id NOT IN "
+              "(SELECT json_extract(fact_json,'$.result.manifest_id') FROM facts);",
+              "prune evicted semantic indexes");
+  execute_sql(database_,
+              "UPDATE scheduled_tasks SET state='pending',next_attempt_at=0 "
+              "WHERE state='completed' AND NOT EXISTS "
+              "(SELECT 1 FROM facts WHERE facts.task_id=scheduled_tasks.task_id);"
+              "DELETE FROM published_tasks WHERE task_id IN "
+              "(SELECT task_id FROM scheduled_tasks WHERE state='pending');",
+              "reschedule evicted cache facts");
   transaction.commit();
 }
 
@@ -413,11 +588,20 @@ Catalog::fact_for_task(const std::string &task_id) const {
   }
   auto value = nlohmann::json::parse(
       reinterpret_cast<const char *>(sqlite3_column_text(statement, 1)));
-  value["fact_id"] =
+  const std::string fact_id =
       reinterpret_cast<const char *>(sqlite3_column_text(statement, 0));
+  value["fact_id"] = fact_id;
   value["source_commit"] =
       reinterpret_cast<const char *>(sqlite3_column_text(statement, 2));
   sqlite3_finalize(statement);
+  check(sqlite3_prepare_v2(database_,
+                           "UPDATE facts SET accessed_at=strftime('%s','now') WHERE fact_id=?",
+                           -1, &statement, nullptr),
+        database_, "prepare fact access update");
+  sqlite3_bind_text(statement, 1, fact_id.c_str(), -1, SQLITE_TRANSIENT);
+  const auto update = sqlite3_step(statement);
+  sqlite3_finalize(statement);
+  check(update, database_, "update fact access");
   return value;
 }
 
@@ -946,6 +1130,280 @@ nlohmann::json Catalog::semantic_dependents(
   return {{"dependents", rows}, {"truncated", truncated}};
 }
 
+nlohmann::json Catalog::symbol_search(const std::string &repository_id,
+                                      const std::string &revision,
+                                      const nlohmann::json &selector,
+                                      std::size_t maximum) const {
+  std::scoped_lock lock(mutex_);
+  const auto name = selector.value("qualified_name", selector.value("name", std::string{}));
+  const auto kind = selector.value("kind", std::string{});
+  const auto path = selector.value("path", std::string{});
+  const auto match = selector.value("match", std::string{"contains"});
+  const auto pattern = name.empty() ? std::string{"%"}
+      : match == "exact" ? name
+      : match == "prefix" ? name + "%" : "%" + name + "%";
+  sqlite3_stmt *statement = nullptr;
+  check(sqlite3_prepare_v2(
+            database_,
+            "SELECT element_json,context_id,manifest_id,revision FROM logical_elements "
+            "WHERE repository_id=? AND (?='' OR revision=?) AND qualified_name LIKE ? "
+            "AND (?='' OR kind=?) AND (?='' OR owner_path=?) "
+            "ORDER BY qualified_name,kind,owner_path,context_id LIMIT ?",
+            -1, &statement, nullptr),
+        database_, "prepare symbol search");
+  sqlite3_bind_text(statement, 1, repository_id.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(statement, 2, revision.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(statement, 3, revision.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(statement, 4, pattern.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(statement, 5, kind.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(statement, 6, kind.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(statement, 7, path.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(statement, 8, path.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_int64(statement, 9, static_cast<sqlite3_int64>(maximum + 1));
+  nlohmann::json rows = nlohmann::json::array();
+  while (sqlite3_step(statement) == SQLITE_ROW) {
+    auto row = nlohmann::json::parse(
+        reinterpret_cast<const char *>(sqlite3_column_text(statement, 0)));
+    row["context_id"] =
+        reinterpret_cast<const char *>(sqlite3_column_text(statement, 1));
+    row["manifest_id"] =
+        reinterpret_cast<const char *>(sqlite3_column_text(statement, 2));
+    row["revision"] =
+        reinterpret_cast<const char *>(sqlite3_column_text(statement, 3));
+    rows.push_back(std::move(row));
+  }
+  sqlite3_finalize(statement);
+  const bool truncated = rows.size() > maximum;
+  if (truncated) rows.erase(rows.end() - 1);
+  return {{"symbols", std::move(rows)}, {"truncated", truncated}};
+}
+
+nlohmann::json Catalog::file_symbols(const std::string &repository_id,
+                                     const std::string &revision,
+                                     const std::string &path,
+                                     std::size_t maximum) const {
+  return symbol_search(repository_id, revision,
+                       {{"path", path}, {"match", "contains"}}, maximum);
+}
+
+void Catalog::store_receipt(const EvidenceReceipt &receipt) {
+  if (receipt.receipt_id.empty() || receipt.repository_id.empty() ||
+      receipt.transition_id.empty() || receipt.result_digest.empty())
+    throw std::invalid_argument(
+        "evidence receipt requires identity, repository, transition, and result digest");
+  auto receipt_identity = nlohmann::json(receipt);
+  receipt_identity.erase("receipt_id");
+  if (receipt.receipt_id != stable_hash(canonical_json(receipt_identity)))
+    throw std::invalid_argument("evidence receipt identity does not match its content");
+  const auto serialized = nlohmann::json(receipt).dump();
+  std::scoped_lock lock(mutex_);
+  sqlite3_stmt *statement = nullptr;
+  check(sqlite3_prepare_v2(
+            database_,
+            "INSERT OR REPLACE INTO evidence_receipts(receipt_id,transition_id,"
+            "receipt_json,created_at) VALUES(?,?,?,strftime('%s','now'))",
+            -1, &statement, nullptr),
+        database_, "prepare evidence receipt");
+  sqlite3_bind_text(statement, 1, receipt.receipt_id.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(statement, 2, receipt.transition_id.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(statement, 3, serialized.c_str(), -1, SQLITE_TRANSIENT);
+  const auto code = sqlite3_step(statement);
+  sqlite3_finalize(statement);
+  check(code, database_, "store evidence receipt");
+}
+
+std::optional<EvidenceReceipt> Catalog::receipt(const std::string &receipt_id) const {
+  std::scoped_lock lock(mutex_);
+  sqlite3_stmt *statement = nullptr;
+  check(sqlite3_prepare_v2(database_,
+                           "SELECT receipt_json FROM evidence_receipts WHERE receipt_id=?",
+                           -1, &statement, nullptr),
+        database_, "prepare evidence receipt lookup");
+  sqlite3_bind_text(statement, 1, receipt_id.c_str(), -1, SQLITE_TRANSIENT);
+  if (sqlite3_step(statement) != SQLITE_ROW) {
+    sqlite3_finalize(statement);
+    return std::nullopt;
+  }
+  const auto value = nlohmann::json::parse(
+      reinterpret_cast<const char *>(sqlite3_column_text(statement, 0)))
+                         .get<EvidenceReceipt>();
+  sqlite3_finalize(statement);
+  return value;
+}
+
+void Catalog::store_inference_claim(const InferenceClaim &claim) {
+  if (claim.claim_id.empty() || claim.repository_id.empty() ||
+      claim.transition_id.empty() || claim.predicate.empty() ||
+      claim.categories.empty() || claim.summary.empty() || claim.model.empty() ||
+      claim.prompt_digest.empty() || claim.input_digest.empty() ||
+      claim.producer_id.empty())
+    throw std::invalid_argument(
+        "inference claim requires identity, target, non-empty reason, and model provenance");
+  auto claim_identity = nlohmann::json(claim);
+  claim_identity.erase("claim_id");
+  if (claim.claim_id != stable_hash(canonical_json(claim_identity)))
+    throw std::invalid_argument("inference claim identity does not match its content");
+  const auto serialized = nlohmann::json(claim).dump();
+  std::scoped_lock lock(mutex_);
+  sqlite3_stmt *statement = nullptr;
+  check(sqlite3_prepare_v2(
+            database_,
+            "INSERT OR REPLACE INTO inference_claims(claim_id,transition_id,"
+            "predicate,claim_json,created_at) VALUES(?,?,?,?,strftime('%s','now'))",
+            -1, &statement, nullptr),
+        database_, "prepare inference claim");
+  sqlite3_bind_text(statement, 1, claim.claim_id.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(statement, 2, claim.transition_id.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(statement, 3, claim.predicate.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(statement, 4, serialized.c_str(), -1, SQLITE_TRANSIENT);
+  const auto code = sqlite3_step(statement);
+  sqlite3_finalize(statement);
+  check(code, database_, "store inference claim");
+}
+
+void Catalog::store_knowledge_decision(const KnowledgeDecision &decision,
+                                       const std::string &knowledge_commit) {
+  static const std::set<std::string> states = {"accepted", "rejected", "superseded"};
+  if (decision.decision_id.empty() || decision.claim_id.empty() ||
+      !states.contains(decision.state) || decision.reviewer.empty() ||
+      knowledge_commit.empty())
+    throw std::invalid_argument("knowledge decision requires an authoritative commit and valid state");
+  auto decision_identity = nlohmann::json(decision);
+  decision_identity.erase("decision_id");
+  if (decision.decision_id != stable_hash(canonical_json(decision_identity)))
+    throw std::invalid_argument("knowledge decision identity does not match its content");
+  const auto serialized = nlohmann::json(decision).dump();
+  std::scoped_lock lock(mutex_);
+  sqlite3_stmt *statement = nullptr;
+  check(sqlite3_prepare_v2(database_,
+                           "SELECT 1 FROM inference_claims WHERE claim_id=?",
+                           -1, &statement, nullptr),
+        database_, "prepare decision claim lookup");
+  sqlite3_bind_text(statement, 1, decision.claim_id.c_str(), -1,
+                    SQLITE_TRANSIENT);
+  const bool claim_exists = sqlite3_step(statement) == SQLITE_ROW;
+  sqlite3_finalize(statement);
+  if (!claim_exists)
+    throw std::invalid_argument("knowledge decision references an unknown claim");
+  statement = nullptr;
+  check(sqlite3_prepare_v2(
+            database_,
+            "INSERT OR REPLACE INTO knowledge_decisions(decision_id,claim_id,state,"
+            "knowledge_commit,decision_json,created_at) VALUES(?,?,?,?,?,strftime('%s','now'))",
+            -1, &statement, nullptr),
+        database_, "prepare knowledge decision");
+  sqlite3_bind_text(statement, 1, decision.decision_id.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(statement, 2, decision.claim_id.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(statement, 3, decision.state.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(statement, 4, knowledge_commit.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(statement, 5, serialized.c_str(), -1, SQLITE_TRANSIENT);
+  const auto code = sqlite3_step(statement);
+  sqlite3_finalize(statement);
+  check(code, database_, "store knowledge decision");
+}
+
+nlohmann::json Catalog::inference_for_transition(
+    const std::string &transition_id, bool include_unreviewed) const {
+  std::scoped_lock lock(mutex_);
+  sqlite3_stmt *statement = nullptr;
+  check(sqlite3_prepare_v2(
+            database_,
+            "SELECT c.claim_json,COALESCE((SELECT d.state FROM knowledge_decisions d "
+            "WHERE d.claim_id=c.claim_id ORDER BY d.rowid DESC "
+            "LIMIT 1),'unreviewed') FROM inference_claims c WHERE c.transition_id=? "
+            "ORDER BY c.predicate,c.claim_id",
+            -1, &statement, nullptr),
+        database_, "prepare inference lookup");
+  sqlite3_bind_text(statement, 1, transition_id.c_str(), -1, SQLITE_TRANSIENT);
+  nlohmann::json accepted = nlohmann::json::array();
+  nlohmann::json unreviewed = nlohmann::json::array();
+  nlohmann::json rejected = nlohmann::json::array();
+  while (sqlite3_step(statement) == SQLITE_ROW) {
+    auto claim = nlohmann::json::parse(
+        reinterpret_cast<const char *>(sqlite3_column_text(statement, 0)));
+    const std::string state =
+        reinterpret_cast<const char *>(sqlite3_column_text(statement, 1));
+    claim["review_state"] = state;
+    if (state == "accepted") {
+      accepted.push_back(std::move(claim));
+    } else if (state == "unreviewed") {
+      if (include_unreviewed) unreviewed.push_back(std::move(claim));
+    } else if (include_unreviewed) {
+      rejected.push_back(std::move(claim));
+    }
+  }
+  sqlite3_finalize(statement);
+  std::set<std::string> superseded;
+  for (const auto &claim : accepted)
+    for (const auto &id : claim.value("supersedes_claim_ids",
+                                      std::vector<std::string>{}))
+      superseded.insert(id);
+  nlohmann::json effective = nlohmann::json::array();
+  std::map<std::string, std::size_t> accepted_by_predicate;
+  for (auto &claim : accepted) {
+    if (superseded.contains(claim.value("claim_id", std::string{}))) {
+      claim["review_state"] = "superseded";
+      if (include_unreviewed) rejected.push_back(std::move(claim));
+      continue;
+    }
+    ++accepted_by_predicate[claim.value("predicate", std::string{})];
+    effective.push_back(std::move(claim));
+  }
+  nlohmann::json conflicts = nlohmann::json::array();
+  for (const auto &[predicate, count] : accepted_by_predicate)
+    if (count > 1) conflicts.push_back({{"predicate", predicate}, {"accepted_claims", count}});
+  return {{"accepted", std::move(effective)},
+          {"unreviewed", std::move(unreviewed)},
+          {"rejected_or_superseded", std::move(rejected)},
+          {"conflicts", std::move(conflicts)}};
+}
+
+void Catalog::store_pr_import(const std::string &import_id,
+                              const nlohmann::json &record,
+                              const std::string &source_commit) {
+  const auto repository_id = record.value("repository_id", std::string{});
+  if (import_id.empty() || repository_id.empty() ||
+      record.value("source", std::string{}).empty())
+    throw std::invalid_argument("PR import requires identity, repository_id, and provenance");
+  const auto serialized = record.dump();
+  std::scoped_lock lock(mutex_);
+  sqlite3_stmt *statement = nullptr;
+  check(sqlite3_prepare_v2(
+            database_,
+            "INSERT OR REPLACE INTO pr_imports(import_id,repository_id,record_json,"
+            "source_commit,created_at) VALUES(?,?,?,?,strftime('%s','now'))",
+            -1, &statement, nullptr),
+        database_, "prepare PR import");
+  sqlite3_bind_text(statement, 1, import_id.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(statement, 2, repository_id.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(statement, 3, serialized.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(statement, 4, source_commit.c_str(), -1, SQLITE_TRANSIENT);
+  const auto code = sqlite3_step(statement);
+  sqlite3_finalize(statement);
+  check(code, database_, "store PR import");
+}
+
+nlohmann::json Catalog::pr_imports(const std::string &repository_id) const {
+  std::scoped_lock lock(mutex_);
+  sqlite3_stmt *statement = nullptr;
+  check(sqlite3_prepare_v2(database_,
+                           "SELECT import_id,record_json,source_commit FROM pr_imports "
+                           "WHERE repository_id=? ORDER BY import_id",
+                           -1, &statement, nullptr),
+        database_, "prepare PR imports");
+  sqlite3_bind_text(statement, 1, repository_id.c_str(), -1, SQLITE_TRANSIENT);
+  nlohmann::json rows = nlohmann::json::array();
+  while (sqlite3_step(statement) == SQLITE_ROW) {
+    auto record = nlohmann::json::parse(
+        reinterpret_cast<const char *>(sqlite3_column_text(statement, 1)));
+    record["import_id"] = reinterpret_cast<const char *>(sqlite3_column_text(statement, 0));
+    record["knowledge_commit"] = reinterpret_cast<const char *>(sqlite3_column_text(statement, 2));
+    rows.push_back(std::move(record));
+  }
+  sqlite3_finalize(statement);
+  return rows;
+}
+
 void Catalog::set_task_state(const std::string &task_id,
                              const std::string &state) {
   std::scoped_lock lock(mutex_);
@@ -996,7 +1454,13 @@ std::string Catalog::snapshot_id() const {
   std::scoped_lock lock(mutex_);
   sqlite3_stmt *statement = nullptr;
   check(sqlite3_prepare_v2(database_,
-                           "SELECT fact_id FROM facts ORDER BY fact_id", -1,
+                           "SELECT identity FROM ("
+                           "SELECT 'fact:'||fact_id AS identity FROM facts UNION ALL "
+                           "SELECT 'receipt:'||receipt_id FROM evidence_receipts UNION ALL "
+                           "SELECT 'claim:'||claim_id FROM inference_claims UNION ALL "
+                           "SELECT 'decision:'||decision_id||':'||knowledge_commit "
+                           "FROM knowledge_decisions UNION ALL "
+                           "SELECT 'pr:'||import_id FROM pr_imports) ORDER BY identity", -1,
                            &statement, nullptr),
         database_, "prepare snapshot");
   std::string input;

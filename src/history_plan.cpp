@@ -276,6 +276,7 @@ void read_git_history(const std::filesystem::path &input_path,
 struct PrFacts {
   std::map<std::string, std::vector<nlohmann::json>> matches;
   std::set<std::string> no_pr;
+  std::map<std::string, nlohmann::json> no_pr_evidence;
 };
 
 PrFacts read_pr_facts(const std::filesystem::path &path) {
@@ -297,6 +298,7 @@ PrFacts read_pr_facts(const std::filesystem::path &path) {
         throw std::runtime_error("no_pr fact lacks commit at line " +
                                  std::to_string(line_number));
       result.no_pr.insert(fact.at("commit").get<std::string>());
+      result.no_pr_evidence[fact.at("commit").get<std::string>()] = fact;
       continue;
     }
     if (!fact.contains("pr_id"))
@@ -321,6 +323,8 @@ PrFacts read_pr_facts(const std::filesystem::path &path) {
           "created_at", "updated_at"})
       if (fact.contains(key))
         normalized[key] = fact.at(key);
+    if (fact.contains("association_kind"))
+      normalized["association_kind"] = fact.at("association_kind");
     for (const auto &commit : commits)
       result.matches[commit].push_back(normalized);
   }
@@ -369,6 +373,45 @@ nlohmann::json change_json(const ChangedPath &change,
 std::string pr_key(const nlohmann::json &match) {
   return match.at("pr_id").is_string() ? match.at("pr_id").get<std::string>()
                                        : match.at("pr_id").dump();
+}
+
+std::vector<ChangedPath>
+net_changes(const std::filesystem::path &repository, const std::string &base,
+            const std::string &head, const std::filesystem::path &scratch) {
+  std::vector<std::string> command = {
+      "git", "-c", "core.quotepath=false", "-C", path_to_utf8(repository)};
+  if (base.empty()) {
+    command.insert(command.end(), {"diff-tree", "--root", "--no-commit-id",
+                                   "--name-status", "-M", "-z", head, "--"});
+  } else {
+    command.insert(command.end(), {"diff", "--name-status", "-M", "-z",
+                                   base, head, "--"});
+  }
+  const auto process = run_to_file(command, scratch);
+  if (process.exit_code != 0)
+    throw std::runtime_error("Git integration diff failed: " + process.error);
+  std::ifstream input(scratch, std::ios::binary);
+  std::vector<ChangedPath> result;
+  std::string status;
+  while (next_token(input, status)) {
+    if (status.empty()) continue;
+    ChangedPath change;
+    change.status = std::move(status);
+    std::string first;
+    if (!next_token(input, first))
+      throw std::runtime_error("incomplete Git integration diff");
+    if (change.status.front() == 'R' || change.status.front() == 'C') {
+      change.old_path = std::move(first);
+      if (!next_token(input, change.path))
+        throw std::runtime_error("incomplete Git rename in integration diff");
+    } else {
+      change.path = std::move(first);
+    }
+    require_utf8(change.path, "Git path");
+    if (!change.old_path.empty()) require_utf8(change.old_path, "Git path");
+    result.push_back(std::move(change));
+  }
+  return result;
 }
 
 } // namespace
@@ -438,12 +481,15 @@ nlohmann::json write_history_plan(const HistoryPlanOptions &options) {
        {"record_type", "history_plan"},
        {"repository", path_to_utf8(std::filesystem::absolute(options.repository)
                                         .lexically_normal())},
+       {"repository_id", options.repository_id},
        {"ref", options.ref},
        {"start_exclusive", options.start_exclusive},
        {"traversal", "first_parent"}});
 
-  std::size_t commits = 0, units = 0, changed_paths = 0;
-  std::size_t identified = 0, ambiguous = 0, no_pr = 0, unknown = 0;
+  std::size_t commits = 0, units = 0, commit_path_records = 0,
+              net_changed_paths = 0;
+  std::size_t identified = 0, ambiguous = 0, compound_count = 0, no_pr = 0,
+              unknown = 0;
   std::size_t source_units = 0, build_units = 0;
   std::string resolved_head;
   nlohmann::json pending;
@@ -452,6 +498,40 @@ nlohmann::json write_history_plan(const HistoryPlanOptions &options) {
   const auto flush = [&] {
     if (pending.is_null())
       return;
+    const auto scratch = temporary_sibling(options.output, "net-diff");
+    struct RemoveScratch {
+      std::filesystem::path path;
+      ~RemoveScratch() {
+        std::error_code ignored;
+        std::filesystem::remove(path, ignored);
+      }
+    } remove_scratch{scratch};
+    const auto changes = net_changes(
+        options.repository, pending.at("base_commit").get<std::string>(),
+        pending.at("head_commit").get<std::string>(), scratch);
+    pending["changes"] = nlohmann::json::array();
+    bool has_source = false, has_build = false;
+    for (const auto &change : changes) {
+      pending["changes"].push_back(
+          change_json(change, pending.at("head_commit").get<std::string>()));
+      has_source = has_source || source_path(change.path) || source_path(change.old_path);
+      has_build = has_build || build_path(change.path) || build_path(change.old_path);
+    }
+    pending["has_source_changes"] = has_source;
+    pending["has_build_changes"] = has_build;
+    pending["net_changed_path_count"] = changes.size();
+    net_changed_paths += changes.size();
+    nlohmann::json association_ids = nlohmann::json::array();
+    for (const auto &match : pending.at("pr_matches"))
+      association_ids.push_back(match.at("pr_id"));
+    std::string identity = options.repository_id + "\n" + options.ref + "\n" +
+                           pending.at("base_commit").get<std::string>() + "\n" +
+                           pending.at("head_commit").get<std::string>() + "\n" +
+                           canonical_json(pending.at("commits")) + "\n" +
+                           pending.at("association_status").get<std::string>() +
+                           "\n" + canonical_json(association_ids);
+    pending["integration_unit_id"] = stable_hash(identity);
+    pending["change_unit_id"] = pending["integration_unit_id"];
     if (pending["has_source_changes"].get<bool>())
       ++source_units;
     if (pending["has_build_changes"].get<bool>())
@@ -465,7 +545,7 @@ nlohmann::json write_history_plan(const HistoryPlanOptions &options) {
   read_git_history(git_output, [&](CommitRecord &&commit) {
     ++commits;
     resolved_head = commit.commit;
-    changed_paths += commit.changes.size();
+    commit_path_records += commit.changes.size();
     bool has_source = false, has_build = false;
     nlohmann::json changes = nlohmann::json::array();
     for (const auto &change : commit.changes) {
@@ -480,8 +560,14 @@ nlohmann::json write_history_plan(const HistoryPlanOptions &options) {
                              ? std::vector<nlohmann::json>{}
                              : found->second;
     const bool confirmed_no_pr = pr_facts.no_pr.contains(commit.commit);
-    const auto grouping_status =
-        !matches.empty() ? (matches.size() == 1 ? "identified" : "ambiguous")
+    const auto no_pr_evidence = pr_facts.no_pr_evidence.find(commit.commit);
+    const bool compound = matches.size() > 1 &&
+        std::all_of(matches.begin(), matches.end(), [](const auto &match) {
+          return match.value("association_kind", std::string{}) == "compound";
+        });
+    const std::string grouping_status =
+        !matches.empty() ? (matches.size() == 1 ? "identified"
+                             : compound ? "compound" : "ambiguous")
                          : (confirmed_no_pr ? "no_pr" : "unknown");
     if (confirmed_no_pr)
       ++no_pr;
@@ -489,6 +575,8 @@ nlohmann::json write_history_plan(const HistoryPlanOptions &options) {
       ++unknown;
     else if (matches.size() == 1)
       ++identified;
+    else if (compound)
+      ++compound_count;
     else
       ++ambiguous;
     const auto exact_pr =
@@ -496,33 +584,35 @@ nlohmann::json write_history_plan(const HistoryPlanOptions &options) {
 
     if (!pending.is_null() && !exact_pr.empty() && pending_pr == exact_pr) {
       pending["head_commit"] = commit.commit;
+      pending["result_commit"] = commit.commit;
       pending["tree"] = commit.tree;
       pending["committer_time"] = commit.committer_time;
       pending["subject"] = commit.subject;
       pending["commits"].push_back(commit.commit);
-      for (auto &change : changes)
-        pending["changes"].push_back(std::move(change));
-      pending["has_source_changes"] =
-          pending["has_source_changes"].get<bool>() || has_source;
-      pending["has_build_changes"] =
-          pending["has_build_changes"].get<bool>() || has_build;
+      pending["integrated_commits"].push_back(commit.commit);
       return;
     }
     flush();
     pending_pr = exact_pr;
     pending = {{"schema_version", kSchemaVersion},
-               {"record_type", "change_unit"},
-               {"change_unit_id", exact_pr.empty()
-                                      ? "commit:" + commit.commit
-                                      : "bitbucket-pr:" + exact_pr},
+               {"record_type", "integration_unit"},
                {"base_commit", commit.parent},
+               {"result_commit", commit.commit},
                {"head_commit", commit.commit},
+               {"integrated_commits", nlohmann::json::array({commit.commit})},
                {"commits", nlohmann::json::array({commit.commit})},
                {"tree", commit.tree},
                {"committer_time", commit.committer_time},
                {"subject", commit.subject},
+               {"association_status",
+                grouping_status == "identified" ? "confirmed_pr" : grouping_status},
                {"grouping_status", grouping_status},
                {"pr_matches", matches},
+               {"association_evidence",
+                !matches.empty() ? nlohmann::json(matches)
+                : no_pr_evidence != pr_facts.no_pr_evidence.end()
+                    ? nlohmann::json::array({no_pr_evidence->second})
+                    : nlohmann::json::array()},
                {"has_source_changes", has_source},
                {"has_build_changes", has_build},
                {"changes", std::move(changes)}};
@@ -533,11 +623,13 @@ nlohmann::json write_history_plan(const HistoryPlanOptions &options) {
                             {"resolved_head", resolved_head},
                             {"commit_count", commits},
                             {"change_unit_count", units},
-                            {"changed_path_count", changed_paths},
+                            {"commit_path_record_count", commit_path_records},
+                            {"net_changed_path_count", net_changed_paths},
                             {"source_change_units", source_units},
                             {"build_change_units", build_units},
                             {"pr_identified_commits", identified},
                             {"pr_ambiguous_commits", ambiguous},
+                            {"pr_compound_commits", compound_count},
                             {"pr_no_pr_commits", no_pr},
                             {"pr_unknown_commits", unknown}});
   output.close();
@@ -555,11 +647,13 @@ nlohmann::json write_history_plan(const HistoryPlanOptions &options) {
           {"resolved_head", resolved_head},
           {"commit_count", commits},
           {"change_unit_count", units},
-          {"changed_path_count", changed_paths},
+          {"commit_path_record_count", commit_path_records},
+          {"net_changed_path_count", net_changed_paths},
           {"source_change_units", source_units},
           {"build_change_units", build_units},
           {"pr_identified_commits", identified},
           {"pr_ambiguous_commits", ambiguous},
+          {"pr_compound_commits", compound_count},
           {"pr_no_pr_commits", no_pr},
           {"pr_unknown_commits", unknown}};
 }

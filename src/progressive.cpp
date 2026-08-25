@@ -1084,7 +1084,7 @@ plan_progressive_screening(const ProgressiveScreeningOptions &options) {
   }
   std::vector<std::string> semantic_revisions;
   // Complete observations, including unchanged revisions, are required for a
-  // classifier denominator. A capture cap may select only the newest suffix,
+  // history denominator. A capture cap may select only the newest suffix,
   // but that suffix is then explicitly incomplete and cannot be classified.
   for (auto it = options.revisions.rbegin();
        !promoted.empty() && it != options.revisions.rend(); ++it)

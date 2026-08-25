@@ -128,6 +128,61 @@ int main() {
     require(second_catalog.lineage_relation(relation.relation_id).has_value(),
             "lineage review did not propagate");
 
+    history::EvidenceReceipt receipt;
+    receipt.repository_id = "fixture-main";
+    receipt.transition_id = "transition-fixture";
+    receipt.result_digest = "semantic-digest";
+    auto receipt_identity = nlohmann::json(receipt);
+    receipt_identity.erase("receipt_id");
+    receipt.receipt_id = history::stable_hash(history::canonical_json(receipt_identity));
+    require(first.publish_receipt(receipt).value("state", std::string{}) ==
+                "published",
+            "evidence receipt was not published");
+    history::InferenceClaim claim;
+    claim.repository_id = "fixture-main";
+    claim.transition_id = receipt.transition_id;
+    claim.summary = "The declaration changed for the new caller.";
+    claim.categories = {"new_requirement"};
+    claim.model = "fixture-model";
+    claim.prompt_digest = "prompt-digest";
+    claim.input_digest = "input-digest";
+    claim.producer_id = first_catalog.producer_id();
+    claim.evidence_receipt_ids = {receipt.receipt_id};
+    auto claim_identity = nlohmann::json(claim);
+    claim_identity.erase("claim_id");
+    claim.claim_id = history::stable_hash(history::canonical_json(claim_identity));
+    require(first.publish_inference_claim(claim).value("state", std::string{}) ==
+                "published",
+            "inference proposal was not published");
+    history::KnowledgeDecision decision;
+    decision.claim_id = claim.claim_id;
+    decision.state = "accepted";
+    decision.reviewer = "reviewer";
+    auto decision_identity = nlohmann::json(decision);
+    decision_identity.erase("decision_id");
+    decision.decision_id = history::stable_hash(history::canonical_json(decision_identity));
+    require(first.publish_knowledge_decision(decision)
+                .value("state", std::string{}) == "published",
+            "knowledge decision was not published");
+    second.sync();
+    require(second_catalog.receipt(receipt.receipt_id).has_value(),
+            "evidence receipt did not propagate");
+    require(second_catalog.inference_for_transition(receipt.transition_id)
+                .at("accepted")
+                .size() == 1,
+            "accepted inference did not propagate from the knowledge ref");
+    const nlohmann::json pr_import = {
+        {"repository_id", "fixture-main"},
+        {"source", "provider-api"},
+        {"pr_id", "42"},
+        {"result_commit", "result-commit"}};
+    require(first.publish_pr_import(pr_import).value("state", std::string{}) ==
+                "published",
+            "PR import was not published");
+    second.sync();
+    require(second_catalog.pr_imports("fixture-main").size() == 1,
+            "PR import did not propagate");
+
     history::Catalog offline_catalog(root / "offline-catalog");
     history::CoordinationOptions offline_options;
     offline_options.repository = first_repo;

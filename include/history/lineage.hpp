@@ -39,6 +39,8 @@ struct TransitionFact {
     std::optional<SourceAnchor> after_location;
     std::string resolution{"automatic"};
     std::string confidence{"exact"};
+    std::string transition_id;
+    std::vector<OriginEvidence> origin_evidence;
 };
 
 struct TransitionResult {
@@ -60,6 +62,7 @@ void to_json(nlohmann::json&, const TransitionFact&);
 void to_json(nlohmann::json&, const TransitionResult&);
 
 TransitionResult trace_transition(const EvidenceBundle& before, const EvidenceBundle& after,
-                                  const std::vector<LineageAssertion>& assertions = {});
+                                  const std::vector<LineageAssertion>& assertions = {},
+                                  const std::string &integration_unit_id = {});
 
 }  // namespace history

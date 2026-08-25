@@ -3,9 +3,8 @@
 Repotraverse captures compiler-derived evidence for C/C++ source elements across Git
 revisions. Git remains the source of exact changed code; artifacts contain compact
 fingerprints, locations, lineage candidates, transition facts, and factual history
-statistics. The service and capture infrastructure are implemented in v1. The
-multitarget, element-level historical aggregation described below is the next
-analytical milestone; the current pilot classifier is provisional.
+statistics. The service and capture infrastructure are implemented in v1.
+Reviewed interpretations are stored separately from facts.
 
 ## Windows VM build
 
@@ -102,8 +101,7 @@ snippets, or AST edit scripts. They contain logical elements, semantic variants,
 source locations, resolved dependency identifiers, and producer versions.
 Project paths are repository-relative. `file.history` deduplicates identical logical
 elements and variants across the endpoint manifests it queries while retaining their
-supporting configurations, contexts, and TUs. The experimental pilot classifier does
-not yet perform this revision-level aggregation.
+supporting configurations, contexts, and TUs.
 
 ## Import ARM build contexts
 
@@ -129,8 +127,7 @@ shared artifacts.
 
 For the end-to-end v1 experiment, use `experiment capture`, `experiment head`,
 and `experiment pilot`. These commands intercept compiler calls made by trusted
-Make builds, measure extraction coverage, and optionally compare element-level
-stability with a developer file partition. See
+Make builds and measure extraction coverage. See
 [`docs/v1-experiment.md`](docs/v1-experiment.md).
 Use [`docs/poc-runbook.md`](docs/poc-runbook.md) for the staged PoC procedure,
 measurements, and expansion gates.
@@ -138,8 +135,8 @@ measurements, and expansion gates.
 `experiment pilot` is budgeted progressive analysis. Git screens the full selected
 history, Tree-sitter maps changed regions to provisional C/C++ sites directly from
 blobs, and only promoted paths reach Make capture and Clang. Required caps are declared
-under `pilot.budget`; exhausted caps preserve partial facts but prohibit a definitive
-classifier result. Exact repeated screening plans reuse their v1 artifact. Capture,
+under `pilot.budget`; exhausted caps preserve partial facts and explicit coverage gaps.
+Exact repeated screening plans reuse their v1 artifact. Capture,
 head, and pilot commands print compact JSON summaries by default; `--full-output` emits
 the complete persisted report.
 
@@ -149,8 +146,8 @@ vendor build environment and compatibility layer are available.
 
 Build records preserve an explicit `(product, target, configuration)` variant. Its ID is
 derived from that tuple; equivalent semantic contexts can still share cached artifacts
-without losing their variant observations. The pilot classifier remains scoped to a
-build-variant/TU series and does not yet produce one repository-wide cross-TU conclusion.
+without losing their variant observations. Pilot output remains scoped to
+build-variant/TU observations and contains facts, not a stability conclusion.
 
 ## Plan Git history
 
@@ -175,8 +172,9 @@ ten-year plan incrementally.
 of `result_commit`, `merge_result_commit`, or `associated_commits`. A confirmed
 direct commit is recorded as
 `{"commit":"...","pr_mapping_status":"no_pr"}`. Consecutive first-parent
-commits mapped to the same unambiguous PR are emitted as one change unit. The
-planner distinguishes `identified`, `ambiguous`, `no_pr`, and `unknown`; an
+commits mapped to the same unambiguous PR are emitted as one integration unit.
+Disjoint spans remain separate, and each unit contains the net base-to-result
+effect. The planner distinguishes `confirmed_pr`, `ambiguous`, `no_pr`, and `unknown`; an
 uncovered commit is never assumed to have bypassed PR review.
 
 Set `start_exclusive` to the last completed commit to create the next partial
@@ -193,9 +191,12 @@ still validated against the ref by Git.
 - `lineage.transition`: find automatic continuity candidates and transition facts.
 - `lineage.resolve`: apply accepted `same_element` and `not_same_element` assertions.
 - `element.history_stats`: summarize ordered snapshots without stability inference.
-- `element.explain`: explain one result from a v1 stability report using its historical
-  facts, score components, policy, and evidence gaps.
 - `analysis.coverage`: return extraction capabilities and gaps.
+
+The preferred public surface is `repotraverse tool OPERATION --endpoint URL`.
+It exposes repository/integration-unit, file/symbol, relation, evidence-receipt,
+and reviewed-inference operations. See
+[`docs/investigation-model.md`](docs/investigation-model.md).
 
 Requests and responses are one-shot JSON. See
 [`docs/lineage-architecture.md`](docs/lineage-architecture.md) for the resource contract.
@@ -210,7 +211,8 @@ shared fact and coordination transport. VMs never connect to one another.
   "schema_version": 1,
   "repository_id": "product-main",
   "catalog": "C:/repotraverse/local-catalog",
-  "artifact_repository": "C:/repotraverse/artifacts",
+  "analysis_repository": "C:/repotraverse/analysis",
+  "knowledge_ref": "refs/heads/repotraverse/v1/knowledge/accepted",
   "remote": "origin",
   "listen_address": "127.0.0.1",
   "port": 7341,
@@ -278,15 +280,16 @@ The first job result can be `partial`: it includes Git/PR change units,
 zero-context changed-line ranges, the materialized `snapshot_id`, coverage gaps,
 and pending work. Repeating the same query after workers finish returns
 compiler-derived element snapshots and per-change-unit semantic transition
-facts. Pagination uses the returned continuation offset. No full project
+facts. Pagination uses a continuation pinned to the resolved source head. No full project
 snapshot is created.
 
 Low-level `work.*` and `catalog.sync` queries exist for diagnostics and service
 coordination. `work.complete` accepts only a schema-v1 `tu_manifest` or
 `tu_failure`.
 
-The artifact Git server must allow branch creation and deletion plus
-compare-and-swap force pushes below `repotraverse/claims/`. A VM does not start
+The analysis Git server must allow branch creation and deletion plus
+compare-and-swap force pushes below `repotraverse/v1/coordination/claims/`.
+A VM does not start
 an expensive task when the remote is unavailable.
 
 Although history is ordered, extraction is parallel: VMs may claim any
@@ -302,19 +305,15 @@ enums and enumerators, aliases, fields, function and record templates,
 specializations, and project macro definitions; external and TU-scoped internal
 identity, binding-normalized bodies, semantic variants, dependency fingerprints,
 conservative lineage, reviewed lineage assertions in the query API,
-first-parent/PR change units, file rename tracking, changed-line ranges, ARM
+first-parent/PR integration units, file rename tracking, changed-line ranges, ARM
 context import, header-to-TU maps when dependencies are supplied, parallel
 automatic extraction, endpoint aggregation in `file.history`, local HTTP queries,
-SQLite materialization, Git leases, and immutable producer results.
+bounded SQLite caching, Git leases, temporary result refs, evidence receipts,
+and reviewed knowledge refs.
 
-The experimental stability path currently builds series per explicit build variant and
-TU. It does not yet aggregate a logical element across TUs, consume reviewed lineage
-assertions, or represent an expected-but-missing target/context observation. Its
-classifications are suitable for bounded trials, not a repository-wide multitarget
-conclusion. The report retains historical facts separately, including semantic changes,
-file Git touches, lifetime revisions, lineage gaps, and provisional policy scores.
-Cross-variant semantic divergence is emitted as a separate fact and is not folded into
-the temporal classifier.
+Repotraverse does not evaluate stability. It preserves semantic changes, Git touches,
+lifetime revisions, lineage gaps, cross-variant divergence, origin evidence, and
+reviewed modification-reason claims as separate facts that a caller can use.
 
 The implemented observation model is:
 
@@ -353,10 +352,8 @@ and quarantine after the configured attempt limit. When `otlp_endpoint` is set,
 redacted logs and cumulative metrics are exported asynchronously using OTLP/HTTP
 JSON over HTTPS; exporter failure never blocks analysis.
 
-These controls harden deployment and coordination; they do not make the provisional
-multirevision classifier analytically complete. Promotion of historical conclusions
-requires the element/build-variant aggregation milestone and validation in the real
-build environment.
+These controls harden deployment and coordination. Conclusions remain the caller's
+responsibility and should retain the returned coverage and provenance.
 
 ## License
 

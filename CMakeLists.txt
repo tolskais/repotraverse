@@ -121,7 +121,7 @@ add_library(history-core
     src/process.cpp
     src/progressive.cpp
     src/query.cpp)
-target_sources(history-core PRIVATE src/worker.cpp src/telemetry.cpp src/stability.cpp
+target_sources(history-core PRIVATE src/worker.cpp src/telemetry.cpp
     src/revision_workspace.cpp)
 target_include_directories(history-core PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
@@ -183,7 +183,8 @@ install(FILES third_party/tree_sitter_cpp/LICENSE
 install(FILES third_party/CLI11/LICENSE third_party/CLI11/VERSION
     DESTINATION licenses/CLI11)
 install(FILES README.md THIRD_PARTY.md docs/lineage-architecture.md
-    docs/operations.md docs/poc-runbook.md docs/v1-experiment.md
+    docs/operations.md docs/investigation-model.md docs/poc-runbook.md
+    docs/v1-experiment.md
     DESTINATION docs)
 install(FILES LICENSE DESTINATION .)
 install(FILES config/service.example.json config/experiment.example.json

@@ -46,8 +46,6 @@ repotraverse_add_test(process-tests process_tests.cpp LIBRARIES history-core)
 repotraverse_add_test(encoding-tests encoding_tests.cpp
     LIBRARIES history-core
     DEFINITIONS PROBE_PATH="$<TARGET_FILE:repotraverse-compiler-probe>")
-repotraverse_add_test(stability-tests stability_tests.cpp
-    CATCH LIBRARIES history-core)
 repotraverse_add_test(revision-workspace-tests revision_workspace_tests.cpp
     LIBRARIES history-core
     DEFINITIONS GIT_PATH="${GIT_EXECUTABLE}")

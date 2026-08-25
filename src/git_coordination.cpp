@@ -71,7 +71,7 @@ std::string relation_identity(const LineageRelation &relation) {
 GitCoordinator::GitCoordinator(Catalog &catalog, CoordinationOptions options)
     : catalog_(catalog), options_(std::move(options)) {
   if (options_.repository.empty())
-    throw std::invalid_argument("artifact repository cannot be empty");
+    throw std::invalid_argument("analysis repository cannot be empty");
   if (options_.remote.empty() || options_.remote.starts_with('-'))
     throw std::invalid_argument("invalid Git remote");
 }
@@ -94,13 +94,13 @@ std::string GitCoordinator::claim_ref(const std::string &task_id) const {
                    [](unsigned char c) { return std::isxdigit(c) != 0; }))
     throw std::invalid_argument(
         "task_id must be a 32-character hexadecimal identifier");
-  return "refs/heads/repotraverse/claims/" + task_id.substr(0, 2) + "/" +
+  return "refs/heads/repotraverse/v1/coordination/claims/" + task_id.substr(0, 2) + "/" +
          task_id;
 }
 
 std::string
 GitCoordinator::remote_tracking_ref(const std::string &task_id) const {
-  return "refs/remotes/" + options_.remote + "/repotraverse/claims/" +
+  return "refs/remotes/" + options_.remote + "/repotraverse/v1/coordination/claims/" +
          task_id.substr(0, 2) + "/" + task_id;
 }
 
@@ -117,7 +117,7 @@ nlohmann::json GitCoordinator::sync() {
   const auto list =
       run_process({"git", "-C", path_to_utf8(options_.repository), "for-each-ref",
                    "--format=%(objectname)%09%(refname)",
-                   "refs/remotes/" + options_.remote + "/repotraverse/claims"});
+                   "refs/remotes/" + options_.remote + "/repotraverse/v1/coordination/claims"});
   require_git(list, "list claim refs");
   std::size_t imported = 0;
   std::vector<std::string> observed;
@@ -160,6 +160,48 @@ nlohmann::json GitCoordinator::sync() {
   const auto tasks = import_tasks();
   const auto facts = import_results();
   const auto reviews = import_reviews();
+  const auto knowledge = import_knowledge();
+  std::size_t task_batches_pruned = 0;
+  const auto task_prefix = "refs/remotes/" + options_.remote +
+                           "/repotraverse/v1/coordination/tasks";
+  const auto task_refs = run_process(
+      {"git", "-C", path_to_utf8(options_.repository), "for-each-ref",
+       "--format=%(refname)", task_prefix});
+  require_git(task_refs, "list temporary task refs");
+  for (const auto &ref : lines(task_refs.output)) {
+    if (ref.empty()) continue;
+    const auto commit = run_process({"git", "-C", path_to_utf8(options_.repository),
+                                     "rev-parse", "--verify", ref});
+    if (commit.exit_code != 0) continue;
+    const auto names = run_process({"git", "-C", path_to_utf8(options_.repository),
+                                    "ls-tree", "--name-only", trim(commit.output)});
+    if (names.exit_code != 0) continue;
+    bool any = false, all_complete = true;
+    for (const auto &name : lines(names.output)) {
+      if (!name.ends_with(".jsonl")) continue;
+      const auto show = run_process({"git", "-C", path_to_utf8(options_.repository),
+                                     "show", trim(commit.output) + ":" + name});
+      if (show.exit_code != 0) {
+        all_complete = false;
+        continue;
+      }
+      for (const auto &line : lines(show.output)) {
+        if (line.empty()) continue;
+        const auto record = nlohmann::json::parse(line, nullptr, false);
+        const auto task_id = string_field(record, "task_id");
+        if (task_id.empty()) continue;
+        any = true;
+        all_complete = all_complete && catalog_.fact_for_task(task_id).has_value();
+      }
+    }
+    if (!any || !all_complete) continue;
+    const auto remote_prefix = "refs/remotes/" + options_.remote + "/";
+    if (!ref.starts_with(remote_prefix)) continue;
+    const auto head_ref = "refs/heads/" + ref.substr(remote_prefix.size());
+    const auto removed = run_process({"git", "-C", path_to_utf8(options_.repository),
+                                      "push", options_.remote, ":" + head_ref});
+    if (removed.exit_code == 0) ++task_batches_pruned;
+  }
   std::size_t pruned = 0;
   const auto now = now_seconds();
   for (const auto &claim : catalog_.claims()) {
@@ -173,13 +215,19 @@ nlohmann::json GitCoordinator::sync() {
                      "--force-with-lease=" + claim_ref(task_id) + ":" + oid,
                      options_.remote, ":" + claim_ref(task_id)});
     if (removed.exit_code == 0) {
+      const auto result_ref = "refs/heads/repotraverse/v1/coordination/results/" +
+                              task_id.substr(0, 2) + "/" + task_id;
+      (void)run_process({"git", "-C", path_to_utf8(options_.repository),
+                         "push", options_.remote, ":" + result_ref});
       catalog_.remove_claim(task_id);
       ++pruned;
     }
   }
   return {{"state", "synchronized"}, {"claims", imported},
           {"claims_pruned", pruned}, {"tasks_imported", tasks},
+          {"task_batches_pruned", task_batches_pruned},
           {"facts_imported", facts}, {"reviews_imported", reviews},
+          {"knowledge_imported", knowledge},
           {"snapshot_id", catalog_.snapshot_id()}};
 }
 
@@ -220,11 +268,11 @@ nlohmann::json GitCoordinator::publish_tasks(const nlohmann::json &tasks) {
       {"git", "-C", path_to_utf8(options_.repository), "mktree"}, {}, entry);
   require_git(tree, "create task batch tree");
   const auto producer_ref =
-      "refs/heads/repotraverse/tasks/" + catalog_.producer_id();
+      "refs/heads/repotraverse/v1/coordination/tasks/" + catalog_.producer_id() +
+      "/" + batch_id;
   const auto tracking = "refs/remotes/" + options_.remote +
-                        "/repotraverse/tasks/" + catalog_.producer_id();
-  const auto prior = run_process({"git", "-C", path_to_utf8(options_.repository),
-                                  "rev-parse", "--verify", tracking});
+                        "/repotraverse/v1/coordination/tasks/" + catalog_.producer_id() +
+                        "/" + batch_id;
   std::vector<std::string> command = {"git",
                                       "-c",
                                       "user.name=Repotraverse",
@@ -234,10 +282,6 @@ nlohmann::json GitCoordinator::publish_tasks(const nlohmann::json &tasks) {
                                       path_to_utf8(options_.repository),
                                       "commit-tree",
                                       trim(tree.output)};
-  if (prior.exit_code == 0) {
-    command.push_back("-p");
-    command.push_back(trim(prior.output));
-  }
   command.push_back("-m");
   command.push_back(nlohmann::json({{"record_type", "task_batch"},
                                     {"batch_id", batch_id},
@@ -265,7 +309,7 @@ std::size_t GitCoordinator::import_tasks() {
   const auto refs =
       run_process({"git", "-C", path_to_utf8(options_.repository), "for-each-ref",
                    "--format=%(refname)",
-                   "refs/remotes/" + options_.remote + "/repotraverse/tasks"});
+                   "refs/remotes/" + options_.remote + "/repotraverse/v1/coordination/tasks"});
   require_git(refs, "list task producer refs");
   std::size_t count = 0;
   for (const auto &ref : lines(refs.output)) {
@@ -322,16 +366,16 @@ std::size_t GitCoordinator::import_results() {
   const auto refs = run_process(
       {"git", "-C", path_to_utf8(options_.repository), "for-each-ref",
        "--format=%(refname)",
-       "refs/remotes/" + options_.remote + "/repotraverse/producers"});
+       "refs/remotes/" + options_.remote + "/repotraverse/v1/coordination/results"});
   require_git(refs, "list producer refs");
   std::size_t count = 0;
   for (const auto &ref : lines(refs.output)) {
     if (ref.empty())
       continue;
-    const auto commits = run_process({"git", "-C", path_to_utf8(options_.repository),
-                                      "rev-list", "--reverse", ref});
-    require_git(commits, "list producer commits");
-    for (const auto &commit : lines(commits.output)) {
+    const auto head = run_process({"git", "-C", path_to_utf8(options_.repository),
+                                   "rev-parse", "--verify", ref});
+    require_git(head, "resolve temporary result ref");
+    for (const auto &commit : lines(head.output)) {
       if (commit.empty() || catalog_.imported(commit))
         continue;
       const auto names = run_process({"git", "-C", path_to_utf8(options_.repository),
@@ -395,7 +439,7 @@ std::size_t GitCoordinator::import_reviews() {
   const auto refs = run_process(
       {"git", "-C", path_to_utf8(options_.repository), "for-each-ref",
        "--format=%(refname)",
-       "refs/remotes/" + options_.remote + "/repotraverse/reviews"});
+       "refs/remotes/" + options_.remote + "/repotraverse/v1/knowledge/lineage"});
   require_git(refs, "list review producer refs");
   std::size_t count = 0;
   for (const auto &ref : lines(refs.output)) {
@@ -467,9 +511,9 @@ nlohmann::json GitCoordinator::publish_review(
       {"git", "-C", path_to_utf8(options_.repository), "mktree"}, {}, entry);
   require_git(tree, "create lineage review tree");
   const auto producer_ref =
-      "refs/heads/repotraverse/reviews/" + catalog_.producer_id();
+      "refs/heads/repotraverse/v1/knowledge/lineage/" + catalog_.producer_id();
   const auto tracking = "refs/remotes/" + options_.remote +
-                        "/repotraverse/reviews/" + catalog_.producer_id();
+                        "/repotraverse/v1/knowledge/lineage/" + catalog_.producer_id();
   const auto prior = run_process({"git", "-C", path_to_utf8(options_.repository),
                                   "rev-parse", "--verify", tracking});
   std::vector<std::string> command = {
@@ -499,6 +543,167 @@ nlohmann::json GitCoordinator::publish_review(
   return {{"state", "published"},
           {"relation_id", relation.relation_id},
           {"commit", trim(commit.output)}};
+}
+
+nlohmann::json GitCoordinator::publish_knowledge_record(
+    const nlohmann::json &record, const std::string &record_id,
+    const std::string &ref) {
+  const auto payload = canonical_json(record);
+  const auto blob = run_process({"git", "-C", path_to_utf8(options_.repository),
+                                 "hash-object", "-w", "--stdin"}, {}, payload);
+  require_git(blob, "store knowledge record");
+  const auto entry = "100644 blob " + trim(blob.output) + "\t" + record_id + ".json\n";
+  const auto tree = run_process(
+      {"git", "-C", path_to_utf8(options_.repository), "mktree"}, {}, entry);
+  require_git(tree, "create knowledge tree");
+  const auto heads = std::string{"refs/heads/"};
+  if (!ref.starts_with(heads))
+    throw std::invalid_argument("knowledge publication requires a heads ref");
+  const auto tracking = "refs/remotes/" + options_.remote + "/" +
+                        ref.substr(heads.size());
+  const auto prior = run_process({"git", "-C", path_to_utf8(options_.repository),
+                                  "rev-parse", "--verify", tracking});
+  std::vector<std::string> command = {
+      "git", "-c", "user.name=Repotraverse", "-c",
+      "user.email=repotraverse@invalid", "-C", path_to_utf8(options_.repository),
+      "commit-tree", trim(tree.output)};
+  if (prior.exit_code == 0)
+    command.insert(command.end(), {"-p", trim(prior.output)});
+  command.insert(command.end(), {"-m", record.dump()});
+  const auto commit = run_process(command);
+  require_git(commit, "create knowledge commit");
+  const auto push = run_process({"git", "-C", path_to_utf8(options_.repository),
+                                 "push", options_.remote,
+                                 trim(commit.output) + ":" + ref});
+  require_git(push, "publish knowledge record");
+  require_git(run_process({"git", "-C", path_to_utf8(options_.repository),
+                           "update-ref", tracking, trim(commit.output)}),
+              "update knowledge tracking ref");
+  return {{"state", "published"}, {"record_id", record_id},
+          {"commit", trim(commit.output)}, {"ref", ref}};
+}
+
+nlohmann::json GitCoordinator::publish_receipt(const EvidenceReceipt &receipt) {
+  std::scoped_lock lock(mutex_);
+  const auto synchronized = sync();
+  if (synchronized.value("state", std::string{}) != "synchronized")
+    return synchronized;
+  auto result = publish_knowledge_record(
+      {{"schema_version", kSchemaVersion}, {"record_type", "evidence_receipt"},
+       {"producer_id", catalog_.producer_id()}, {"receipt", receipt}},
+      receipt.receipt_id,
+      "refs/heads/repotraverse/v1/knowledge/receipts/" + catalog_.producer_id());
+  catalog_.store_receipt(receipt);
+  return result;
+}
+
+nlohmann::json GitCoordinator::publish_inference_claim(const InferenceClaim &claim) {
+  std::scoped_lock lock(mutex_);
+  const auto synchronized = sync();
+  if (synchronized.value("state", std::string{}) != "synchronized")
+    return synchronized;
+  auto result = publish_knowledge_record(
+      {{"schema_version", kSchemaVersion}, {"record_type", "inference_claim"},
+       {"producer_id", catalog_.producer_id()}, {"claim", claim}},
+      claim.claim_id,
+      "refs/heads/repotraverse/v1/knowledge/proposals/" + catalog_.producer_id());
+  catalog_.store_inference_claim(claim);
+  return result;
+}
+
+nlohmann::json
+GitCoordinator::publish_knowledge_decision(const KnowledgeDecision &decision) {
+  std::scoped_lock lock(mutex_);
+  const auto synchronized = sync();
+  if (synchronized.value("state", std::string{}) != "synchronized")
+    return synchronized;
+  auto result = publish_knowledge_record(
+      {{"schema_version", kSchemaVersion}, {"record_type", "knowledge_decision"},
+       {"producer_id", catalog_.producer_id()}, {"decision", decision}},
+      decision.decision_id, options_.knowledge_ref);
+  catalog_.store_knowledge_decision(decision, result.at("commit"));
+  return result;
+}
+
+nlohmann::json GitCoordinator::publish_pr_import(const nlohmann::json &record) {
+  std::scoped_lock lock(mutex_);
+  const auto synchronized = sync();
+  if (synchronized.value("state", std::string{}) != "synchronized")
+    return synchronized;
+  const auto import_id = stable_hash(canonical_json(record));
+  auto result = publish_knowledge_record(
+      {{"schema_version", kSchemaVersion}, {"record_type", "pr_import"},
+       {"producer_id", catalog_.producer_id()}, {"import_id", import_id},
+       {"record", record}},
+      import_id,
+      "refs/heads/repotraverse/v1/knowledge/pr-imports/" +
+          catalog_.producer_id());
+  catalog_.store_pr_import(import_id, record, result.at("commit"));
+  return result;
+}
+
+std::size_t GitCoordinator::import_knowledge() {
+  const auto prefix = "refs/remotes/" + options_.remote +
+                      "/repotraverse/v1/knowledge";
+  const auto authoritative = "refs/remotes/" + options_.remote + "/" +
+      options_.knowledge_ref.substr(std::string{"refs/heads/"}.size());
+  const auto refs = run_process({"git", "-C", path_to_utf8(options_.repository),
+                                 "for-each-ref", "--format=%(refname)", prefix});
+  require_git(refs, "list knowledge refs");
+  std::size_t count = 0;
+  auto knowledge_refs = lines(refs.output);
+  std::stable_sort(knowledge_refs.begin(), knowledge_refs.end(),
+                   [&](const auto &left, const auto &right) {
+                     return (left == authoritative) < (right == authoritative);
+                   });
+  for (const auto &ref : knowledge_refs) {
+    if (ref.empty() || ref.find("/lineage/") != std::string::npos) continue;
+    const auto commits = run_process({"git", "-C", path_to_utf8(options_.repository),
+                                      "rev-list", "--reverse", ref});
+    require_git(commits, "list knowledge commits");
+    for (const auto &commit : lines(commits.output)) {
+      if (commit.empty() || catalog_.imported(commit)) continue;
+      const auto names = run_process({"git", "-C", path_to_utf8(options_.repository),
+                                      "ls-tree", "--name-only", commit});
+      require_git(names, "list knowledge record");
+      for (const auto &name : lines(names.output)) {
+        if (!name.ends_with(".json")) continue;
+        const auto show = run_process({"git", "-C", path_to_utf8(options_.repository),
+                                       "show", commit + ":" + name});
+        require_git(show, "read knowledge record");
+        if (show.output.size() > options_.max_record_bytes) continue;
+        const auto record = nlohmann::json::parse(show.output, nullptr, false);
+        if (record.is_discarded() || !schema_v1(record) ||
+            !trusted_producer(string_field(record, "producer_id"))) continue;
+        try {
+          const auto type = string_field(record, "record_type");
+          if (type == "evidence_receipt" && record.contains("receipt")) {
+            catalog_.store_receipt(record.at("receipt").get<EvidenceReceipt>());
+            ++count;
+          } else if (type == "inference_claim" && record.contains("claim")) {
+            catalog_.store_inference_claim(record.at("claim").get<InferenceClaim>());
+            ++count;
+          } else if (type == "knowledge_decision" &&
+                     record.contains("decision") && ref == authoritative) {
+            catalog_.store_knowledge_decision(
+                record.at("decision").get<KnowledgeDecision>(), commit);
+            ++count;
+          } else if (type == "pr_import" && record.contains("record")) {
+            const auto imported = record.at("record");
+            const auto import_id = string_field(record, "import_id");
+            if (import_id == stable_hash(canonical_json(imported))) {
+              catalog_.store_pr_import(import_id, imported, commit);
+              ++count;
+            }
+          }
+        } catch (const std::exception &) {
+          continue;
+        }
+      }
+      catalog_.mark_imported(commit);
+    }
+  }
+  return count;
 }
 
 std::string
@@ -679,11 +884,11 @@ std::string GitCoordinator::publish_result(const std::string &task_id,
       {"git", "-C", path_to_utf8(options_.repository), "mktree"}, {}, entry);
   require_git(tree, "create result tree");
   const auto producer_ref =
-      "refs/heads/repotraverse/producers/" + catalog_.producer_id();
+      "refs/heads/repotraverse/v1/coordination/results/" + task_id.substr(0, 2) +
+      "/" + task_id;
   const auto tracking = "refs/remotes/" + options_.remote +
-                        "/repotraverse/producers/" + catalog_.producer_id();
-  const auto prior = run_process({"git", "-C", path_to_utf8(options_.repository),
-                                  "rev-parse", "--verify", tracking});
+                        "/repotraverse/v1/coordination/results/" +
+                        task_id.substr(0, 2) + "/" + task_id;
   std::vector<std::string> command = {"git",
                                       "-c",
                                       "user.name=Repotraverse",
@@ -693,10 +898,6 @@ std::string GitCoordinator::publish_result(const std::string &task_id,
                                       path_to_utf8(options_.repository),
                                       "commit-tree",
                                       trim(tree.output)};
-  if (prior.exit_code == 0) {
-    command.push_back("-p");
-    command.push_back(trim(prior.output));
-  }
   command.push_back("-m");
   command.push_back(nlohmann::json({{"record_type", "result_shard"},
                                     {"task_id", task_id},

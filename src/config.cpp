@@ -36,11 +36,12 @@ ServiceConfig parse_service_config(const nlohmann::json &value) {
       "schema_version",
       "repository_id",
       "catalog",
-      "artifact_repository",
+      "analysis_repository",
       "source_repository",
       "extractor",
       "scratch_root",
       "remote",
+      "knowledge_ref",
       "listen_address",
       "port",
       "sync_seconds",
@@ -51,6 +52,8 @@ ServiceConfig parse_service_config(const nlohmann::json &value) {
       "git_timeout_seconds",
       "extractor_timeout_seconds",
       "max_manifest_bytes",
+      "local_cache_max_facts",
+      "local_cache_max_bytes",
       "workspace_mode",
       "workspace_max_revisions",
       "workspace_max_bytes",
@@ -74,21 +77,25 @@ ServiceConfig parse_service_config(const nlohmann::json &value) {
     throw std::invalid_argument(
         "service config requires a valid repository_id");
   result.catalog = path_from_utf8(value.value("catalog", std::string{}));
-  result.artifact_repository = path_from_utf8(
-      value.value("artifact_repository", std::string{}));
+  result.analysis_repository = path_from_utf8(
+      value.value("analysis_repository", std::string{}));
   result.source_repository =
       path_from_utf8(value.value("source_repository", std::string{}));
   result.extractor = path_from_utf8(value.value("extractor", std::string{}));
   result.scratch_root = value.contains("scratch_root")
                             ? path_from_utf8(value.at("scratch_root").get<std::string>())
                             : result.catalog / "scratch";
-  if (result.catalog.empty() || result.artifact_repository.empty())
+  if (result.catalog.empty() || result.analysis_repository.empty())
     throw std::invalid_argument(
-        "service config requires catalog and artifact_repository");
+        "service config requires catalog and analysis_repository");
   result.remote = value.value("remote", std::string{"origin"});
   if (!valid_name(result.remote) || result.remote.starts_with('-'))
     throw std::invalid_argument(
         "service config contains an invalid Git remote");
+  result.knowledge_ref = value.value(
+      "knowledge_ref", std::string{"refs/heads/repotraverse/v1/knowledge/accepted"});
+  if (!result.knowledge_ref.starts_with("refs/heads/repotraverse/v1/knowledge/"))
+    throw std::invalid_argument("knowledge_ref must be a repotraverse v1 knowledge ref");
   result.listen_address =
       value.value("listen_address", std::string{"127.0.0.1"});
   if (result.listen_address != "127.0.0.1")
@@ -111,6 +118,11 @@ ServiceConfig parse_service_config(const nlohmann::json &value) {
   result.max_manifest_bytes = bounded<std::uint64_t>(
       value, "max_manifest_bytes", 256ULL * 1024ULL * 1024ULL,
       1024ULL * 1024ULL, 1024ULL * 1024ULL * 1024ULL);
+  result.local_cache_max_facts = bounded<std::uint32_t>(
+      value, "local_cache_max_facts", 10000, 100, 1000000);
+  result.local_cache_max_bytes = bounded<std::uint64_t>(
+      value, "local_cache_max_bytes", 4ULL * 1024ULL * 1024ULL * 1024ULL,
+      64ULL * 1024ULL * 1024ULL, 1024ULL * 1024ULL * 1024ULL * 1024ULL);
   result.workspace_mode = value.value("workspace_mode", std::string{"auto"});
   if (result.workspace_mode != "auto")
     throw std::invalid_argument("workspace_mode currently requires auto");

@@ -76,7 +76,9 @@ void to_json(nlohmann::json& value, const TransitionFact& item) {
              {"content_change", item.content_change},
              {"dependencies_changed", item.dependencies_changed},
              {"resolution", item.resolution},
-             {"confidence", item.confidence}};
+             {"confidence", item.confidence},
+             {"transition_id", item.transition_id},
+             {"origin_evidence", item.origin_evidence}};
     if (item.before_location) value["before_location"] = *item.before_location;
     if (item.after_location) value["after_location"] = *item.after_location;
 }
@@ -90,7 +92,8 @@ void to_json(nlohmann::json& value, const TransitionResult& item) {
 }
 
 TransitionResult trace_transition(const EvidenceBundle& before, const EvidenceBundle& after,
-                                  const std::vector<LineageAssertion>& assertions) {
+                                  const std::vector<LineageAssertion>& assertions,
+                                  const std::string &integration_unit_id) {
     TransitionResult result{before.source_revision,
                             after.source_revision,
                             after.configuration,
@@ -177,6 +180,31 @@ TransitionResult trace_transition(const EvidenceBundle& before, const EvidenceBu
             result.coverage.status = "partial";
             result.coverage.gaps.push_back("unresolved successor for " + old_element.compiler_id);
         }
+        fact.transition_id = stable_hash(
+            integration_unit_id + "\n" + before.source_revision + "\n" + after.source_revision + "\n" +
+            before.configuration + "\n" + before.context_fingerprint + "\n" +
+            after.context_fingerprint + "\n" + fact.before_element + "\n" +
+            fact.after_element);
+        if (fact.content_change != "none" &&
+            fact.content_change != "unverified") {
+            OriginEvidence evidence;
+            evidence.kind = "unattributed_semantic_change";
+            evidence.confidence = "unattributed";
+            evidence.coverage.status = "partial";
+            evidence.coverage.gaps = {
+                "Git and dependency evidence has not been joined"};
+            fact.origin_evidence.push_back(std::move(evidence));
+        }
+        if (before.context_fingerprint != after.context_fingerprint) {
+            OriginEvidence evidence;
+            evidence.kind = "build_context_change";
+            evidence.evidence = {
+                {"compile_context", before.context_fingerprint,
+                 before.source_revision, {}},
+                {"compile_context", after.context_fingerprint,
+                 after.source_revision, {}}};
+            fact.origin_evidence.push_back(std::move(evidence));
+        }
         result.facts.push_back(std::move(fact));
     }
     for (std::size_t i = 0; i < after.elements.size(); ++i) if (!used[i]) {
@@ -185,7 +213,12 @@ TransitionResult trace_transition(const EvidenceBundle& before, const EvidenceBu
         fact.after_element = after.elements[i].compiler_id; fact.after_revision = after.source_revision;
         fact.before_revision = before.source_revision; fact.after_location = after.elements[i].location;
         fact.continuity = "added_or_unresolved"; fact.content_change = "unverified";
-        fact.confidence = "ambiguous"; result.facts.push_back(std::move(fact));
+        fact.confidence = "ambiguous";
+        fact.transition_id = stable_hash(
+            integration_unit_id + "\n" + before.source_revision + "\n" + after.source_revision + "\n" +
+            before.configuration + "\n" + before.context_fingerprint + "\n" +
+            after.context_fingerprint + "\n\n" + fact.after_element);
+        result.facts.push_back(std::move(fact));
     }
     const auto references = [](const ElementSnapshot& element,
                                const ElementSnapshot& target) {

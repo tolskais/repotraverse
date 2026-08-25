@@ -1,4 +1,4 @@
-# V1 ARM build and stability experiment
+# V1 ARM build and fact-extraction experiment
 
 RepoTraverse v1 validates whether historical ARMCC/ArmClang build contexts can
 be reconstructed accurately enough to compare element-level stability with an
@@ -20,7 +20,7 @@ Until cross-TU element aggregation is implemented:
 
 - provide `build_variant.product`, `build_variant.target`, and
   `build_variant.configuration` for each capture configuration;
-- treat missing revision manifests as an evidence gap outside the classifier;
+- treat missing revision manifests as an explicit evidence gap;
 - interpret element counts and classifications as TU-series trial results, not
   repository-wide deduplicated results; and
 - treat the ARMCC5/ArmClang6 adapter as partial until it is qualified against the real
@@ -97,7 +97,7 @@ Clang can assign the same USR to distinct anonymous C/C++ tags. V1 disambiguates
 tags with a repository-relative spelling anchor before deriving the logical element ID.
 This prevents one TU manifest from collapsing separate anonymous declarations, while
 also making their exact lineage intentionally sensitive to moving that declaration;
-such gaps remain evidence limitations rather than classifier certainty.
+such gaps remain explicit evidence limitations.
 
 `progressive-screening.v1.json` records file facts, syntax snapshots and transitions,
 promotion reasons, cap usage, and coverage. An identical
@@ -141,7 +141,7 @@ change with no dependency map conservatively invalidates every TU. Unaffected
 manifests are re-observed at the new revision without rerunning Clang. Capture
 or extraction gaps remain explicit. If a syntax or capture cap truncates the selected
 history, Git/syntax facts remain usable but `coverage_complete` is false and the
-classifier can return only `insufficient_evidence`.
+result must remain partial.
 
 Change origins are not collapsed into one count. `direct_source` and
 `own_declaration` are intrinsic changes. An included header change first creates
@@ -150,37 +150,8 @@ semantic fingerprints change under the same context. Build-context changes and
 unattributed semantic changes remain separate, and multiple causes are retained as a
 set. Dependency propagation is bounded by the manifest depth and per-transition caps.
 
-When `partition` is present, the pilot also writes
-`stability-report.v1.json`. A standalone classification can consume explicitly
-ordered bundle series:
-
-```text
-repotraverse experiment classify --manifest stability-input.json
-```
-
-The classifier always preserves raw implementation, interface, structural,
-and lineage evidence. It returns `stable`, `variable`, or
-`insufficient_evidence`. Partial extraction, ambiguous lineage, or too few
-observable transitions prevents a stable or variable conclusion.
-
-The classifier does not currently consume accepted lineage assertions. It also cannot
-distinguish an element that is semantically absent for a successfully analyzed target
-from a target/context that was not observed, because the pilot does not yet construct an
-explicit expected-observation matrix.
-
-The comparison report contains an agreement matrix, variable elements inside
-developer-labeled stable files (`variation_leakage`), and stable elements
-inside developer-labeled variable files (`stable_islands`). Developer labels
-are a comparison reference, not asserted ground truth.
-`cross_variant_facts` separately reports the current opaque semantic states
-observed for the same historical element in two or more build variants. It does
-not feed those differences into the temporal classifier.
-
-Logical elements and semantic variants are already normalized in TU manifests, and
-build variants are explicit. The remaining analytical milestone is the reduction into
-cross-TU logical-element revision states. Temporal stability and cross-target
-variability remain separate facts.
-
-The default weights and thresholds shown in the example manifest are an explicit
-baseline hypothesis for practical experiments. They are not empirical constants or a
-production definition of stability.
+The pilot preserves implementation, interface, structural, lineage, and
+cross-variant evidence with explicit coverage. It does not classify stability.
+Logical elements and semantic variants are normalized in TU manifests, and build
+variants are explicit. Header investigations add an expected-observation matrix
+over the union of including TUs at both endpoints.

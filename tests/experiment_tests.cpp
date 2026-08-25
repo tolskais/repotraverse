@@ -1,7 +1,6 @@
 #include "history/experiment.hpp"
 #include "history/ir.hpp"
 #include "history/process.hpp"
-#include "history/stability.hpp"
 
 #include <chrono>
 #include <filesystem>
@@ -44,28 +43,6 @@ nlohmann::json first_manifest(const std::filesystem::path &directory) {
   throw std::runtime_error("manifest directory is empty");
 }
 
-history::EvidenceBundle bundle(std::string revision, bool changed) {
-  history::EvidenceBundle result;
-  result.source_revision = std::move(revision);
-  result.configuration = "debug";
-  result.coverage.capabilities = {"element_lineage"};
-  history::ElementSnapshot stable;
-  stable.compiler_id = "stable-id";
-  stable.kind = "function";
-  stable.qualified_name = "stable_function";
-  stable.interface_fingerprint = "interface";
-  stable.implementation_fingerprint = "implementation";
-  stable.dependency_fingerprint = "dependencies";
-  stable.location.path = "stable/stable.cpp";
-  history::ElementSnapshot variable = stable;
-  variable.compiler_id = "variable-id";
-  variable.qualified_name = "variable_function";
-  variable.location.path = "variable/variable.cpp";
-  variable.implementation_fingerprint =
-      changed ? result.source_revision : "base";
-  result.elements = {stable, variable};
-  return result;
-}
 } // namespace
 
 int main() {
@@ -174,8 +151,6 @@ int main() {
     pilot_experiment["pilot"] = {{"ref", "main"},
                                  {"max_revisions", 4},
                                  {"budget", progressive_budget()}};
-    pilot_experiment["partition"] = {{"stable", {"src/*", "include/*"}},
-                                     {"variable", nlohmann::json::array()}};
     auto missing_budget = pilot_experiment;
     missing_budget["output"] = (root / "missing-budget-output").string();
     missing_budget["pilot"].erase("budget");
@@ -213,11 +188,8 @@ int main() {
             pilot.at("revision_reports").back().at("workspace").at("mode") ==
                 "sparse",
         "pilot did not switch from capture workspace to sparse extraction");
-    require(pilot.at("stability").at("classifications").value("stable", 0U) > 0,
-            "pilot did not classify unchanged elements as stable");
-
     auto changed_pilot_experiment = pilot_experiment;
-    changed_pilot_experiment["partition"]["exclude"] = {"README.md"};
+    changed_pilot_experiment["pilot"]["budget"]["max_dependency_depth"] = 3;
     write(pilot_manifest, changed_pilot_experiment.dump());
     const auto rerun =
         history::run_pilot_experiment(pilot_manifest, PROBE_PATH);
@@ -247,14 +219,6 @@ int main() {
         !incomplete.at("series").front().at("coverage_complete") &&
             !incomplete.at("series").front().at("missing_revisions").empty(),
         "a missing semantic revision was presented as complete coverage");
-    require(incomplete.at("stability")
-                        .at("classifications")
-                        .value("insufficient_evidence", 0U) > 0 &&
-                incomplete.at("stability")
-                        .at("classifications")
-                        .value("stable", 0U) == 0,
-            "a series with a missing revision received a definitive "
-            "classification");
 
     auto clean_experiment = experiment;
     clean_experiment["revision"] = "main";
@@ -275,30 +239,6 @@ int main() {
     require(incremental_manifest == full_manifest,
             "incremental and clean full manifests diverged");
 
-    nlohmann::json paths = nlohmann::json::array();
-    for (int index = 0; index < 4; ++index) {
-      const auto path = root / ("bundle-" + std::to_string(index) + ".json");
-      write(path, nlohmann::json(bundle("r" + std::to_string(index), index > 0))
-                      .dump());
-      paths.push_back(path.string());
-    }
-    const auto stability_manifest = root / "stability.json";
-    write(stability_manifest,
-          nlohmann::json(
-              {{"schema_version", history::kSchemaVersion},
-               {"series", {{{"configuration", "debug"}, {"bundles", paths}}}},
-               {"partition",
-                {{"stable", {"stable/*"}}, {"variable", {"variable/*"}}}}})
-              .dump());
-    const auto stability =
-        history::run_stability_experiment(stability_manifest);
-    require(stability.at("classifications").value("stable", 0U) == 1,
-            "stable element was not classified");
-    require(stability.at("classifications").value("variable", 0U) == 1,
-            "variable element was not classified");
-    require(stability.at("variation_leakage").empty() &&
-                stability.at("stable_islands").empty(),
-            "matching developer partition reported disagreements");
     std::cout << "experiment tests passed\n";
     return 0;
   } catch (const std::exception &error) {

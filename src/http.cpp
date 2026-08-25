@@ -267,7 +267,8 @@ bool allowed_http_query(const nlohmann::json &request) {
   static const std::set<std::string> allowed = {
       "file.history", "lineage.review.submit", "lineage.review.get",
       "submodule.revisions"};
-  return allowed.contains(request.at("query").get<std::string>());
+  const auto query = request.at("query").get<std::string>();
+  return allowed.contains(query) || query.starts_with("tool.");
 }
 
 class RequestExecutor {
@@ -463,7 +464,13 @@ void run_http_server(const HttpServerOptions &options, QueryService &service,
         const auto queued = requests.enqueue(request);
         respond(client, queued.value("ok", false) ? 202 : 503, queued);
       } else if (first.starts_with("POST /v1/queries ")) {
-        throw std::runtime_error("direct HTTP queries are disabled; use /v1/requests");
+        const auto request =
+            nlohmann::json::parse(raw.substr(header_end + 4));
+        const auto query = request.value("query", std::string{});
+        if (!query.starts_with("tool."))
+          throw std::runtime_error("direct HTTP queries are limited to raw tool operations");
+        const auto response = service.execute(request);
+        respond(client, response.value("ok", false) ? 200 : 400, response);
       } else if (first.starts_with("GET /v1/requests/")) {
         const auto begin = std::strlen("GET /v1/requests/");
         const auto end = first.find(' ', begin);
@@ -511,7 +518,10 @@ void run_http_server(const HttpServerOptions &options, QueryService &service,
 
 nlohmann::json http_query(const std::string &endpoint,
                           const nlohmann::json &request) {
-  return request_http(endpoint, "POST", "/v1/requests", &request);
+  const auto path = request.value("query", std::string{}).starts_with("tool.")
+                        ? "/v1/queries"
+                        : "/v1/requests";
+  return request_http(endpoint, "POST", path, &request);
 }
 
 nlohmann::json http_status(const std::string &endpoint) {

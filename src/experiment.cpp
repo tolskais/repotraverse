@@ -8,7 +8,6 @@
 #include "history/process.hpp"
 #include "history/progressive.hpp"
 #include "history/revision_workspace.hpp"
-#include "history/stability.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -377,6 +376,13 @@ bool build_context_changed(const std::filesystem::path &repository,
 }
 
 void refresh_manifest_identity(TuManifest &manifest) {
+  for (auto &observation : manifest.observations)
+    observation.observation_id = stable_hash(
+        manifest.repository_id + "\n" + manifest.source_revision + "\n" +
+        manifest.translation_unit + "\n" + manifest.context_id + "\n" +
+        manifest.build_variant.variant_id + "\n" + observation.element_id +
+        "\n" + observation.variant_id + "\n" +
+        nlohmann::json(observation.location).dump());
   const nlohmann::json identity = {
       {"repository", manifest.repository_id},
       {"revision", manifest.source_revision},
@@ -1028,21 +1034,6 @@ run_pilot_experiment(const std::filesystem::path &manifest_path,
                            {"budget_usage", progressive.at("budget_usage")},
                            {"resume_granularity", "revision"},
                            {"output", generic_path_to_utf8(output)}};
-  if (manifest.contains("partition")) {
-    nlohmann::json stability_manifest = {
-        {"schema_version", kSchemaVersion},
-        {"series", usable_series},
-        {"revision_authors", revision_authors},
-        {"revision_times", revision_times},
-        {"revision_file_touches", revision_file_touches},
-        {"partition", manifest.at("partition")},
-        {"report", path_to_utf8(output / "stability-report.v1.json")}};
-    if (manifest.contains("policy"))
-      stability_manifest["policy"] = manifest.at("policy");
-    const auto path = output / "stability-input.v1.json";
-    persist(path, stability_manifest);
-    result["stability"] = run_stability_experiment(path);
-  }
   persist(output / "pilot-report.v1.json", result);
   return result;
 }

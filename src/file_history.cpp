@@ -5,6 +5,7 @@
 #include "history/process.hpp"
 #include "history/revision_workspace.hpp"
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <fstream>
 #include <map>
@@ -31,6 +32,51 @@ std::int64_t prior_year(std::int64_t timestamp) {
 bool is_rename(const nlohmann::json &change) {
   const auto status = change.value("status", std::string{});
   return !status.empty() && status.front() == 'R';
+}
+
+bool is_header_path(const std::string &path) {
+  auto extension = path_to_utf8(path_from_utf8(path).extension());
+  std::transform(extension.begin(), extension.end(), extension.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  static const std::set<std::string> headers = {
+      ".h", ".hh", ".hpp", ".hxx", ".inc", ".inl", ".ipp", ".tpp"};
+  return headers.contains(extension);
+}
+
+std::string observation_family(const CompileContext &context) {
+  return context.translation_unit + "\n" + context.build_variant.product + "\n" +
+         context.build_variant.target + "\n" + context.build_variant.configuration;
+}
+
+bool overlaps_change(const SourceAnchor &location, const nlohmann::json &ranges,
+                     bool after) {
+  const auto start_key = after ? "after_start" : "before_start";
+  const auto count_key = after ? "after_count" : "before_count";
+  for (const auto &range : ranges) {
+    const auto start = range.value(start_key, std::uint64_t{});
+    const auto count = range.value(count_key, std::uint64_t{});
+    const auto end = count == 0 ? start : start + count - 1;
+    if (location.begin_line <= end && location.end_line >= start) return true;
+  }
+  return false;
+}
+
+nlohmann::json direct_origin(const nlohmann::json &unit,
+                             const SourceAnchor *before,
+                             const SourceAnchor *after) {
+  const auto ranges = unit.value("changed_ranges", nlohmann::json::array());
+  if ((!before || !overlaps_change(*before, ranges, false)) &&
+      (!after || !overlaps_change(*after, ranges, true)))
+    return nlohmann::json::array();
+  OriginEvidence origin;
+  origin.kind = "direct_git_change";
+  origin.evidence.push_back(
+      {"integration_unit", unit.value("integration_unit_id", std::string{}),
+       unit.value("head_commit", std::string{}), {}});
+  origin.causes = {"element source range overlaps the integration-unit diff"};
+  origin.confidence = "exact";
+  origin.coverage.capabilities = {"git_diff", "source_anchor"};
+  return nlohmann::json::array({origin});
 }
 
 struct ElementView {
@@ -261,7 +307,8 @@ nlohmann::json aggregate_analysis(Catalog &catalog,
                               !unavailable_endpoints.contains(after_key));
     if (!before_ready || !after_ready) {
       transitions.push_back(
-          {{"change_unit_id", unit.value("change_unit_id", std::string{})},
+          {{"integration_unit_id", unit.value("integration_unit_id", std::string{})},
+           {"change_unit_id", unit.value("change_unit_id", std::string{})},
            {"before_revision", unit.value("base_commit", std::string{})},
            {"after_revision", unit.value("head_commit", std::string{})},
            {"state", "pending"},
@@ -296,7 +343,9 @@ nlohmann::json aggregate_analysis(Catalog &catalog,
             old_view.location.path != new_view.location.path ||
                 old_view.location.begin_line != new_view.location.begin_line},
            {"before_location", old_view.location},
-           {"after_location", new_view.location}});
+           {"after_location", new_view.location},
+           {"origin_evidence", direct_origin(unit, &old_view.location,
+                                              &new_view.location)}});
     }
     for (const auto &[id, view] : after)
       if (!before.contains(id))
@@ -334,15 +383,28 @@ nlohmann::json aggregate_analysis(Catalog &catalog,
           {{"element_id", id},
            {"change_kind",
             candidate_before.contains(id) ? "lineage_unresolved" : "removed"},
-           {"before_location", before.at(id).location}});
+           {"before_location", before.at(id).location},
+           {"origin_evidence", direct_origin(unit, &before.at(id).location,
+                                              nullptr)}});
     for (const auto &id : unmatched_after)
       changes.push_back(
           {{"element_id", id},
            {"change_kind",
             candidate_after.contains(id) ? "lineage_unresolved" : "added"},
-           {"after_location", after.at(id).location}});
+           {"after_location", after.at(id).location},
+           {"origin_evidence", direct_origin(unit, nullptr,
+                                              &after.at(id).location)}});
+    for (auto &change : changes) {
+      change["logical_element_id"] = change.value("element_id", std::string{});
+      change["transition_id"] = stable_hash(
+          unit.value("integration_unit_id", std::string{}) + "\n" +
+          change.value("element_id", std::string{}) + "\n" +
+          unit.value("base_commit", std::string{}) + "\n" +
+          unit.value("head_commit", std::string{}));
+    }
     transitions.push_back(
-        {{"change_unit_id", unit.value("change_unit_id", std::string{})},
+        {{"integration_unit_id", unit.value("integration_unit_id", std::string{})},
+         {"change_unit_id", unit.value("change_unit_id", std::string{})},
          {"before_revision", unit.value("base_commit", std::string{})},
          {"after_revision", unit.value("head_commit", std::string{})},
          {"state", "complete"},
@@ -366,7 +428,8 @@ nlohmann::json plan_file_history(Catalog &catalog,
                    "\n" + options.ref) +
        ".jsonl");
   write_history_plan(
-      {options.repository, options.ref, {}, options.pr_facts, plan});
+      {options.repository, options.ref, {}, options.pr_facts, plan,
+       options.repository_id});
   std::ifstream input(plan);
   std::string line;
   std::vector<nlohmann::json> units;
@@ -375,11 +438,16 @@ nlohmann::json plan_file_history(Catalog &catalog,
     if (line.empty())
       continue;
     auto value = nlohmann::json::parse(line);
-    if (value.value("record_type", std::string{}) == "change_unit") {
+    if (value.value("record_type", std::string{}) == "integration_unit") {
       head_time =
           std::max(head_time, value.value("committer_time", std::int64_t{}));
       units.push_back(std::move(value));
     }
+  }
+  input.close();
+  {
+    std::error_code ignored;
+    std::filesystem::remove(plan, ignored);
   }
   const auto since = options.since ? options.since : prior_year(head_time);
   std::string tracked = options.path;
@@ -431,10 +499,20 @@ nlohmann::json plan_file_history(Catalog &catalog,
   bool semantic_map_missing = false;
   std::set<std::string> seen_tasks, missing_contexts;
   const auto schedule_endpoint = [&](const std::string &revision,
-                                     const std::string &endpoint_path) {
+                                     const std::string &endpoint_path,
+                                     const std::set<std::string> &additional_tus) {
     if (revision.empty() || endpoint_path.empty())
       return;
-    const auto contexts = catalog.compile_contexts(endpoint_path, revision);
+    auto contexts = catalog.compile_contexts(endpoint_path, revision);
+    std::set<std::string> context_keys;
+    for (const auto &context : contexts)
+      context_keys.insert(context.context_id + "\n" + context.configuration +
+                          "\n" + context.translation_unit);
+    for (const auto &tu : additional_tus)
+      for (const auto &context : catalog.compile_contexts(tu, revision))
+        if (context_keys.insert(context.context_id + "\n" + context.configuration +
+                                "\n" + context.translation_unit).second)
+          contexts.push_back(context);
     if (contexts.empty()) {
       const auto key = endpoint_key(revision, endpoint_path);
       if (missing_contexts.insert(key).second)
@@ -444,12 +522,9 @@ nlohmann::json plan_file_history(Catalog &catalog,
       return;
     }
     if (options.scope == "semantic") {
-      const auto mapped = std::any_of(
+          const auto mapped = std::any_of(
           contexts.begin(), contexts.end(), [](const CompileContext &context) {
-            return std::find(context.coverage.capabilities.begin(),
-                             context.coverage.capabilities.end(),
-                             "project_dependency_map") !=
-                   context.coverage.capabilities.end();
+            return context.dependency_map_complete;
           });
       semantic_map_missing = semantic_map_missing || !mapped;
     }
@@ -472,6 +547,10 @@ nlohmann::json plan_file_history(Catalog &catalog,
           {"translation_unit", context.translation_unit},
           {"context_id", context_id},
           {"build_variant", context.build_variant},
+          {"inventory_id", context.inventory_id},
+          {"toolchain_fingerprint", context.toolchain_fingerprint},
+          {"generated_inputs_fingerprint",
+           context.generated_inputs_fingerprint},
           {"extractor_identity", options.extractor_identity},
           {"extractor_schema", kSchemaVersion}};
       const auto id = stable_hash(identity.dump());
@@ -488,16 +567,17 @@ nlohmann::json plan_file_history(Catalog &catalog,
           {"translation_unit", context.translation_unit},
           {"requested_file", endpoint_path},
           {"context_id", context_id},
+          {"inventory_id", context.inventory_id},
           {"configurations", group.second},
           {"build_variant", context.build_variant},
+          {"toolchain_fingerprint", context.toolchain_fingerprint},
+          {"generated_inputs_fingerprint",
+           context.generated_inputs_fingerprint},
           {"frontend_arguments", context.frontend_arguments},
           {"materialization",
            MaterializationManifest{
                context.project_files,
-               std::find(context.coverage.capabilities.begin(),
-                         context.coverage.capabilities.end(),
-                         "project_dependency_map") !=
-                   context.coverage.capabilities.end(),
+               context.dependency_map_complete,
                context.project_files.empty()
                    ? std::vector<std::string>{"project dependency closure is "
                                               "unavailable"}
@@ -511,19 +591,23 @@ nlohmann::json plan_file_history(Catalog &catalog,
       }
     }
   };
-  for (const auto &unit : selected)
-    for (const auto *endpoint : {"base_commit", "head_commit"}) {
-      if (!unit.value(std::string(endpoint) == "base_commit"
-                          ? "file_exists_before"
-                          : "file_exists_after",
-                      true))
-        continue;
-      schedule_endpoint(unit.value(endpoint, std::string{}),
-                        unit.value(std::string(endpoint) == "base_commit"
-                                       ? "file_path_before"
-                                       : "file_path_after",
-                                   options.path));
+  for (const auto &unit : selected) {
+    const auto before_revision = unit.value("base_commit", std::string{});
+    const auto after_revision = unit.value("head_commit", std::string{});
+    const auto before_path = unit.value("file_path_before", options.path);
+    const auto after_path = unit.value("file_path_after", options.path);
+    std::set<std::string> before_tus, after_tus;
+    if (is_header_path(options.path)) {
+      for (const auto &context : catalog.compile_contexts(before_path, before_revision))
+        before_tus.insert(context.translation_unit);
+      for (const auto &context : catalog.compile_contexts(after_path, after_revision))
+        after_tus.insert(context.translation_unit);
     }
+    if (unit.value("file_exists_before", true))
+      schedule_endpoint(before_revision, before_path, after_tus);
+    if (unit.value("file_exists_after", true))
+      schedule_endpoint(after_revision, after_path, before_tus);
+  }
   const auto resolved = run_process(
       {"git", "-C", path_to_utf8(options.repository), "rev-parse", options.ref});
   if (resolved.exit_code != 0)
@@ -533,7 +617,81 @@ nlohmann::json plan_file_history(Catalog &catalog,
   while (!current_revision.empty() &&
          (current_revision.back() == '\n' || current_revision.back() == '\r'))
     current_revision.pop_back();
-  schedule_endpoint(current_revision, options.path);
+  schedule_endpoint(current_revision, options.path, {});
+  nlohmann::json header_observation_matrix = nlohmann::json::array();
+  if (is_header_path(options.path)) {
+    for (const auto &unit : selected) {
+      const auto before_revision = unit.value("base_commit", std::string{});
+      const auto after_revision = unit.value("head_commit", std::string{});
+      const auto before_path = unit.value("file_path_before", options.path);
+      const auto after_path = unit.value("file_path_after", options.path);
+      const auto before_contexts = unit.value("file_exists_before", true)
+                                       ? catalog.compile_contexts(before_path, before_revision)
+                                       : std::vector<CompileContext>{};
+      const auto after_contexts = unit.value("file_exists_after", true)
+                                      ? catalog.compile_contexts(after_path, after_revision)
+                                      : std::vector<CompileContext>{};
+      std::map<std::string, CompileContext> before_by_family, after_by_family;
+      for (const auto &context : before_contexts)
+        before_by_family[observation_family(context)] = context;
+      for (const auto &context : after_contexts)
+        after_by_family[observation_family(context)] = context;
+      std::set<std::string> families;
+      for (const auto &[family, ignored] : before_by_family) {
+        (void)ignored;
+        families.insert(family);
+      }
+      for (const auto &[family, ignored] : after_by_family) {
+        (void)ignored;
+        families.insert(family);
+      }
+      for (const auto &family : families) {
+        if (!before_by_family.contains(family) && after_by_family.contains(family))
+          for (const auto &context : catalog.compile_contexts(
+                   after_by_family.at(family).translation_unit, before_revision))
+            if (observation_family(context) == family) {
+              before_by_family[family] = context;
+              break;
+            }
+        if (!after_by_family.contains(family) && before_by_family.contains(family))
+          for (const auto &context : catalog.compile_contexts(
+                   before_by_family.at(family).translation_unit, after_revision))
+            if (observation_family(context) == family) {
+              after_by_family[family] = context;
+              break;
+            }
+      }
+      for (const auto &family : families) {
+        const auto before = before_by_family.find(family);
+        const auto after = after_by_family.find(family);
+        const auto complete_context = [](const auto &found, const auto &end) {
+          return found != end && found->second.inventory_complete &&
+                 found->second.dependency_map_complete;
+        };
+        const bool before_complete = complete_context(before, before_by_family.end());
+        const bool after_complete = complete_context(after, after_by_family.end());
+        header_observation_matrix.push_back(
+            {{"integration_unit_id", unit.value("integration_unit_id", std::string{})},
+             {"context_family", stable_hash(family)},
+             {"translation_unit", before != before_by_family.end()
+                                      ? before->second.translation_unit
+                                      : after->second.translation_unit},
+             {"before", {{"revision", before_revision},
+                         {"context_id", before != before_by_family.end()
+                                            ? before->second.context_id : std::string{}},
+                         {"status", before_complete ? "expected" : "missing"}}},
+             {"after", {{"revision", after_revision},
+                        {"context_id", after != after_by_family.end()
+                                           ? after->second.context_id : std::string{}},
+                        {"status", after_complete ? "expected" : "missing"}}}});
+        if ((!before_revision.empty() && unit.value("file_exists_before", true) && !before_complete) ||
+            (unit.value("file_exists_after", true) && !after_complete))
+          gaps.push_back({{"kind", "header_observation_matrix_incomplete"},
+                          {"integration_unit_id", unit.value("integration_unit_id", std::string{})},
+                          {"context_family", stable_hash(family)}});
+      }
+    }
+  }
   if (options.scope == "semantic" && semantic_map_missing)
     gaps.push_back(
         {{"kind", "semantic_dependency_map_incomplete"},
@@ -562,6 +720,7 @@ nlohmann::json plan_file_history(Catalog &catalog,
       {"change_unit_count", selected.size()},
       {"change_units", page},
       {"analysis", std::move(analysis)},
+      {"header_observation_matrix", std::move(header_observation_matrix)},
       {"path_segments", path_segments},
       {"scheduled_tasks", scheduled},
       {"completed_tasks", complete},

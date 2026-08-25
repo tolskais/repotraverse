@@ -232,11 +232,322 @@ nlohmann::json QueryService::fail_request(const std::string &request_id,
 }
 
 nlohmann::json QueryService::execute(const nlohmann::json &request) const {
+  auto response = execute_impl(request);
+  const auto query = request.value("query", std::string{});
+  if (!query.starts_with("tool.")) return response;
+  response["operation"] = query.substr(5);
+  const auto result_status = response.value("result_status", std::string{});
+  response["status"] = !response.value("ok", false) ? "failed"
+                         : result_status.empty() ? "complete" : result_status;
+  if (!response.contains("facts")) response["facts"] = nlohmann::json::object();
+  if (!response.contains("inference"))
+    response["inference"] = {{"accepted", nlohmann::json::array()},
+                             {"conflicts", nlohmann::json::array()}};
+  else if (response.at("inference").is_array())
+    response["inference"] = {{"accepted", response.at("inference")},
+                             {"conflicts", nlohmann::json::array()}};
+  if (response.at("inference").is_object()) {
+    if (!response["inference"].contains("accepted"))
+      response["inference"]["accepted"] = nlohmann::json::array();
+    if (!response["inference"].contains("conflicts"))
+      response["inference"]["conflicts"] = nlohmann::json::array();
+  }
+  if (!response.contains("coverage"))
+    response["coverage"] = {{"status", response.at("status")},
+                            {"capabilities", nlohmann::json::array()},
+                            {"gaps", nlohmann::json::array()}};
+  response["provenance"] = {
+      {"snapshot_id", response.value("snapshot_id", std::string{})}};
+  response["pending_work"] = response.value("pending_work", nlohmann::json::array());
+  if (!response.contains("continuation"))
+    response["continuation"] = response.at("facts").contains("continuation")
+                                   ? response.at("facts").at("continuation")
+                                   : nlohmann::json(nullptr);
+  return response;
+}
+
+nlohmann::json QueryService::execute_impl(const nlohmann::json &request) const {
   try {
     if (request.value("schema_version", 0U) != kSchemaVersion)
       throw std::runtime_error("unsupported request schema");
     const auto &params = parameters(request);
     const auto query = request.value("query", std::string{});
+    if (query == "tool.repository-changes" || query == "tool.history-summary" ||
+        query == "tool.change-unit") {
+      HistoryPlanOptions options;
+      options.repository = path_parameter(params, "repository");
+      options.ref = params.value("ref", std::string{"HEAD"});
+      options.repository_id = params.value("repository_id", std::string{});
+      options.start_exclusive = params.value("start_exclusive", std::string{});
+      if (params.contains("pr_facts"))
+        options.pr_facts = path_parameter(params, "pr_facts");
+      const auto nonce = std::to_string(
+          std::chrono::steady_clock::now().time_since_epoch().count());
+      options.output = (catalog_ ? catalog_->root() : std::filesystem::temp_directory_path()) /
+                       ("history-plan-" + stable_hash(nonce) + ".jsonl");
+      std::filesystem::path imported_pr_facts;
+      if (options.pr_facts.empty() && catalog_ && params.contains("repository_id")) {
+        const auto imports = catalog_->pr_imports(
+            params.at("repository_id").get<std::string>());
+        if (!imports.empty()) {
+          imported_pr_facts = options.output;
+          imported_pr_facts += ".pr-imports";
+          std::ofstream imported(imported_pr_facts);
+          if (!imported) throw std::runtime_error("cannot materialize cached PR imports");
+          for (auto record : imports) {
+            record.erase("import_id");
+            record.erase("knowledge_commit");
+            imported << canonical_json(record);
+          }
+          options.pr_facts = imported_pr_facts;
+        }
+      }
+      struct RemovePlan {
+        std::filesystem::path path, imports;
+        ~RemovePlan() {
+          std::error_code ignored;
+          std::filesystem::remove(path, ignored);
+          std::filesystem::remove(imports, ignored);
+        }
+      } remove_plan{options.output, imported_pr_facts};
+      const auto plan_summary = write_history_plan(options);
+      std::ifstream input(options.output);
+      nlohmann::json units = nlohmann::json::array();
+      nlohmann::json plan_header, summary;
+      std::map<std::string, std::size_t> file_touches;
+      std::string line;
+      while (std::getline(input, line)) {
+        if (line.empty()) continue;
+        auto record = nlohmann::json::parse(line);
+        const auto type = record.value("record_type", std::string{});
+        if (type == "history_plan") plan_header = std::move(record);
+        else if (type == "history_plan_summary") summary = std::move(record);
+        else if (type == "integration_unit") {
+          for (const auto &change : record.value("changes", nlohmann::json::array()))
+            ++file_touches[change.value("path", std::string{})];
+          units.push_back(std::move(record));
+        }
+      }
+      if (query == "tool.change-unit") {
+        const auto wanted = params.value("integration_unit_id", std::string{});
+        nlohmann::json found;
+        for (const auto &unit : units)
+          if (unit.value("integration_unit_id", std::string{}) == wanted) {
+            found = unit;
+            break;
+          }
+        if (found.is_null()) throw std::runtime_error("integration unit not found");
+        return {{"schema_version", kSchemaVersion}, {"ok", true},
+                {"result_status", "complete"}, {"facts", found},
+                {"inference", nlohmann::json::array()}};
+      }
+      nlohmann::json files = nlohmann::json::array();
+      for (const auto &[path, touches] : file_touches)
+        if (!path.empty()) files.push_back({{"path", path}, {"integration_unit_touches", touches}});
+      std::sort(files.begin(), files.end(), [](const auto &left, const auto &right) {
+        const auto lc = left.at("integration_unit_touches").template get<std::size_t>();
+        const auto rc = right.at("integration_unit_touches").template get<std::size_t>();
+        return lc != rc ? lc > rc : left.at("path") < right.at("path");
+      });
+      const auto total_files = files.size();
+      const auto file_limit = std::clamp<std::size_t>(
+          params.value("file_limit", std::size_t{100}), 1, 1000);
+      if (files.size() > file_limit) files.erase(files.begin() + file_limit, files.end());
+      const auto pinned_head = summary.value("resolved_head", std::string{});
+      if (params.contains("pinned_head") &&
+          params.at("pinned_head").get<std::string>() != pinned_head)
+        throw std::runtime_error("history ref moved since the requested page was pinned");
+      const auto offset = params.value("offset", std::size_t{});
+      const auto limit = std::clamp<std::size_t>(params.value("limit", std::size_t{100}), 1, 1000);
+      nlohmann::json page = nlohmann::json::array();
+      for (std::size_t index = offset; index < units.size() && page.size() < limit; ++index)
+        page.push_back(units[index]);
+      nlohmann::json facts = {{"plan", plan_header}, {"summary", summary},
+                              {"planner", plan_summary}, {"pinned_head", pinned_head},
+                              {"files_by_change_count", files},
+                              {"file_count", total_files},
+                              {"files_truncated", total_files > files.size()}};
+      if (query == "tool.repository-changes") facts["integration_units"] = std::move(page);
+      facts["continuation"] = query == "tool.repository-changes" &&
+                                      offset + page.size() < units.size()
+                                  ? nlohmann::json{{"offset", offset + page.size()},
+                                                   {"pinned_head", pinned_head}}
+                                  : nlohmann::json(nullptr);
+      return {{"schema_version", kSchemaVersion}, {"ok", true},
+              {"result_status", "complete"}, {"facts", std::move(facts)},
+              {"inference", nlohmann::json::array()},
+              {"coverage", {{"status", "complete"},
+                            {"capabilities", {"git_integration_units", "file_change_counts"}},
+                            {"gaps", nlohmann::json::array()}}}};
+    }
+    if (query == "tool.symbol-search" || query == "tool.symbol-history") {
+      if (!catalog_) throw std::runtime_error(query + " requires service catalog");
+      const auto repository_id = params.value("repository_id", std::string{});
+      const auto revision = query == "tool.symbol-history"
+                                ? std::string{}
+                                : params.value("revision", std::string{});
+      if (repository_id.empty() || !params.contains("selector"))
+        throw std::runtime_error(query + " requires repository_id and selector");
+      const auto maximum = std::clamp<std::size_t>(
+          params.value("maximum", std::size_t{100}), 1, 10000);
+      auto result = catalog_->symbol_search(repository_id, revision,
+                                            params.at("selector"), maximum);
+      return {{"schema_version", kSchemaVersion}, {"ok", true},
+              {"result_status", "complete"},
+              {"snapshot_id", catalog_->snapshot_id()},
+              {"facts", result}, {"inference", nlohmann::json::array()},
+              {"coverage", {{"status", "complete"},
+                            {"capabilities", {"compiler_symbols"}},
+                            {"gaps", nlohmann::json::array()}}}};
+    }
+    if (query == "tool.file-symbols") {
+      if (!catalog_) throw std::runtime_error("tool.file-symbols requires service catalog");
+      const auto repository_id = params.value("repository_id", std::string{});
+      const auto revision = params.value("revision", std::string{});
+      const auto path = params.value("path", std::string{});
+      if (repository_id.empty() || revision.empty() || path.empty())
+        throw std::runtime_error("tool.file-symbols requires repository_id, revision, and path");
+      const auto maximum = std::clamp<std::size_t>(
+          params.value("maximum", std::size_t{1000}), 1, 10000);
+      auto facts = catalog_->file_symbols(repository_id, revision, path, maximum);
+      const auto contexts = catalog_->compile_contexts(path, revision);
+      nlohmann::json observations = nlohmann::json::array();
+      bool inventory_complete = !contexts.empty();
+      for (const auto &context : contexts) {
+        observations.push_back({{"inventory_id", context.inventory_id},
+                                {"context_id", context.context_id},
+                                {"translation_unit", context.translation_unit},
+                                {"build_variant", context.build_variant},
+                                {"inventory_complete", context.inventory_complete},
+                                {"dependency_map_complete", context.dependency_map_complete}});
+        inventory_complete = inventory_complete && context.inventory_complete &&
+                             context.dependency_map_complete;
+      }
+      facts["translation_unit_observations"] = std::move(observations);
+      facts["inventory_complete"] = inventory_complete;
+      return {{"schema_version", kSchemaVersion}, {"ok", true},
+              {"result_status", inventory_complete ? "complete" : "partial"},
+              {"snapshot_id", catalog_->snapshot_id()}, {"facts", facts},
+              {"inference", nlohmann::json::array()},
+              {"coverage", {{"status", inventory_complete ? "complete" : "partial"},
+                            {"capabilities", {"compiler_symbols", "including_translation_units"}},
+                            {"gaps", inventory_complete ? nlohmann::json::array()
+                                                        : nlohmann::json::array({"declared inventory or dependency map is incomplete"})}}}};
+    }
+    if (query == "tool.symbol-relations") {
+      if (!catalog_) throw std::runtime_error("tool.symbol-relations requires service catalog");
+      const auto repository_id = params.value("repository_id", std::string{});
+      const auto revision = params.value("revision", std::string{});
+      if (!params.contains("element_ids") || !params.at("element_ids").is_array())
+        throw std::runtime_error("tool.symbol-relations requires element_ids");
+      auto facts = catalog_->semantic_dependents(
+          repository_id, revision,
+          params.at("element_ids").get<std::vector<std::string>>(),
+          std::clamp<std::size_t>(params.value("maximum", std::size_t{1000}), 1, 100000));
+      return {{"schema_version", kSchemaVersion}, {"ok", true},
+              {"result_status", facts.value("truncated", false) ? "partial" : "complete"},
+              {"snapshot_id", catalog_->snapshot_id()}, {"facts", facts},
+              {"inference", nlohmann::json::array()}};
+    }
+    if (query == "tool.inference-get") {
+      if (!catalog_) throw std::runtime_error("tool.inference-get requires service catalog");
+      const auto transition_id = params.value("transition_id", std::string{});
+      if (transition_id.empty()) throw std::runtime_error("transition_id is required");
+      return {{"schema_version", kSchemaVersion}, {"ok", true},
+              {"result_status", "complete"},
+              {"facts", {{"transition_id", transition_id}}},
+              {"inference", catalog_->inference_for_transition(
+                  transition_id, params.value("include_unreviewed", false))}};
+    }
+    if (query == "tool.claim-propose") {
+      if (!catalog_) throw std::runtime_error("tool.claim-propose requires service catalog");
+      if (!params.contains("claim")) throw std::runtime_error("claim is required");
+      auto claim = params.at("claim").get<InferenceClaim>();
+      if (claim.producer_id.empty()) claim.producer_id = catalog_->producer_id();
+      for (const auto &receipt_id : claim.evidence_receipt_ids) {
+        const auto receipt = catalog_->receipt(receipt_id);
+        if (!receipt)
+          throw std::runtime_error("claim references an unknown evidence receipt");
+        if (receipt->transition_id != claim.transition_id)
+          throw std::runtime_error("claim evidence receipt targets another transition");
+      }
+      if (claim.claim_id.empty()) {
+        auto identity = nlohmann::json(claim);
+        identity.erase("claim_id");
+        claim.claim_id = stable_hash(canonical_json(identity));
+      }
+      nlohmann::json publication = coordinator_
+                                       ? coordinator_->publish_inference_claim(claim)
+                                       : nlohmann::json{{"state", "local_only"}};
+      return {{"schema_version", kSchemaVersion}, {"ok", true},
+              {"result_status", "complete"},
+              {"facts", nlohmann::json::object()},
+              {"inference", {{"proposal", claim}, {"review_state", "unreviewed"},
+                             {"publication", publication}}}};
+    }
+    if (query == "tool.receipt-put" || query == "tool.receipt-get") {
+      if (!catalog_) throw std::runtime_error(query + " requires service catalog");
+      if (query == "tool.receipt-put") {
+        if (!params.contains("receipt")) throw std::runtime_error("receipt is required");
+        auto receipt = params.at("receipt").get<EvidenceReceipt>();
+        if (receipt.producer_id.empty()) receipt.producer_id = catalog_->producer_id();
+        if (receipt.receipt_id.empty()) {
+          auto identity = nlohmann::json(receipt);
+          identity.erase("receipt_id");
+          receipt.receipt_id = stable_hash(canonical_json(identity));
+        }
+        nlohmann::json publication = coordinator_
+                                         ? coordinator_->publish_receipt(receipt)
+                                         : nlohmann::json{{"state", "local_only"}};
+        return {{"schema_version", kSchemaVersion}, {"ok", true},
+                {"result_status", "complete"},
+                {"facts", {{"receipt", receipt}, {"publication", publication}}},
+                {"inference", nlohmann::json::array()}};
+      }
+      const auto receipt = catalog_->receipt(params.value("receipt_id", std::string{}));
+      if (!receipt) throw std::runtime_error("evidence receipt not found");
+      return {{"schema_version", kSchemaVersion}, {"ok", true},
+              {"result_status", "complete"}, {"facts", *receipt},
+              {"inference", nlohmann::json::array()}};
+    }
+    if (query == "tool.claim-verify") {
+      if (!catalog_ || !coordinator_)
+        throw std::runtime_error("tool.claim-verify requires coordinated service");
+      if (!params.contains("decision")) throw std::runtime_error("decision is required");
+      auto decision = params.at("decision").get<KnowledgeDecision>();
+      if (decision.decision_id.empty()) {
+        auto identity = nlohmann::json(decision);
+        identity.erase("decision_id");
+        decision.decision_id = stable_hash(canonical_json(identity));
+      }
+      const auto publication = coordinator_->publish_knowledge_decision(decision);
+      return {{"schema_version", kSchemaVersion}, {"ok", true},
+              {"result_status", "complete"},
+              {"facts", {{"publication", publication}}},
+              {"inference", {{"decision", decision}}}};
+    }
+    if (query == "tool.pr-import") {
+      if (!catalog_ || !coordinator_)
+        throw std::runtime_error("tool.pr-import requires coordinated service");
+      if (!params.contains("records") || !params.at("records").is_array())
+        throw std::runtime_error("tool.pr-import requires records");
+      nlohmann::json publications = nlohmann::json::array();
+      for (const auto &record : params.at("records")) {
+        if (!record.is_object() || record.value("repository_id", std::string{}).empty() ||
+            record.value("source", std::string{}).empty())
+          throw std::runtime_error("each PR import requires repository_id and source provenance");
+        publications.push_back(coordinator_->publish_pr_import(record));
+      }
+      return {{"schema_version", kSchemaVersion}, {"ok", true},
+              {"result_status", "complete"},
+              {"facts", {{"imported", publications.size()},
+                         {"publications", publications}}},
+              {"inference", nlohmann::json::array()}};
+    }
+    if (query == "tool.request-status") {
+      return request_status(params.value("request_id", std::string{}),
+                            params.value("refresh", false));
+    }
     if (query == "work.run") {
       if (!worker_)
         return {{"schema_version", kSchemaVersion},
@@ -292,6 +603,7 @@ nlohmann::json QueryService::execute(const nlohmann::json &request) const {
       if (params.contains("pr_facts"))
         options.pr_facts = path_parameter(params, "pr_facts");
       options.ref = params.value("ref", std::string{"HEAD"});
+      options.repository_id = params.value("repository_id", std::string{});
       options.path = params.value("path", std::string{});
       options.scope = params.value("scope", std::string{"direct"});
       if (worker_)
@@ -525,7 +837,9 @@ nlohmann::json QueryService::execute(const nlohmann::json &request) const {
                  "accepted", relation->author, relation->reviewer});
         }
       }
-      auto result = trace_transition(before, after, assertions);
+      auto result = trace_transition(
+          before, after, assertions,
+          params.value("integration_unit_id", std::string{}));
       result.reviewed_relations = std::move(reviewed);
       return {{"schema_version", kSchemaVersion},
               {"ok", true},
@@ -640,83 +954,6 @@ nlohmann::json QueryService::execute(const nlohmann::json &request) const {
           {"coverage", coverage},
           {"result",
            {{"bundle_count", bundles.size()}, {"elements", std::move(rows)}}}};
-    }
-    if (query == "element.explain") {
-      const auto report = nlohmann::json::parse(
-          read_text_file(path_parameter(params, "report")).text);
-      if (report.value("schema_version", 0U) != kSchemaVersion ||
-          !report.contains("elements") || !report.at("elements").is_array())
-        throw std::runtime_error(
-            "element.explain requires a v1 stability report");
-      const auto wanted_id =
-          params.value("historical_element_id", std::string{});
-      const auto wanted_name = params.value("current_name", std::string{});
-      if (wanted_id.empty() && wanted_name.empty())
-        throw std::runtime_error(
-            "element.explain requires historical_element_id or current_name");
-      nlohmann::json matches = nlohmann::json::array();
-      for (const auto &element : report.at("elements"))
-        if ((!wanted_id.empty() && element.value("historical_element_id",
-                                                 std::string{}) == wanted_id) ||
-            (!wanted_name.empty() &&
-             element.value("current_name", std::string{}) == wanted_name))
-          matches.push_back(
-              {{"identity",
-                {{"historical_element_id",
-                  element.value("historical_element_id", std::string{})},
-                 {"current_name", element.value("current_name", std::string{})},
-                 {"kind", element.value("kind", std::string{})},
-                 {"path", element.value("path", std::string{})},
-                 {"configuration",
-                  element.value("configuration", std::string{})},
-                 {"build_variant",
-                  element.value("build_variant", BuildVariant{})}}},
-               {"classification",
-                element.value("classification", std::string{})},
-               {"historical_facts",
-                {{"observed_versions", element.value("observed_versions", 0U)},
-                 {"observable_transitions",
-                  element.value("observable_transitions", 0U)},
-                 {"implementation_changes",
-                  element.value("implementation_changes", 0U)},
-                 {"interface_changes", element.value("interface_changes", 0U)},
-                 {"dependency_changes",
-                  element.value("dependency_changes", 0U)},
-                 {"moves", element.value("moves", 0U)},
-                 {"renames", element.value("renames", 0U)},
-                 {"ambiguous_transitions",
-                  element.value("ambiguous_transitions", 0U)},
-                 {"change_units", element.value("change_units", 0U)},
-                 {"authors", element.value("authors", 0U)}}},
-               {"lifetime",
-                {{"added_at", element.value("added_at", std::string{})},
-                 {"last_observed_at",
-                  element.value("last_observed_at", std::string{})},
-                 {"removed_at", element.value("removed_at", std::string{})},
-                 {"last_semantic_change",
-                  element.value("last_semantic_change", std::string{})}}},
-               {"git_touches",
-                {{"file", element.value("file_git_touches", 0U)},
-                 {"direct", element.value("direct_git_touches", nullptr)},
-                 {"coverage",
-                  element.value("fact_coverage", nlohmann::json::object())}}},
-               {"score",
-                {{"volatility", element.value("volatility_score", 0.0)},
-                 {"implementation", element.value("implementation_score", 0.0)},
-                 {"interface",
-                  element.value("interface_instability_score", 0.0)},
-                 {"structural",
-                  element.value("structural_volatility_score", 0.0)}}},
-               {"evidence_gaps",
-                element.value("evidence_gaps", std::vector<std::string>{})}});
-      if (matches.empty())
-        throw std::runtime_error("historical element was not found in report");
-      return {{"schema_version", kSchemaVersion},
-              {"ok", true},
-              {"result_status", "complete"},
-              {"result",
-               {{"policy", report.value("policy", nlohmann::json::object())},
-                {"matches", std::move(matches)}}}};
     }
     if (query == "analysis.coverage") {
       const auto bundle = store_->load(path_parameter(params, "bundle"));

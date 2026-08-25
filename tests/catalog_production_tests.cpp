@@ -77,6 +77,8 @@ TEST_CASE("production catalog operations remain durable and consistent") {
     source.compiler_id = "source";
     target.compiler_id = "target";
     source.kind = target.kind = "function";
+    source.qualified_name = "fixture::source";
+    target.qualified_name = "fixture::target";
     source.linkage = target.linkage = "external";
     source.owner_file = target.owner_file = "source.cpp";
     source.element_id = history::stable_hash("main\nexternal\n\nsource");
@@ -93,8 +95,8 @@ TEST_CASE("production catalog operations remain durable and consistent") {
     manifest.elements = {source, target};
     manifest.variants = {source_variant, target_variant};
     manifest.observations = {
-        {source.element_id, source_variant.variant_id, source_location},
-        {target.element_id, target_variant.variant_id, target_location}};
+        {source.element_id, source_variant.variant_id, source_location, {}},
+        {target.element_id, target_variant.variant_id, target_location, {}}};
     const nlohmann::json identity = {
         {"repository", manifest.repository_id},
         {"revision", manifest.source_revision},
@@ -114,6 +116,47 @@ TEST_CASE("production catalog operations remain durable and consistent") {
                 dependents.at("dependents").front().at("element_id") ==
                     source.element_id,
             "reverse semantic dependency was not indexed");
+    const auto symbols = catalog.symbol_search(
+        "main", "revision", {{"name", "fixture::"}, {"match", "prefix"}});
+    require(symbols.at("symbols").size() == 2,
+            "compiler symbols were not indexed for investigation");
+
+    history::EvidenceReceipt receipt;
+    receipt.repository_id = "main";
+    receipt.transition_id = "transition-1";
+    receipt.result_digest = "result-digest";
+    auto receipt_identity = nlohmann::json(receipt);
+    receipt_identity.erase("receipt_id");
+    receipt.receipt_id = history::stable_hash(history::canonical_json(receipt_identity));
+    catalog.store_receipt(receipt);
+    history::InferenceClaim claim;
+    claim.repository_id = "main";
+    claim.transition_id = "transition-1";
+    claim.categories = {"new_requirement"};
+    claim.summary = "The API changed to support the new caller.";
+    claim.model = "fixture-model";
+    claim.prompt_digest = "prompt-digest";
+    claim.input_digest = "input-digest";
+    claim.producer_id = "fixture-producer";
+    claim.evidence_receipt_ids = {receipt.receipt_id};
+    auto claim_identity = nlohmann::json(claim);
+    claim_identity.erase("claim_id");
+    claim.claim_id = history::stable_hash(history::canonical_json(claim_identity));
+    catalog.store_inference_claim(claim);
+    REQUIRE(catalog.inference_for_transition("transition-1")
+                .at("accepted")
+                .empty());
+    history::KnowledgeDecision decision;
+    decision.claim_id = claim.claim_id;
+    decision.state = "accepted";
+    decision.reviewer = "reviewer";
+    auto decision_identity = nlohmann::json(decision);
+    decision_identity.erase("decision_id");
+    decision.decision_id = history::stable_hash(history::canonical_json(decision_identity));
+    catalog.store_knowledge_decision(decision, "knowledge-commit");
+    REQUIRE(catalog.inference_for_transition("transition-1")
+                .at("accepted")
+                .size() == 1);
 }
 
 TEST_CASE("v1 catalog reopens with its identity and request state intact") {

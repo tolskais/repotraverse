@@ -204,7 +204,7 @@ void test_production_config_validation() {
       {{"schema_version", history::kSchemaVersion},
        {"repository_id", "device-main"},
        {"catalog", "catalog"},
-       {"artifact_repository", "artifacts"}});
+       {"analysis_repository", "analysis"}});
   require(config.listen_address == "127.0.0.1", "loopback default changed");
   require(config.workspace_mode == "auto" &&
               config.workspace_max_revisions == 2 &&
@@ -215,7 +215,7 @@ void test_production_config_validation() {
     history::parse_service_config({{"schema_version", history::kSchemaVersion},
                                    {"repository_id", "device-main"},
                                    {"catalog", "catalog"},
-                                   {"artifact_repository", "artifacts"},
+                                   {"analysis_repository", "analysis"},
                                    {"listen_address", "0.0.0.0"}});
   } catch (const std::invalid_argument &) {
     rejected = true;

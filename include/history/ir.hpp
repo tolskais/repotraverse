@@ -77,6 +77,9 @@ struct CompileContext {
   std::vector<std::string> project_files;
   std::string toolchain, adapter_version;
   Coverage coverage;
+  std::string inventory_id, toolchain_fingerprint,
+      generated_inputs_fingerprint;
+  bool inventory_complete{}, dependency_map_complete{};
 };
 
 struct LogicalElement {
@@ -93,6 +96,44 @@ struct SemanticVariant {
 struct ElementObservation {
   std::string element_id, variant_id;
   SourceAnchor location;
+  std::string observation_id;
+};
+
+struct EvidenceReference {
+  std::string kind, id, revision, path;
+};
+
+struct OriginEvidence {
+  std::string kind;
+  std::vector<EvidenceReference> evidence;
+  std::vector<std::string> causes;
+  std::uint32_t dependency_depth{};
+  std::string confidence{"exact"};
+  Coverage coverage;
+};
+
+struct EvidenceReceipt {
+  std::uint32_t schema_version{kSchemaVersion};
+  std::string receipt_id, repository_id, integration_unit_id, transition_id,
+      source_before, source_after, investigation_scope, inventory_fingerprint,
+      context_fingerprint, toolchain_fingerprint, generated_inputs_fingerprint,
+      extractor_fingerprint, result_digest, producer_id;
+  Coverage coverage;
+};
+
+struct InferenceClaim {
+  std::uint32_t schema_version{kSchemaVersion};
+  std::string claim_id, repository_id, transition_id,
+      predicate{"modification_reason"}, summary, model, prompt_digest,
+      input_digest, producer_id;
+  std::vector<std::string> categories, evidence_receipt_ids,
+      supersedes_claim_ids;
+  double confidence{};
+};
+
+struct KnowledgeDecision {
+  std::uint32_t schema_version{kSchemaVersion};
+  std::string decision_id, claim_id, state, reviewer, rationale;
 };
 
 struct MacroExpansion {
@@ -157,6 +198,16 @@ void to_json(nlohmann::json &, const SemanticVariant &);
 void from_json(const nlohmann::json &, SemanticVariant &);
 void to_json(nlohmann::json &, const ElementObservation &);
 void from_json(const nlohmann::json &, ElementObservation &);
+void to_json(nlohmann::json &, const EvidenceReference &);
+void from_json(const nlohmann::json &, EvidenceReference &);
+void to_json(nlohmann::json &, const OriginEvidence &);
+void from_json(const nlohmann::json &, OriginEvidence &);
+void to_json(nlohmann::json &, const EvidenceReceipt &);
+void from_json(const nlohmann::json &, EvidenceReceipt &);
+void to_json(nlohmann::json &, const InferenceClaim &);
+void from_json(const nlohmann::json &, InferenceClaim &);
+void to_json(nlohmann::json &, const KnowledgeDecision &);
+void from_json(const nlohmann::json &, KnowledgeDecision &);
 void to_json(nlohmann::json &, const MacroExpansion &);
 void from_json(const nlohmann::json &, MacroExpansion &);
 void to_json(nlohmann::json &, const TuManifest &);

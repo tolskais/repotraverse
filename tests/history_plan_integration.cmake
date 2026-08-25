@@ -39,12 +39,26 @@ file(WRITE "${repository}/DIRECT.txt" "not associated with a PR\n")
 run_git(add DIRECT.txt)
 run_git(commit -m "Direct maintenance commit")
 
+file(WRITE "${repository}/temporary.txt" "temporary\n")
+run_git(add temporary.txt)
+run_git(commit -m "Add temporary file")
+execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${repository}" rev-parse HEAD
+    OUTPUT_VARIABLE fifth OUTPUT_STRIP_TRAILING_WHITESPACE)
+file(REMOVE "${repository}/temporary.txt")
+run_git(add temporary.txt)
+run_git(commit -m "Remove temporary file")
+execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${repository}" rev-parse HEAD
+    OUTPUT_VARIABLE sixth OUTPUT_STRIP_TRAILING_WHITESPACE)
+
 file(WRITE "${pr_facts}"
     "{\"commit\":\"${first}\",\"pr_mapping_status\":\"no_pr\","
     "\"source\":\"bitbucket_data_center_api\"}\n"
     "{\"pr_id\":42,\"title\":\"Rename and document source\","
     "\"state\":\"MERGED\",\"source\":\"bitbucket_data_center_api\","
-    "\"result_commit\":\"${third}\",\"associated_commits\":[\"${second}\"]}\n")
+    "\"result_commit\":\"${third}\",\"associated_commits\":[\"${second}\"]}\n"
+    "{\"pr_id\":99,\"title\":\"Empty net change\","
+    "\"state\":\"MERGED\",\"source\":\"bitbucket_data_center_api\","
+    "\"result_commit\":\"${sixth}\",\"associated_commits\":[\"${fifth}\"]}\n")
 file(TO_CMAKE_PATH "${repository}" repository_json)
 file(TO_CMAKE_PATH "${plan}" plan_json)
 file(TO_CMAKE_PATH "${pr_facts}" pr_facts_json)
@@ -59,9 +73,9 @@ if(NOT result EQUAL 0)
     message(FATAL_ERROR "history.plan query failed: ${response}")
 endif()
 foreach(expected
-        "\"commit_count\":4"
-        "\"change_unit_count\":3"
-        "\"pr_identified_commits\":2"
+        "\"commit_count\":6"
+        "\"change_unit_count\":4"
+        "\"pr_identified_commits\":4"
         "\"pr_no_pr_commits\":1"
         "\"pr_unknown_commits\":1")
     string(FIND "${response}" "${expected}" found)
@@ -82,7 +96,7 @@ execute_process(COMMAND "${REPOTRAVERSE}" query --request "${request}"
 if(NOT result EQUAL 0)
     message(FATAL_ERROR "partial history.plan query failed: ${response}")
 endif()
-foreach(expected "\"commit_count\":3" "\"change_unit_count\":2")
+foreach(expected "\"commit_count\":5" "\"change_unit_count\":3")
     string(FIND "${response}" "${expected}" found)
     if(found EQUAL -1)
         message(FATAL_ERROR "missing ${expected} from partial plan: ${response}")
@@ -91,7 +105,10 @@ endforeach()
 
 file(READ "${plan}" plan_contents)
 foreach(expected
-        "\"change_unit_id\":\"bitbucket-pr:42\""
+        "\"record_type\":\"integration_unit\""
+        "\"association_status\":\"confirmed_pr\""
+        "\"integration_unit_id\":"
+        "\"integrated_commits\":"
         "\"grouping_status\":\"no_pr\""
         "\"base_commit\":\"${first}\""
         "\"head_commit\":\"${third}\""
@@ -103,3 +120,7 @@ foreach(expected
         message(FATAL_ERROR "missing ${expected} in history plan")
     endif()
 endforeach()
+string(FIND "${plan_contents}" "\"net_changed_path_count\":0" empty_net)
+if(empty_net EQUAL -1)
+    message(FATAL_ERROR "empty-net PR integration unit was not retained")
+endif()

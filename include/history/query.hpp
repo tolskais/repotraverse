@@ -39,6 +39,7 @@ public:
                               const std::string &code) const;
 
 private:
+  nlohmann::json execute_impl(const nlohmann::json &request) const;
   std::shared_ptr<const FactStore> store_;
   std::shared_ptr<Catalog> catalog_;
   std::shared_ptr<GitCoordinator> coordinator_;

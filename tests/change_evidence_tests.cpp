@@ -81,8 +81,8 @@ history::TuManifest manifest(const std::string &revision,
   result.elements = {caller, api};
   result.variants = {caller_variant, api_variant};
   result.observations = {{caller.element_id, caller_variant.variant_id,
-                          definition},
-                         {api.element_id, api_variant.variant_id, declaration}};
+                          definition, {}},
+                         {api.element_id, api_variant.variant_id, declaration, {}}};
   return result;
 }
 

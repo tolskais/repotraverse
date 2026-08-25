@@ -14,7 +14,10 @@ namespace history {
 
 class Catalog {
 public:
-  explicit Catalog(std::filesystem::path root);
+  explicit Catalog(std::filesystem::path root,
+                   std::size_t maximum_cached_facts = 10000,
+                   std::uint64_t maximum_cached_fact_bytes =
+                       4ULL * 1024ULL * 1024ULL * 1024ULL);
   ~Catalog();
   Catalog(const Catalog &) = delete;
   Catalog &operator=(const Catalog &) = delete;
@@ -62,6 +65,25 @@ public:
       const std::string &repository_id, const std::string &revision,
       const std::vector<std::string> &element_ids,
       std::size_t maximum = 10000) const;
+  nlohmann::json symbol_search(const std::string &repository_id,
+                               const std::string &revision,
+                               const nlohmann::json &selector,
+                               std::size_t maximum = 100) const;
+  nlohmann::json file_symbols(const std::string &repository_id,
+                              const std::string &revision,
+                              const std::string &path,
+                              std::size_t maximum = 1000) const;
+  void store_receipt(const EvidenceReceipt &receipt);
+  std::optional<EvidenceReceipt> receipt(const std::string &receipt_id) const;
+  void store_inference_claim(const InferenceClaim &claim);
+  void store_knowledge_decision(const KnowledgeDecision &decision,
+                                const std::string &knowledge_commit);
+  nlohmann::json inference_for_transition(
+      const std::string &transition_id, bool include_unreviewed = false) const;
+  void store_pr_import(const std::string &import_id,
+                       const nlohmann::json &record,
+                       const std::string &source_commit = {});
+  nlohmann::json pr_imports(const std::string &repository_id) const;
   bool task_published(const std::string &task_id) const;
   void mark_task_published(const std::string &task_id);
   std::string snapshot_id() const;
@@ -74,6 +96,8 @@ private:
   std::string producer_id_;
   sqlite3 *database_{};
   mutable std::mutex mutex_;
+  std::size_t maximum_cached_facts_;
+  std::uint64_t maximum_cached_fact_bytes_;
 };
 
 } // namespace history

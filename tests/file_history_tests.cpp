@@ -130,7 +130,7 @@ int main() {
       manifest.elements = {element};
       manifest.variants = {variant};
       manifest.observations = {
-          {element.element_id, variant.variant_id, location}};
+          {element.element_id, variant.variant_id, location, {}}};
       manifest.manifest_id =
           history::stable_hash(manifest.source_revision + manifest.context_id);
       const auto task_id = task.at("task_id").get<std::string>();

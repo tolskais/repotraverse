@@ -1,7 +1,7 @@
 # Proof-of-concept runbook
 
 This runbook validates whether RepoTraverse produces useful and auditable historical
-element evidence on one real repository. It does not qualify classifier thresholds,
+element evidence on one real repository. It does not qualify stability conclusions,
 prove ten-year scale, or qualify ARMCC/ARMCLANG compatibility.
 
 ## Pre-PoC validation evidence
@@ -119,7 +119,7 @@ developers who know the architecture. For each candidate, distinguish:
 - context or dependency sensitivity rather than direct source variability;
 - lineage or extraction coverage failure;
 - partition mismatch; and
-- classifier-policy disagreement.
+- disagreements between reviewed interpretations and the reported facts.
 
 Weights and thresholds remain unchanged during the first review. The PoC succeeds when
 the factual evidence is reproducible, explainable, and useful enough to justify a larger
@@ -137,4 +137,4 @@ Expand from 20 revisions to a longer window only when:
 - developers find actionable variation leakage or stable-island evidence.
 
 ARMCC/ARMCLANG qualification, cross-TU revision aggregation, expected target/context
-absence, classifier calibration, and a 500K/ten-year capacity claim remain later gates.
+absence and a 500K/ten-year capacity claim remain later gates.

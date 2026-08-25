@@ -17,7 +17,6 @@
 #include "history/http.hpp"
 #include "history/process.hpp"
 #include "history/query.hpp"
-#include "history/stability.hpp"
 #include "history/telemetry.hpp"
 #include "history/worker.hpp"
 
@@ -42,8 +41,6 @@ nlohmann::json read_json(const std::filesystem::path &path) {
 
 nlohmann::json experiment_summary(const std::string &action,
                                   const nlohmann::json &result) {
-  if (action == "classify")
-    return result;
   nlohmann::json summary = {
       {"schema_version", result.value("schema_version", 1)},
       {"artifact_version", result.value("artifact_version", 1)},
@@ -115,10 +112,13 @@ int run_service(const std::filesystem::path &config_path,
       std::chrono::seconds(config.git_timeout_seconds));
   history::Telemetry::instance().configure(config.otlp_endpoint,
                                            config.otel_service_name);
-  auto catalog = std::make_shared<history::Catalog>(config.catalog);
+  auto catalog = std::make_shared<history::Catalog>(
+      config.catalog, config.local_cache_max_facts,
+      config.local_cache_max_bytes);
   history::CoordinationOptions coordination;
-  coordination.repository = config.artifact_repository;
+  coordination.repository = config.analysis_repository;
   coordination.remote = config.remote;
+  coordination.knowledge_ref = config.knowledge_ref;
   coordination.lease_seconds = config.lease_seconds;
   coordination.grace_seconds = config.grace_seconds;
   coordination.trusted_producers = config.trusted_producers;
@@ -274,8 +274,6 @@ int repotraverse_main(int argc, char **argv) {
   auto *capture = add_experiment("capture", "Capture build contexts");
   auto *head = add_experiment("head", "Analyze the head revision");
   auto *pilot = add_experiment("pilot", "Run progressive history analysis");
-  auto *classify =
-      add_experiment("classify", "Classify a completed experiment");
 
   std::string service_config;
   auto *serve = cli.add_subcommand("serve", "Run the local service");
@@ -318,6 +316,17 @@ int repotraverse_main(int argc, char **argv) {
   query->add_option("--endpoint", query_endpoint, "Service HTTP endpoint");
   query->add_option("--request", request_file, "Request file; defaults to stdin");
 
+  std::string tool_operation, tool_endpoint, tool_input;
+  auto *tool = cli.add_subcommand(
+      "tool", "Request repository facts or reviewed inference as JSON");
+  tool->add_option("operation", tool_operation,
+                   "Operation (for example file-symbols or symbol-search)")
+      ->required();
+  tool->add_option("--endpoint", tool_endpoint, "Service HTTP endpoint")
+      ->required();
+  tool->add_option("--input", tool_input,
+                   "JSON parameter file; use - for stdin");
+
   try {
     cli.parse(argc, argv);
   } catch (const CLI::ParseError &error) {
@@ -326,8 +335,7 @@ int repotraverse_main(int argc, char **argv) {
   }
 
   try {
-    if (capture->parsed() || head->parsed() || pilot->parsed() ||
-        classify->parsed()) {
+    if (capture->parsed() || head->parsed() || pilot->parsed()) {
       auto probe = std::filesystem::absolute(history::path_from_utf8(argv[0]))
                        .parent_path() /
                    "repotraverse-compiler-probe";
@@ -336,17 +344,14 @@ int repotraverse_main(int argc, char **argv) {
 #endif
       const auto action = capture->parsed()  ? std::string{"capture"}
                           : head->parsed()   ? std::string{"head"}
-                          : pilot->parsed()  ? std::string{"pilot"}
-                                             : std::string{"classify"};
+                          : std::string{"pilot"};
       const auto manifest = history::path_from_utf8(experiment_manifest);
       const auto result =
           action == "capture"
               ? history::run_capture_experiment(manifest, probe)
           : action == "head"
               ? history::run_head_experiment(manifest, probe)
-          : action == "pilot"
-              ? history::run_pilot_experiment(manifest, probe)
-              : history::run_stability_experiment(manifest);
+          : history::run_pilot_experiment(manifest, probe);
       std::cout << history::canonical_json(
                        full_output ? result
                                    : experiment_summary(action, result))
@@ -442,6 +447,22 @@ int repotraverse_main(int argc, char **argv) {
                     std::make_shared<history::MemoryFactStore>())
                     .execute(request)
               : history::http_query(query_endpoint, request);
+      std::cout << history::canonical_json(response);
+      return response.value("ok", false) ? 0 : 1;
+    }
+    if (tool->parsed()) {
+      nlohmann::json params = nlohmann::json::object();
+      if (tool_input == "-")
+        params = read_json(std::cin);
+      else if (!tool_input.empty())
+        params = read_json(history::path_from_utf8(tool_input));
+      if (!params.is_object())
+        throw std::runtime_error("tool input must be a JSON object");
+      const auto response = history::http_query(
+          tool_endpoint,
+          {{"schema_version", history::kSchemaVersion},
+           {"query", "tool." + tool_operation},
+           {"params", std::move(params)}});
       std::cout << history::canonical_json(response);
       return response.value("ok", false) ? 0 : 1;
     }

@@ -1,9 +1,7 @@
 # Production-oriented service operations
 
-These procedures cover deployment, coordination, and recovery of the v1 service. They
-do not assert that the experimental historical classifier is analytically complete.
-Multitarget element aggregation and validation in the real build environment remain
-promotion gates for historical conclusions.
+These procedures cover deployment, coordination, and recovery of the v1 service.
+Repotraverse supplies facts and reviewed interpretations, not stability conclusions.
 
 For the CLI experiment PoC, including separate output-directory rules and evidence
 collection, use [`poc-runbook.md`](poc-runbook.md).
@@ -20,9 +18,10 @@ Initialize each instance once with
 `repotraverse identity init --catalog C:\repotraverse\catalog`, record the
 generated producer ID, and place the IDs of permitted
 peer instances in `trusted_producers`. An empty production allowlist trusts only
-the local producer. Grant the artifact Git credentials access only to
-`repotraverse/tasks/`, `repotraverse/producers/`, and
-`repotraverse/claims/`. Register the service from an elevated shell:
+the local producer. Grant the analysis Git credentials access to
+`repotraverse/v1/coordination/tasks/`, `repotraverse/v1/coordination/results/`, and
+`repotraverse/v1/coordination/claims/`, plus the configured knowledge refs.
+Register the service from an elevated shell:
 
 ```powershell
 .\tools\install-service.ps1 -Config C:\repotraverse\service.json
@@ -44,8 +43,9 @@ use the CLI `work.retry` query only after correcting the cause.
 
 Non-v1 and unversioned prototype catalogs are deliberately unsupported.
 For catalog corruption, stop the service, preserve the directory for incident
-analysis, create a new catalog directory, and restart. Immutable results and
-accepted/rejected lineage reviews are re-imported from Git; build captures must
+analysis, create a new catalog directory, and restart. PR imports, receipts,
+inference proposals, decisions, and lineage reviews are re-imported from Git;
+compiler manifests are cache entries, and build captures must
 be re-imported because raw captures are intentionally not shared artifacts.
 Durable local request state should be included in catalog backups.
 
@@ -53,17 +53,16 @@ Durable local request state should be included in catalog backups.
 
 - Git unavailable: queries remain partial, tasks stay unpublished, and workers
   do not start them. Restore the remote and allow the coordination loop to retry.
-- Extractor timeout or output limit: the worker publishes a typed coverage gap
-  or retries according to task state; increase a limit only after capacity review.
+- Extractor timeout or output limit: the worker keeps retryable operational state;
+  increase a limit only after capacity review.
 - Disk pressure: the workspace pool evicts idle sparse revisions by byte and count
   limits. Full capture workspaces are temporary. If a revision cannot fit while
   preserving the configured reserve, it fails with `disk_space_insufficient`; reduce
   concurrency, increase the workspace volume, or provide complete dependency capture.
-  Never delete producer result refs.
+  Temporary result refs are pruned after the completed lease expires.
 - Progressive budget exhausted: retain `progressive-screening.v1.json` and the pilot
-  report. Git and syntax facts remain valid, but semantic history is partial and the
-  classifier must remain `insufficient_evidence`. Increase only the exhausted explicit
-  stratum, capture, dependency-depth, or induced-element cap on a new output directory.
+  report. Git and syntax facts remain valid, but semantic history is partial. Increase
+  only the exhausted explicit cap on a new output directory.
 - Invalid producer record: remove the producer from the allowlist, preserve the
   offending ref, and investigate before reenrollment.
 - Telemetry outage: use `/v1/metrics` and host-captured structured stderr;

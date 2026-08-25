@@ -158,6 +158,11 @@ void to_json(nlohmann::json &v, const CompileContext &x) {
        {"project_files", x.project_files},
        {"toolchain", x.toolchain},
        {"adapter_version", x.adapter_version},
+       {"inventory_id", x.inventory_id},
+       {"toolchain_fingerprint", x.toolchain_fingerprint},
+       {"generated_inputs_fingerprint", x.generated_inputs_fingerprint},
+       {"inventory_complete", x.inventory_complete},
+       {"dependency_map_complete", x.dependency_map_complete},
        {"coverage", x.coverage}};
 }
 void from_json(const nlohmann::json &v, CompileContext &x) {
@@ -172,6 +177,12 @@ void from_json(const nlohmann::json &v, CompileContext &x) {
   optional(v, "project_files", x.project_files);
   optional(v, "toolchain", x.toolchain);
   optional(v, "adapter_version", x.adapter_version);
+  optional(v, "inventory_id", x.inventory_id);
+  optional(v, "toolchain_fingerprint", x.toolchain_fingerprint);
+  optional(v, "generated_inputs_fingerprint",
+           x.generated_inputs_fingerprint);
+  optional(v, "inventory_complete", x.inventory_complete);
+  optional(v, "dependency_map_complete", x.dependency_map_complete);
   optional(v, "coverage", x.coverage);
 }
 void to_json(nlohmann::json &v, const LogicalElement &x) {
@@ -213,12 +224,128 @@ void from_json(const nlohmann::json &v, SemanticVariant &x) {
 void to_json(nlohmann::json &v, const ElementObservation &x) {
   v = {{"element_id", x.element_id},
        {"variant_id", x.variant_id},
-       {"location", x.location}};
+       {"location", x.location},
+       {"observation_id", x.observation_id}};
 }
 void from_json(const nlohmann::json &v, ElementObservation &x) {
   optional(v, "element_id", x.element_id);
   optional(v, "variant_id", x.variant_id);
   optional(v, "location", x.location);
+  optional(v, "observation_id", x.observation_id);
+}
+void to_json(nlohmann::json &v, const EvidenceReference &x) {
+  v = {{"kind", x.kind}, {"id", x.id}, {"revision", x.revision},
+       {"path", x.path}};
+}
+void from_json(const nlohmann::json &v, EvidenceReference &x) {
+  optional(v, "kind", x.kind);
+  optional(v, "id", x.id);
+  optional(v, "revision", x.revision);
+  optional(v, "path", x.path);
+}
+void to_json(nlohmann::json &v, const OriginEvidence &x) {
+  v = {{"kind", x.kind},
+       {"evidence", x.evidence},
+       {"causes", x.causes},
+       {"dependency_depth", x.dependency_depth},
+       {"confidence", x.confidence},
+       {"coverage", x.coverage}};
+}
+void from_json(const nlohmann::json &v, OriginEvidence &x) {
+  optional(v, "kind", x.kind);
+  optional(v, "evidence", x.evidence);
+  optional(v, "causes", x.causes);
+  optional(v, "dependency_depth", x.dependency_depth);
+  optional(v, "confidence", x.confidence);
+  optional(v, "coverage", x.coverage);
+}
+void to_json(nlohmann::json &v, const EvidenceReceipt &x) {
+  v = {{"schema_version", x.schema_version},
+       {"record_type", "evidence_receipt"},
+       {"receipt_id", x.receipt_id},
+       {"repository_id", x.repository_id},
+       {"integration_unit_id", x.integration_unit_id},
+       {"transition_id", x.transition_id},
+       {"source_before", x.source_before},
+       {"source_after", x.source_after},
+       {"investigation_scope", x.investigation_scope},
+       {"inventory_fingerprint", x.inventory_fingerprint},
+       {"context_fingerprint", x.context_fingerprint},
+       {"toolchain_fingerprint", x.toolchain_fingerprint},
+       {"generated_inputs_fingerprint", x.generated_inputs_fingerprint},
+       {"extractor_fingerprint", x.extractor_fingerprint},
+       {"result_digest", x.result_digest},
+       {"producer_id", x.producer_id},
+       {"coverage", x.coverage}};
+}
+void from_json(const nlohmann::json &v, EvidenceReceipt &x) {
+  optional(v, "schema_version", x.schema_version);
+  optional(v, "receipt_id", x.receipt_id);
+  optional(v, "repository_id", x.repository_id);
+  optional(v, "integration_unit_id", x.integration_unit_id);
+  optional(v, "transition_id", x.transition_id);
+  optional(v, "source_before", x.source_before);
+  optional(v, "source_after", x.source_after);
+  optional(v, "investigation_scope", x.investigation_scope);
+  optional(v, "inventory_fingerprint", x.inventory_fingerprint);
+  optional(v, "context_fingerprint", x.context_fingerprint);
+  optional(v, "toolchain_fingerprint", x.toolchain_fingerprint);
+  optional(v, "generated_inputs_fingerprint",
+           x.generated_inputs_fingerprint);
+  optional(v, "extractor_fingerprint", x.extractor_fingerprint);
+  optional(v, "result_digest", x.result_digest);
+  optional(v, "producer_id", x.producer_id);
+  optional(v, "coverage", x.coverage);
+}
+void to_json(nlohmann::json &v, const InferenceClaim &x) {
+  v = {{"schema_version", x.schema_version},
+       {"record_type", "inference_claim"},
+       {"claim_id", x.claim_id},
+       {"repository_id", x.repository_id},
+       {"transition_id", x.transition_id},
+       {"predicate", x.predicate},
+       {"categories", x.categories},
+       {"summary", x.summary},
+       {"model", x.model},
+       {"prompt_digest", x.prompt_digest},
+       {"input_digest", x.input_digest},
+       {"producer_id", x.producer_id},
+       {"evidence_receipt_ids", x.evidence_receipt_ids},
+       {"supersedes_claim_ids", x.supersedes_claim_ids},
+       {"confidence", x.confidence}};
+}
+void from_json(const nlohmann::json &v, InferenceClaim &x) {
+  optional(v, "schema_version", x.schema_version);
+  optional(v, "claim_id", x.claim_id);
+  optional(v, "repository_id", x.repository_id);
+  optional(v, "transition_id", x.transition_id);
+  optional(v, "predicate", x.predicate);
+  optional(v, "categories", x.categories);
+  optional(v, "summary", x.summary);
+  optional(v, "model", x.model);
+  optional(v, "prompt_digest", x.prompt_digest);
+  optional(v, "input_digest", x.input_digest);
+  optional(v, "producer_id", x.producer_id);
+  optional(v, "evidence_receipt_ids", x.evidence_receipt_ids);
+  optional(v, "supersedes_claim_ids", x.supersedes_claim_ids);
+  optional(v, "confidence", x.confidence);
+}
+void to_json(nlohmann::json &v, const KnowledgeDecision &x) {
+  v = {{"schema_version", x.schema_version},
+       {"record_type", "knowledge_decision"},
+       {"decision_id", x.decision_id},
+       {"claim_id", x.claim_id},
+       {"state", x.state},
+       {"reviewer", x.reviewer},
+       {"rationale", x.rationale}};
+}
+void from_json(const nlohmann::json &v, KnowledgeDecision &x) {
+  optional(v, "schema_version", x.schema_version);
+  optional(v, "decision_id", x.decision_id);
+  optional(v, "claim_id", x.claim_id);
+  optional(v, "state", x.state);
+  optional(v, "reviewer", x.reviewer);
+  optional(v, "rationale", x.rationale);
 }
 void to_json(nlohmann::json &v, const MacroExpansion &x) {
   v = {{"macro_element_id", x.macro_element_id},

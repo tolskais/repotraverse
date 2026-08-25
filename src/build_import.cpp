@@ -332,9 +332,14 @@ nlohmann::json import_build_log(Catalog &catalog,
     context.project_files =
         record.value("project_files",
                      record.value("dependencies", std::vector<std::string>{}));
+    context.inventory_complete = record.value("inventory_complete", false);
+    context.dependency_map_complete =
+        record.value("dependency_map_complete", !context.project_files.empty());
+    context.generated_inputs_fingerprint =
+        record.value("generated_inputs_fingerprint", std::string{});
     context.coverage.capabilities = {"normalized_frontend_arguments",
                                      "captured_working_directory"};
-    if (!context.project_files.empty())
+    if (context.dependency_map_complete)
       context.coverage.capabilities.push_back("project_dependency_map");
     else
       gap(context.coverage, "project dependency map was not captured");
@@ -344,6 +349,30 @@ nlohmann::json import_build_log(Catalog &catalog,
                   record.value("response_file_contents",
                                std::map<std::string, std::string>{}),
                   context.coverage);
+    nlohmann::json toolchain_inputs = nlohmann::json::array();
+    for (std::size_t index = 0; index < context.frontend_arguments.size(); ++index) {
+      const auto &argument = context.frontend_arguments[index];
+      const bool identity_option =
+          argument == "--sysroot" || argument == "-isysroot" ||
+          argument == "-resource-dir" || argument == "-isystem" ||
+          argument == "-internal-isystem" || argument == "/winsysroot" ||
+          argument.starts_with("--sysroot=") ||
+          argument.starts_with("-resource-dir=");
+      if (!identity_option) continue;
+      toolchain_inputs.push_back(argument);
+      if ((argument == "--sysroot" || argument == "-isysroot" ||
+           argument == "-resource-dir" || argument == "-isystem" ||
+           argument == "-internal-isystem" || argument == "/winsysroot") &&
+          index + 1 < context.frontend_arguments.size())
+        toolchain_inputs.push_back(context.frontend_arguments[++index]);
+    }
+    context.toolchain_fingerprint = record.value(
+        "toolchain_fingerprint",
+        stable_hash(nlohmann::json({{"toolchain", context.toolchain},
+                                    {"adapter", context.adapter_version},
+                                    {"target", context.target},
+                                    {"sdk_sysroot_resource_inputs", toolchain_inputs}})
+                        .dump()));
     if (context.frontend_arguments.size() > 4096 ||
         std::any_of(context.frontend_arguments.begin(),
                     context.frontend_arguments.end(), [](const auto &argument) {
@@ -354,13 +383,22 @@ nlohmann::json import_build_log(Catalog &catalog,
       project_file =
           generic_path_to_utf8(safe_relative(path_from_utf8(project_file),
                                              "project path"));
+    context.inventory_id = record.value(
+        "inventory_id",
+        stable_hash(nlohmann::json({{"revision", context.source_revision},
+                                    {"variant", context.build_variant},
+                                    {"toolchain", context.toolchain_fingerprint}})
+                        .dump()));
     const nlohmann::json identity = {
         {"translation_unit", context.translation_unit},
         {"working_directory", context.working_directory},
         {"target", context.target},
         {"arguments", context.frontend_arguments},
         {"toolchain", context.toolchain},
-        {"adapter", context.adapter_version}};
+        {"adapter", context.adapter_version},
+        {"toolchain_fingerprint", context.toolchain_fingerprint},
+        {"generated_inputs_fingerprint",
+         context.generated_inputs_fingerprint}};
     context.context_id = stable_hash(identity.dump());
     catalog.store_compile_context(context);
     configurations.insert(context.configuration);

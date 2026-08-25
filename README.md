@@ -65,17 +65,10 @@ no dependency download or parser-generation path. Upstream license and
 public-domain notices are retained under `third_party/` and installed with the
 tool.
 
-The core-only preset still uses clang-cl as the compiler but does not link the
-Clang libraries:
-
-```powershell
-.\tools\build-windows.ps1 -Mode CoreOnly -LlvmRoot C:\llvm-sdk
-```
-
 ## Developer build
 
-The extractor is omitted by default. Non-Windows developer machines can build
-it by explicitly selecting an installed LLVM/Clang CMake package:
+LLVM/Clang is a required dependency. Non-Windows developer machines can select
+an installed LLVM/Clang CMake package explicitly:
 
 ```sh
 cmake -S . -B build -G Ninja \
@@ -85,8 +78,8 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-Without `Clang_DIR` or `REPOTRAVERSE_LLVM_ROOT`, configuration does not search
-for LLVM/Clang and builds only the core executables.
+Without `REPOTRAVERSE_LLVM_ROOT`, CMake uses normal package discovery and
+requires a compatible Clang package.
 
 ## Extract snapshots
 

@@ -94,6 +94,87 @@ function(repotraverse_detect_llvm_msvc_runtime output)
     set(${output} "${_repotraverse_runtime}" PARENT_SCOPE)
 endfunction()
 
+# LLVM/Clang is a product dependency, so import its policy before creating any
+# Repotraverse target. An explicit root keeps Windows and offline builds pinned;
+# otherwise the normal Clang package lookup locates its matching LLVM package.
+if(REPOTRAVERSE_LLVM_ROOT)
+    cmake_path(ABSOLUTE_PATH REPOTRAVERSE_LLVM_ROOT NORMALIZE)
+    unset(_llvm_config CACHE)
+    unset(_clang_config CACHE)
+    find_file(_llvm_config LLVMConfig.cmake
+        PATHS
+            "${REPOTRAVERSE_LLVM_ROOT}/lib64/cmake/llvm"
+            "${REPOTRAVERSE_LLVM_ROOT}/lib/cmake/llvm"
+        NO_DEFAULT_PATH)
+    find_file(_clang_config ClangConfig.cmake
+        PATHS
+            "${REPOTRAVERSE_LLVM_ROOT}/lib64/cmake/clang"
+            "${REPOTRAVERSE_LLVM_ROOT}/lib/cmake/clang"
+        NO_DEFAULT_PATH)
+    if(NOT _llvm_config)
+        message(FATAL_ERROR
+            "REPOTRAVERSE_LLVM_ROOT does not contain LLVMConfig.cmake "
+            "under lib/cmake/llvm or lib64/cmake/llvm: "
+            "${REPOTRAVERSE_LLVM_ROOT}")
+    endif()
+    if(NOT _clang_config)
+        message(FATAL_ERROR
+            "REPOTRAVERSE_LLVM_ROOT does not contain ClangConfig.cmake "
+            "under lib/cmake/clang or lib64/cmake/clang: "
+            "${REPOTRAVERSE_LLVM_ROOT}")
+    endif()
+    cmake_path(GET _llvm_config PARENT_PATH _llvm_cmake)
+    cmake_path(GET _clang_config PARENT_PATH _clang_cmake)
+    find_package(LLVM CONFIG REQUIRED PATHS "${_llvm_cmake}" NO_DEFAULT_PATH)
+    find_package(Clang CONFIG REQUIRED PATHS "${_clang_cmake}" NO_DEFAULT_PATH)
+else()
+    find_package(Clang CONFIG REQUIRED)
+endif()
+
+if(MSVC)
+    if(NOT REPOTRAVERSE_LLVM_ROOT)
+        message(FATAL_ERROR
+            "Windows Clang builds require REPOTRAVERSE_LLVM_ROOT")
+    endif()
+    repotraverse_detect_llvm_msvc_runtime(_repotraverse_llvm_msvc_runtime)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "${_repotraverse_llvm_msvc_runtime}")
+    message(STATUS
+        "Repotraverse MSVC runtime follows LLVM: "
+        "${_repotraverse_llvm_msvc_runtime}")
+endif()
+
+if(WIN32 AND TARGET clangTooling AND TARGET clangIndex)
+    set(_repotraverse_clang_libraries clangTooling clangIndex)
+    set(_repotraverse_clang_linkage "component")
+elseif(TARGET clang-cpp AND TARGET LLVM)
+    set(_repotraverse_clang_libraries clang-cpp LLVM)
+    set(_repotraverse_clang_linkage "monolithic")
+elseif(TARGET clangTooling AND TARGET clangIndex)
+    set(_repotraverse_clang_libraries clangTooling clangIndex)
+    set(_repotraverse_clang_linkage "component")
+else()
+    message(FATAL_ERROR
+        "The LLVM/Clang SDK must export either clangTooling and clangIndex "
+        "or the monolithic clang-cpp and LLVM CMake targets")
+endif()
+message(STATUS "Repotraverse Clang linkage: ${_repotraverse_clang_linkage}")
+
+if(WIN32)
+    set(_repotraverse_clang_resource_include
+        "${REPOTRAVERSE_LLVM_ROOT}/lib/clang/${LLVM_VERSION_MAJOR}/include")
+    set(_repotraverse_llvm_license "${REPOTRAVERSE_LLVM_ROOT}/LICENSE.TXT")
+    if(NOT IS_DIRECTORY "${_repotraverse_clang_resource_include}")
+        message(FATAL_ERROR
+            "The LLVM SDK does not contain Clang ${LLVM_VERSION_MAJOR} "
+            "resource headers: ${_repotraverse_clang_resource_include}")
+    endif()
+    if(NOT EXISTS "${_repotraverse_llvm_license}")
+        message(FATAL_ERROR
+            "The LLVM SDK does not contain LICENSE.TXT: "
+            "${REPOTRAVERSE_LLVM_ROOT}")
+    endif()
+endif()
+
 if(REPOTRAVERSE_NATIVE_OPTIMIZATION)
     set(REPOTRAVERSE_BUILD_MODE "native")
 else()
@@ -227,106 +308,14 @@ add_executable(repotraverse-compiler-probe probe/main.cpp)
 target_link_libraries(repotraverse-compiler-probe PRIVATE
     history-core repotraverse-build-options)
 
-set(_repotraverse_clang_enabled OFF)
-if(REPOTRAVERSE_LLVM_ROOT OR Clang_DIR)
-    if(REPOTRAVERSE_LLVM_ROOT)
-        cmake_path(ABSOLUTE_PATH REPOTRAVERSE_LLVM_ROOT NORMALIZE)
-        unset(_llvm_config CACHE)
-        unset(_clang_config CACHE)
-        find_file(_llvm_config LLVMConfig.cmake
-            PATHS
-                "${REPOTRAVERSE_LLVM_ROOT}/lib64/cmake/llvm"
-                "${REPOTRAVERSE_LLVM_ROOT}/lib/cmake/llvm"
-            NO_DEFAULT_PATH)
-        find_file(_clang_config ClangConfig.cmake
-            PATHS
-                "${REPOTRAVERSE_LLVM_ROOT}/lib64/cmake/clang"
-                "${REPOTRAVERSE_LLVM_ROOT}/lib/cmake/clang"
-            NO_DEFAULT_PATH)
-        if(NOT _llvm_config)
-            message(FATAL_ERROR
-                "REPOTRAVERSE_LLVM_ROOT does not contain LLVMConfig.cmake "
-                "under lib/cmake/llvm or lib64/cmake/llvm: "
-                "${REPOTRAVERSE_LLVM_ROOT}")
-        endif()
-        if(NOT _clang_config)
-            message(FATAL_ERROR
-                "REPOTRAVERSE_LLVM_ROOT does not contain ClangConfig.cmake "
-                "under lib/cmake/clang or lib64/cmake/clang: "
-                "${REPOTRAVERSE_LLVM_ROOT}")
-        endif()
-        cmake_path(GET _llvm_config PARENT_PATH _llvm_cmake)
-        cmake_path(GET _clang_config PARENT_PATH _clang_cmake)
-        find_package(LLVM CONFIG REQUIRED PATHS "${_llvm_cmake}" NO_DEFAULT_PATH)
-        find_package(Clang CONFIG REQUIRED PATHS "${_clang_cmake}" NO_DEFAULT_PATH)
-    else()
-        # ClangConfig locates its matching LLVM package. The Windows offline
-        # presets and build script use REPOTRAVERSE_LLVM_ROOT instead.
-        find_package(Clang CONFIG REQUIRED)
-    endif()
-
-    set(_repotraverse_clang_enabled ON)
-endif()
-
-# Match the runtime exported by LLVM. Some SDKs built with LLVM's legacy CRT
-# selection leave the exported CMake variable empty, so read the authoritative
-# /FAILIFMISMATCH directive from a component library in that case.
-if(MSVC AND _repotraverse_clang_enabled)
-    repotraverse_detect_llvm_msvc_runtime(_repotraverse_llvm_msvc_runtime)
-    set(CMAKE_MSVC_RUNTIME_LIBRARY "${_repotraverse_llvm_msvc_runtime}")
-    message(STATUS
-        "Repotraverse MSVC runtime follows LLVM: "
-        "${_repotraverse_llvm_msvc_runtime}")
-endif()
-
-if(_repotraverse_clang_enabled)
-    if(WIN32 AND TARGET clangTooling AND TARGET clangIndex)
-        set(_repotraverse_clang_libraries clangTooling clangIndex)
-        set(_repotraverse_clang_linkage "component")
-    elseif(TARGET clang-cpp AND TARGET LLVM)
-        set(_repotraverse_clang_libraries clang-cpp LLVM)
-        set(_repotraverse_clang_linkage "monolithic")
-    elseif(TARGET clangTooling AND TARGET clangIndex)
-        set(_repotraverse_clang_libraries clangTooling clangIndex)
-        set(_repotraverse_clang_linkage "component")
-    else()
-        message(FATAL_ERROR
-            "The LLVM/Clang SDK must export either clangTooling and clangIndex "
-            "or the monolithic clang-cpp and LLVM CMake targets")
-    endif()
-    message(STATUS
-        "Repotraverse Clang linkage: ${_repotraverse_clang_linkage}")
-
-    if(WIN32)
-        if(NOT REPOTRAVERSE_LLVM_ROOT)
-            message(FATAL_ERROR
-                "Windows Clang builds require REPOTRAVERSE_LLVM_ROOT")
-        endif()
-        set(_repotraverse_clang_resource_include
-            "${REPOTRAVERSE_LLVM_ROOT}/lib/clang/${LLVM_VERSION_MAJOR}/include")
-        set(_repotraverse_llvm_license
-            "${REPOTRAVERSE_LLVM_ROOT}/LICENSE.TXT")
-        if(NOT IS_DIRECTORY "${_repotraverse_clang_resource_include}")
-            message(FATAL_ERROR
-                "The LLVM SDK does not contain Clang ${LLVM_VERSION_MAJOR} "
-                "resource headers: ${_repotraverse_clang_resource_include}")
-        endif()
-        if(NOT EXISTS "${_repotraverse_llvm_license}")
-            message(FATAL_ERROR
-                "The LLVM SDK does not contain LICENSE.TXT: "
-                "${REPOTRAVERSE_LLVM_ROOT}")
-        endif()
-    endif()
-
-    add_executable(clang-extractor extractor/main.cpp)
-    target_include_directories(clang-extractor SYSTEM PRIVATE
-        ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
-    separate_arguments(_llvm_definitions NATIVE_COMMAND "${LLVM_DEFINITIONS}")
-    target_compile_options(clang-extractor PRIVATE ${_llvm_definitions})
-    target_link_libraries(clang-extractor PRIVATE
-        history-core repotraverse-build-options
-        ${_repotraverse_clang_libraries})
-endif()
+add_executable(clang-extractor extractor/main.cpp)
+target_include_directories(clang-extractor SYSTEM PRIVATE
+    ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
+separate_arguments(_llvm_definitions NATIVE_COMMAND "${LLVM_DEFINITIONS}")
+target_compile_options(clang-extractor PRIVATE ${_llvm_definitions})
+target_link_libraries(clang-extractor PRIVATE
+    history-core repotraverse-build-options
+    ${_repotraverse_clang_libraries})
 
 include(CTest)
 if(BUILD_TESTING)
@@ -423,86 +412,66 @@ if(BUILD_TESTING)
             -DBINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/history_plan_integration.cmake)
 
-    if(TARGET clang-extractor)
-        add_executable(fake-make tests/fake_make.cpp)
-        target_link_libraries(fake-make PRIVATE history-core repotraverse-build-options)
-        add_executable(fake-arm-compiler tests/fake_arm_compiler.cpp)
-        target_link_libraries(fake-arm-compiler PRIVATE repotraverse-build-options)
-        add_executable(experiment-tests tests/experiment_tests.cpp)
-        target_link_libraries(experiment-tests PRIVATE
-            history-core repotraverse-build-options)
-        target_compile_definitions(experiment-tests PRIVATE
-            EXTRACTOR_PATH="$<TARGET_FILE:clang-extractor>"
-            PROBE_PATH="$<TARGET_FILE:repotraverse-compiler-probe>"
-            FAKE_MAKE_PATH="$<TARGET_FILE:fake-make>"
-            FAKE_ARM_COMPILER_PATH="$<TARGET_FILE:fake-arm-compiler>"
-            GIT_PATH="${GIT_EXECUTABLE}")
-        add_dependencies(experiment-tests clang-extractor
-            repotraverse-compiler-probe fake-make fake-arm-compiler)
-        add_test(NAME experiment-tests COMMAND experiment-tests)
-        add_executable(worker-integration-tests tests/worker_integration.cpp)
-        target_link_libraries(worker-integration-tests PRIVATE
-            history-core repotraverse-build-options)
-        target_compile_definitions(worker-integration-tests PRIVATE
-            EXTRACTOR_PATH="$<TARGET_FILE:clang-extractor>")
-        add_dependencies(worker-integration-tests clang-extractor)
-        add_test(NAME worker-integration-tests COMMAND worker-integration-tests)
-        add_test(NAME clang-extractor-version COMMAND clang-extractor --version)
-        set_tests_properties(clang-extractor-version PROPERTIES
-            PASS_REGULAR_EXPRESSION
-                "repotraverse clang-extractor ${PROJECT_VERSION}.*LLVM/Clang")
-        add_test(
-            NAME clang-extractor-smoke
-            COMMAND clang-extractor
-                "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/sample.cpp"
-                -- -std=c++17)
-        set_tests_properties(clang-extractor-smoke PROPERTIES
-            PASS_REGULAR_EXPRESSION "qualified_name")
-        add_test(
-            NAME clang-extractor-lineage
-            COMMAND ${CMAKE_COMMAND}
-                -DEXTRACTOR=$<TARGET_FILE:clang-extractor>
-                -DREPOTRAVERSE=$<TARGET_FILE:repotraverse>
-                -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
-                -DBINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}
-                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/extractor_integration.cmake)
-        add_executable(extractor-entities-tests tests/extractor_entities_tests.cpp)
-        target_link_libraries(extractor-entities-tests PRIVATE
-            history-core repotraverse-build-options)
-        target_compile_definitions(extractor-entities-tests PRIVATE
-            EXTRACTOR_PATH="$<TARGET_FILE:clang-extractor>"
-            TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
-        add_dependencies(extractor-entities-tests clang-extractor)
-        add_test(NAME extractor-entities-tests COMMAND extractor-entities-tests)
-    endif()
-endif()
-
-# history-core is created before LLVM is imported. Apply the detected SDK
-# policy to every non-imported binary target so all linked objects agree.
-if(MSVC AND _repotraverse_llvm_msvc_runtime)
-    get_property(_repotraverse_directory_targets DIRECTORY
-        PROPERTY BUILDSYSTEM_TARGETS)
-    foreach(_repotraverse_target IN LISTS _repotraverse_directory_targets)
-        get_target_property(_repotraverse_target_type
-            ${_repotraverse_target} TYPE)
-        if(_repotraverse_target_type MATCHES
-           "^(STATIC_LIBRARY|SHARED_LIBRARY|MODULE_LIBRARY|OBJECT_LIBRARY|EXECUTABLE)$")
-            set_property(TARGET ${_repotraverse_target} PROPERTY
-                MSVC_RUNTIME_LIBRARY "${_repotraverse_llvm_msvc_runtime}")
-        endif()
-    endforeach()
+    add_executable(fake-make tests/fake_make.cpp)
+    target_link_libraries(fake-make PRIVATE history-core repotraverse-build-options)
+    add_executable(fake-arm-compiler tests/fake_arm_compiler.cpp)
+    target_link_libraries(fake-arm-compiler PRIVATE repotraverse-build-options)
+    add_executable(experiment-tests tests/experiment_tests.cpp)
+    target_link_libraries(experiment-tests PRIVATE
+        history-core repotraverse-build-options)
+    target_compile_definitions(experiment-tests PRIVATE
+        EXTRACTOR_PATH="$<TARGET_FILE:clang-extractor>"
+        PROBE_PATH="$<TARGET_FILE:repotraverse-compiler-probe>"
+        FAKE_MAKE_PATH="$<TARGET_FILE:fake-make>"
+        FAKE_ARM_COMPILER_PATH="$<TARGET_FILE:fake-arm-compiler>"
+        GIT_PATH="${GIT_EXECUTABLE}")
+    add_dependencies(experiment-tests clang-extractor
+        repotraverse-compiler-probe fake-make fake-arm-compiler)
+    add_test(NAME experiment-tests COMMAND experiment-tests)
+    add_executable(worker-integration-tests tests/worker_integration.cpp)
+    target_link_libraries(worker-integration-tests PRIVATE
+        history-core repotraverse-build-options)
+    target_compile_definitions(worker-integration-tests PRIVATE
+        EXTRACTOR_PATH="$<TARGET_FILE:clang-extractor>")
+    add_dependencies(worker-integration-tests clang-extractor)
+    add_test(NAME worker-integration-tests COMMAND worker-integration-tests)
+    add_test(NAME clang-extractor-version COMMAND clang-extractor --version)
+    set_tests_properties(clang-extractor-version PROPERTIES
+        PASS_REGULAR_EXPRESSION
+            "repotraverse clang-extractor ${PROJECT_VERSION}.*LLVM/Clang")
+    add_test(
+        NAME clang-extractor-smoke
+        COMMAND clang-extractor
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/sample.cpp"
+            -- -std=c++17)
+    set_tests_properties(clang-extractor-smoke PROPERTIES
+        PASS_REGULAR_EXPRESSION "qualified_name")
+    add_test(
+        NAME clang-extractor-lineage
+        COMMAND ${CMAKE_COMMAND}
+            -DEXTRACTOR=$<TARGET_FILE:clang-extractor>
+            -DREPOTRAVERSE=$<TARGET_FILE:repotraverse>
+            -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+            -DBINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/extractor_integration.cmake)
+    add_executable(extractor-entities-tests tests/extractor_entities_tests.cpp)
+    target_link_libraries(extractor-entities-tests PRIVATE
+        history-core repotraverse-build-options)
+    target_compile_definitions(extractor-entities-tests PRIVATE
+        EXTRACTOR_PATH="$<TARGET_FILE:clang-extractor>"
+        TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
+    add_dependencies(extractor-entities-tests clang-extractor)
+    add_test(NAME extractor-entities-tests COMMAND extractor-entities-tests)
 endif()
 
 install(TARGETS repotraverse repotraverse-compiler-probe
     RUNTIME DESTINATION bin)
-if(TARGET clang-extractor)
-    install(TARGETS clang-extractor RUNTIME DESTINATION bin)
-    if(WIN32)
-        install(DIRECTORY "${_repotraverse_clang_resource_include}/"
-            DESTINATION "lib/clang/${LLVM_VERSION_MAJOR}/include")
-        install(FILES "${_repotraverse_llvm_license}"
-            DESTINATION licenses/llvm)
-    endif()
+install(TARGETS clang-extractor RUNTIME DESTINATION bin)
+if(WIN32)
+    install(DIRECTORY "${_repotraverse_clang_resource_include}/"
+        DESTINATION "lib/clang/${LLVM_VERSION_MAJOR}/include")
+    install(FILES "${_repotraverse_llvm_license}"
+        DESTINATION licenses/llvm)
 endif()
 install(FILES third_party/nlohmann_json/LICENSE.MIT
     DESTINATION licenses/nlohmann_json)
@@ -534,7 +503,5 @@ if(WIN32)
     # compiler fixtures created by this build.
     repotraverse_add_windows_manifest(repotraverse)
     repotraverse_add_windows_manifest(repotraverse-compiler-probe)
-    if(TARGET clang-extractor)
-        repotraverse_add_windows_manifest(clang-extractor)
-    endif()
+    repotraverse_add_windows_manifest(clang-extractor)
 endif()

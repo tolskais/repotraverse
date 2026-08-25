@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet("Generic", "Native", "CoreOnly")]
+    [ValidateSet("Generic", "Native")]
     [string]$Mode = "Generic",
 
     [string]$LlvmRoot = $env:REPOTRAVERSE_LLVM_ROOT,
@@ -25,7 +25,6 @@ $env:REPOTRAVERSE_LLVM_ROOT = (Resolve-Path -LiteralPath $LlvmRoot).Path
 $preset = switch ($Mode) {
     "Generic" { "windows-x64-generic" }
     "Native" { "windows-x64-native" }
-    "CoreOnly" { "windows-x64-core-only" }
 }
 
 Push-Location $sourceRoot

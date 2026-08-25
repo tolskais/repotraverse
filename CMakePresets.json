@@ -41,16 +41,6 @@
         "REPOTRAVERSE_LLVM_ROOT": "$env{REPOTRAVERSE_LLVM_ROOT}",
         "REPOTRAVERSE_NATIVE_OPTIMIZATION": true
       }
-    },
-    {
-      "name": "windows-x64-core-only",
-      "displayName": "Windows x64 core-only build",
-      "inherits": "windows-x64-base",
-      "binaryDir": "${sourceDir}/out/build/windows-x64-core-only",
-      "cacheVariables": {
-        "REPOTRAVERSE_LLVM_ROOT": "",
-        "REPOTRAVERSE_NATIVE_OPTIMIZATION": false
-      }
     }
   ],
   "buildPresets": [
@@ -63,11 +53,6 @@
       "name": "windows-x64-native-release",
       "configurePreset": "windows-x64-native",
       "jobs": 2
-    },
-    {
-      "name": "windows-x64-core-only-release",
-      "configurePreset": "windows-x64-core-only",
-      "jobs": 2
     }
   ],
   "testPresets": [
@@ -79,11 +64,6 @@
     {
       "name": "windows-x64-native",
       "configurePreset": "windows-x64-native",
-      "output": { "outputOnFailure": true }
-    },
-    {
-      "name": "windows-x64-core-only",
-      "configurePreset": "windows-x64-core-only",
       "output": { "outputOnFailure": true }
     }
   ]

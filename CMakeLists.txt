@@ -6,13 +6,6 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# The supported Windows LLVM SDK is built against the static MSVC runtime.
-# Keep every project target on the same CRT model to avoid LNK2038 mismatches.
-if(MSVC)
-    set(CMAKE_MSVC_RUNTIME_LIBRARY
-        "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-endif()
-
 set(REPOTRAVERSE_LLVM_ROOT "" CACHE PATH
     "Root of the prebuilt LLVM/Clang SDK")
 option(REPOTRAVERSE_NATIVE_OPTIMIZATION
@@ -40,6 +33,65 @@ function(repotraverse_add_windows_manifest target)
             "/MANIFEST:EMBED"
             "/MANIFESTINPUT:${REPOTRAVERSE_WINDOWS_MANIFEST}")
     endif()
+endfunction()
+
+function(repotraverse_detect_llvm_msvc_runtime output)
+    set(_repotraverse_runtime "${CMAKE_MSVC_RUNTIME_LIBRARY}")
+    if(NOT _repotraverse_runtime)
+        set(_repotraverse_probe_library
+            "${REPOTRAVERSE_LLVM_ROOT}/lib/clangTooling.lib")
+        find_program(_repotraverse_llvm_readobj
+            NAMES llvm-readobj.exe llvm-readobj
+            PATHS "${REPOTRAVERSE_LLVM_ROOT}/bin"
+            NO_DEFAULT_PATH)
+        if(NOT _repotraverse_llvm_readobj OR
+           NOT EXISTS "${_repotraverse_probe_library}")
+            message(FATAL_ERROR
+                "The LLVM SDK does not export CMAKE_MSVC_RUNTIME_LIBRARY and "
+                "its runtime policy cannot be inspected")
+        endif()
+        execute_process(
+            COMMAND "${_repotraverse_llvm_readobj}" --coff-directives
+                "${_repotraverse_probe_library}"
+            RESULT_VARIABLE _repotraverse_readobj_result
+            OUTPUT_VARIABLE _repotraverse_directives
+            ERROR_VARIABLE _repotraverse_readobj_error)
+        if(NOT _repotraverse_readobj_result EQUAL 0)
+            message(FATAL_ERROR
+                "Cannot inspect the LLVM SDK runtime policy: "
+                "${_repotraverse_readobj_error}")
+        endif()
+        string(REGEX MATCHALL "RuntimeLibrary=[A-Za-z_]+"
+            _repotraverse_runtime_directives "${_repotraverse_directives}")
+        list(REMOVE_DUPLICATES _repotraverse_runtime_directives)
+        list(LENGTH _repotraverse_runtime_directives
+            _repotraverse_runtime_directive_count)
+        if(NOT _repotraverse_runtime_directive_count EQUAL 1)
+            message(FATAL_ERROR
+                "The LLVM SDK has no single MSVC runtime policy: "
+                "${_repotraverse_runtime_directives}")
+        endif()
+        list(GET _repotraverse_runtime_directives 0
+            _repotraverse_runtime_directive)
+        if(_repotraverse_runtime_directive STREQUAL
+           "RuntimeLibrary=MT_StaticRelease")
+            set(_repotraverse_runtime "MultiThreaded")
+        elseif(_repotraverse_runtime_directive STREQUAL
+               "RuntimeLibrary=MTd_StaticDebug")
+            set(_repotraverse_runtime "MultiThreadedDebug")
+        elseif(_repotraverse_runtime_directive STREQUAL
+               "RuntimeLibrary=MD_DynamicRelease")
+            set(_repotraverse_runtime "MultiThreadedDLL")
+        elseif(_repotraverse_runtime_directive STREQUAL
+               "RuntimeLibrary=MDd_DynamicDebug")
+            set(_repotraverse_runtime "MultiThreadedDebugDLL")
+        else()
+            message(FATAL_ERROR
+                "Unsupported LLVM SDK runtime policy: "
+                "${_repotraverse_runtime_directive}")
+        endif()
+    endif()
+    set(${output} "${_repotraverse_runtime}" PARENT_SCOPE)
 endfunction()
 
 if(REPOTRAVERSE_NATIVE_OPTIMIZATION)
@@ -214,6 +266,17 @@ if(REPOTRAVERSE_LLVM_ROOT OR Clang_DIR)
     endif()
 
     set(_repotraverse_clang_enabled ON)
+endif()
+
+# Match the runtime exported by LLVM. Some SDKs built with LLVM's legacy CRT
+# selection leave the exported CMake variable empty, so read the authoritative
+# /FAILIFMISMATCH directive from a component library in that case.
+if(MSVC AND _repotraverse_clang_enabled)
+    repotraverse_detect_llvm_msvc_runtime(_repotraverse_llvm_msvc_runtime)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "${_repotraverse_llvm_msvc_runtime}")
+    message(STATUS
+        "Repotraverse MSVC runtime follows LLVM: "
+        "${_repotraverse_llvm_msvc_runtime}")
 endif()
 
 if(_repotraverse_clang_enabled)
@@ -412,6 +475,22 @@ if(BUILD_TESTING)
         add_dependencies(extractor-entities-tests clang-extractor)
         add_test(NAME extractor-entities-tests COMMAND extractor-entities-tests)
     endif()
+endif()
+
+# history-core is created before LLVM is imported. Apply the detected SDK
+# policy to every non-imported binary target so all linked objects agree.
+if(MSVC AND _repotraverse_llvm_msvc_runtime)
+    get_property(_repotraverse_directory_targets DIRECTORY
+        PROPERTY BUILDSYSTEM_TARGETS)
+    foreach(_repotraverse_target IN LISTS _repotraverse_directory_targets)
+        get_target_property(_repotraverse_target_type
+            ${_repotraverse_target} TYPE)
+        if(_repotraverse_target_type MATCHES
+           "^(STATIC_LIBRARY|SHARED_LIBRARY|MODULE_LIBRARY|OBJECT_LIBRARY|EXECUTABLE)$")
+            set_property(TARGET ${_repotraverse_target} PROPERTY
+                MSVC_RUNTIME_LIBRARY "${_repotraverse_llvm_msvc_runtime}")
+        endif()
+    endforeach()
 endif()
 
 install(TARGETS repotraverse repotraverse-compiler-probe

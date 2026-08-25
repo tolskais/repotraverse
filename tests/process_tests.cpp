@@ -34,14 +34,9 @@ int process_test_main(int argc, char **argv) {
     return 0;
   }
   if (argc == 3 && std::string(argv[1]) == "--unicode-child") {
-#ifdef _WIN32
     const auto environment =
         history::environment_utf8("REPOTRAVERSE_UNICODE_TEST")
             .value_or(std::string{});
-#else
-    const auto *raw = std::getenv("REPOTRAVERSE_UNICODE_TEST");
-    const std::string environment = raw ? raw : "";
-#endif
     std::cout << argv[2] << '\n'
               << history::path_to_utf8(std::filesystem::current_path()) << '\n'
               << environment << '\n';

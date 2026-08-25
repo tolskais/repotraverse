@@ -6,6 +6,13 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# The supported Windows LLVM SDK is built against the static MSVC runtime.
+# Keep every project target on the same CRT model to avoid LNK2038 mismatches.
+if(MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY
+        "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
 set(REPOTRAVERSE_LLVM_ROOT "" CACHE PATH
     "Root of the prebuilt LLVM/Clang SDK")
 option(REPOTRAVERSE_NATIVE_OPTIMIZATION
@@ -21,19 +28,17 @@ if(WIN32 AND NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
 endif()
 
 if(WIN32)
-    enable_language(RC)
     set(REPOTRAVERSE_WINDOWS_MANIFEST
         "${CMAKE_CURRENT_SOURCE_DIR}/resources/windows/repotraverse.manifest")
-    configure_file(
-        "${CMAKE_CURRENT_SOURCE_DIR}/resources/windows/repotraverse.rc.in"
-        "${CMAKE_CURRENT_BINARY_DIR}/repotraverse.rc"
-        @ONLY)
 endif()
 
 function(repotraverse_add_windows_manifest target)
     if(WIN32)
-        target_sources(${target} PRIVATE
-            "${CMAKE_CURRENT_BINARY_DIR}/repotraverse.rc")
+        # Let link.exe merge longPathAware with its generated CRT manifest.
+        # Embedding an RT_MANIFEST resource through an RC file duplicates ID 1.
+        target_link_options(${target} PRIVATE
+            "/MANIFEST:EMBED"
+            "/MANIFESTINPUT:${REPOTRAVERSE_WINDOWS_MANIFEST}")
     endif()
 endfunction()
 
@@ -446,15 +451,11 @@ if(WIN32)
         tools/package-windows.ps1
         DESTINATION tools)
 
-    # Every executable that exercises history-core must opt in independently;
-    # a manifest on the parent process does not affect child executables.
-    get_property(_repotraverse_directory_targets DIRECTORY
-        PROPERTY BUILDSYSTEM_TARGETS)
-    foreach(_repotraverse_target IN LISTS _repotraverse_directory_targets)
-        get_target_property(_repotraverse_target_type
-            ${_repotraverse_target} TYPE)
-        if(_repotraverse_target_type STREQUAL "EXECUTABLE")
-            repotraverse_add_windows_manifest(${_repotraverse_target})
-        endif()
-    endforeach()
+    # Manifests are a property of the shipped processes, not test runners and
+    # compiler fixtures created by this build.
+    repotraverse_add_windows_manifest(repotraverse)
+    repotraverse_add_windows_manifest(repotraverse-compiler-probe)
+    if(TARGET clang-extractor)
+        repotraverse_add_windows_manifest(clang-extractor)
+    endif()
 endif()

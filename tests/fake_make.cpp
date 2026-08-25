@@ -1,3 +1,4 @@
+#include "history/encoding.hpp"
 #include "history/process.hpp"
 
 #include <cstdlib>
@@ -11,10 +12,10 @@ int main(int argc, char **argv) {
     if (argument.starts_with("CC="))
       configured = argument.substr(3);
   }
-  const auto *compiler_environment = std::getenv("CC");
+  const auto compiler_environment = history::environment_utf8("CC");
   const auto compiler =
       configured.empty()
-          ? std::string(compiler_environment ? compiler_environment : "")
+          ? compiler_environment.value_or(std::string{})
           : configured;
   if (compiler.empty()) {
     std::cerr << "CC is not set\n";

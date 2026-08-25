@@ -27,10 +27,12 @@ DecodedText decode_text(std::string_view bytes,
 DecodedText read_text_file(const std::filesystem::path &path,
                            bool allow_windows_legacy = false);
 
+// Returns a UTF-8 copy so callers never retain platform environment storage.
+std::optional<std::string> environment_utf8(std::string_view name);
+
 #ifdef _WIN32
 std::wstring utf8_to_wide(std::string_view value);
 std::string wide_to_utf8(std::wstring_view value);
-std::optional<std::string> environment_utf8(std::string_view name);
 #endif
 
 } // namespace history

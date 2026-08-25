@@ -27,15 +27,9 @@
 namespace {
 
 std::string environment(const char *name, bool required = false) {
-#ifdef _WIN32
   const auto value = history::environment_utf8(name);
   if (value && !value->empty())
     return *value;
-#else
-  const auto *value = std::getenv(name);
-  if (value && *value)
-    return value;
-#endif
   if (required)
     throw std::runtime_error(std::string("missing environment variable: ") +
                              name);

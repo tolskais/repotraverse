@@ -52,7 +52,11 @@ nlohmann::json budget(std::size_t transitions = 20) {
 bool has_gap(const nlohmann::json &result, std::string_view kind) {
   return std::any_of(result.at("evidence_gaps").begin(),
                      result.at("evidence_gaps").end(),
-                     [&](const auto &gap) { return gap.at("kind") == kind; });
+                     [&](const nlohmann::json &gap) {
+                       const auto &value = gap.at("kind");
+                       return value.is_string() &&
+                              value.get_ref<const std::string &>() == kind;
+                     });
 }
 
 } // namespace

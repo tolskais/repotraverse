@@ -1,5 +1,6 @@
 #include "history/encoding.hpp"
 
+#include <cstdlib>
 #include <fstream>
 #include <iterator>
 #include <stdexcept>
@@ -236,6 +237,13 @@ std::optional<std::string> environment_utf8(std::string_view name) {
     throw std::runtime_error("cannot read process environment");
   value.resize(written);
   return wide_to_utf8(value);
+}
+#else
+std::optional<std::string> environment_utf8(std::string_view name) {
+  const std::string owned_name{name};
+  if (const auto *value = std::getenv(owned_name.c_str()))
+    return std::string{value};
+  return std::nullopt;
 }
 #endif
 

@@ -1,9 +1,9 @@
 include_guard(GLOBAL)
 
-if(WIN32 AND NOT (MSVC AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang"))
+if(WIN32 AND NOT MSVC)
     message(FATAL_ERROR
         "Windows builds require clang-cl from REPOTRAVERSE_LLVM_ROOT; "
-        "selected compiler: ${CMAKE_CXX_COMPILER_ID}")
+        "the selected Clang compiler does not use the MSVC command-line ABI")
 endif()
 if(WIN32 AND NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "Repotraverse supports 64-bit Windows only")

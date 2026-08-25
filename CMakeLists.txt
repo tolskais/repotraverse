@@ -35,17 +35,13 @@ else()
         $<$<COMPILE_LANGUAGE:CXX>:-Werror>)
 endif()
 if(REPOTRAVERSE_NATIVE_OPTIMIZATION)
-    if(MSVC AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    if(MSVC)
         target_compile_options(repotraverse-build-options INTERFACE
             $<$<COMPILE_LANGUAGE:CXX>:/clang:-march=native>)
-    elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    else()
         target_compile_options(repotraverse-build-options INTERFACE
             $<$<COMPILE_LANGUAGE:CXX>:-march=native>
             $<$<COMPILE_LANGUAGE:CXX>:-mtune=native>)
-    else()
-        message(FATAL_ERROR
-            "Native optimization requires Clang; selected compiler: "
-            "${CMAKE_CXX_COMPILER_ID}")
     endif()
 endif()
 

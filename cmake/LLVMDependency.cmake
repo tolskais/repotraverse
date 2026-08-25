@@ -1,5 +1,12 @@
 include_guard(GLOBAL)
 
+if(NOT CMAKE_C_COMPILER_ID STREQUAL "Clang" OR
+   NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    message(FATAL_ERROR
+        "Repotraverse requires Clang for both C and C++; selected compilers: "
+        "${CMAKE_C_COMPILER_ID} and ${CMAKE_CXX_COMPILER_ID}")
+endif()
+
 function(repotraverse_detect_llvm_msvc_runtime output)
     set(_runtime "${CMAKE_MSVC_RUNTIME_LIBRARY}")
     if(NOT _runtime)

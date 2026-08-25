@@ -67,11 +67,13 @@ tool.
 
 ## Developer build
 
-LLVM/Clang is a required dependency. Non-Windows developer machines can select
-an installed LLVM/Clang CMake package explicitly:
+LLVM/Clang is a required dependency and Clang is the only supported compiler.
+Non-Windows developer machines can select an installed toolchain and its CMake
+package explicitly:
 
 ```sh
 cmake -S . -B build -G Ninja \
+  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
   -DLLVM_DIR=/usr/lib/llvm/22/lib64/cmake/llvm \
   -DClang_DIR=/usr/lib/llvm/22/lib64/cmake/clang
 cmake --build build

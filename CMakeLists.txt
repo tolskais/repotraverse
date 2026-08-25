@@ -149,6 +149,16 @@ target_include_directories(clang-extractor SYSTEM PRIVATE
     ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
 separate_arguments(_llvm_definitions NATIVE_COMMAND "${LLVM_DEFINITIONS}")
 target_compile_options(clang-extractor PRIVATE ${_llvm_definitions})
+# LLVM's imported targets do not expose their RTTI mode as an interface compile
+# option.  A consumer of Clang's C++ APIs must nevertheless use the same mode:
+# otherwise a no-RTTI SDK leaves references to LLVM/Clang typeinfo unresolved.
+if(NOT LLVM_ENABLE_RTTI)
+    if(MSVC)
+        target_compile_options(clang-extractor PRIVATE /GR-)
+    else()
+        target_compile_options(clang-extractor PRIVATE -fno-rtti)
+    endif()
+endif()
 target_link_libraries(clang-extractor PRIVATE
     history-core repotraverse-build-options
     ${_repotraverse_clang_libraries})

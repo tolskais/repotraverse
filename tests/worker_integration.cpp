@@ -126,7 +126,7 @@ int main() {
     const auto planned_response = service.execute(request);
     require(planned_response.value("ok", false), "file query failed");
     const auto &planned = planned_response.at("result");
-    require(planned.at("scheduled_tasks") == 1,
+    require(planned.at("enqueued_work_items") == 1,
             "file query did not schedule extraction");
     require(planned.at("task_publication").value("state", std::string{}) ==
                 "queued",

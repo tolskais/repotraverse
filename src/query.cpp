@@ -3,9 +3,11 @@
 
 #include "history/build_import.hpp"
 #include "history/catalog.hpp"
+#include "history/connectors.hpp"
 #include "history/file_history.hpp"
 #include "history/git_coordination.hpp"
 #include "history/history_plan.hpp"
+#include "history/process.hpp"
 #include "history/telemetry.hpp"
 #include "history/worker.hpp"
 
@@ -13,11 +15,173 @@
 #include <chrono>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <set>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace history {
 namespace {
+std::string trimmed(std::string value) {
+  while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back())))
+    value.pop_back();
+  return value;
+}
+
+std::string resolved_head(const std::filesystem::path &repository,
+                          const std::string &ref) {
+  const auto result = run_process(
+      {"git", "-C", path_to_utf8(repository), "rev-parse", "--verify", ref + "^{commit}"});
+  if (result.exit_code != 0)
+    throw std::runtime_error("cannot resolve history ref: " + utf8_lossy(result.error));
+  return trimmed(result.output);
+}
+
+std::string file_digest(const std::filesystem::path &path) {
+  if (path.empty()) return stable_hash("no-pr-facts");
+  if (std::filesystem::file_size(path) > 256ULL * 1024ULL * 1024ULL)
+    throw std::runtime_error("PR facts exceed the supported snapshot size");
+  return stable_hash(read_text_file(path).text);
+}
+
+class PinnedPlan {
+public:
+  PinnedPlan() = default;
+  PinnedPlan(std::filesystem::path path, bool cached)
+      : path_(std::move(path)), cached_(cached) {
+    if (cached_) {
+      std::scoped_lock lock(mutex());
+      ++pins()[path_to_utf8(path_)];
+    }
+  }
+  PinnedPlan(const PinnedPlan &) = delete;
+  PinnedPlan &operator=(const PinnedPlan &) = delete;
+  PinnedPlan(PinnedPlan &&other) noexcept
+      : path_(std::move(other.path_)), cached_(other.cached_) {
+    other.cached_ = false;
+  }
+  ~PinnedPlan() {
+    std::error_code ignored;
+    if (!cached_) {
+      if (!path_.empty()) std::filesystem::remove(path_, ignored);
+      return;
+    }
+    std::scoped_lock lock(mutex());
+    const auto key = path_to_utf8(path_);
+    if (auto found = pins().find(key); found != pins().end() && --found->second == 0)
+      pins().erase(found);
+  }
+  const std::filesystem::path &path() const { return path_; }
+
+  static std::mutex &mutex() { static std::mutex value; return value; }
+  static std::unordered_map<std::string, std::size_t> &pins() {
+    static std::unordered_map<std::string, std::size_t> value;
+    return value;
+  }
+
+private:
+  std::filesystem::path path_;
+  bool cached_{};
+};
+
+bool valid_plan_payload(const std::filesystem::path &path) {
+  std::ifstream input(path);
+  std::string line;
+  bool header = false, summary = false;
+  try {
+    while (std::getline(input, line)) {
+      if (line.empty()) continue;
+      const auto row = nlohmann::json::parse(line);
+      header = header || row.value("record_type", std::string{}) == "history_plan";
+      summary = summary || row.value("record_type", std::string{}) == "history_plan_summary";
+    }
+  } catch (...) {
+    return false;
+  }
+  return input.eof() && header && summary;
+}
+
+void evict_history_plans(const Catalog &catalog,
+                         const std::filesystem::path &keep) {
+  std::scoped_lock cache_lock(PinnedPlan::mutex());
+  const auto directory = catalog.root() / "cache" / "history-plans-v1";
+  struct Entry { std::filesystem::path path; std::uint64_t bytes; std::filesystem::file_time_type access; };
+  std::vector<Entry> entries;
+  std::uint64_t bytes = 0;
+  std::error_code error;
+  for (const auto &item : std::filesystem::directory_iterator(directory, error)) {
+    if (!item.is_regular_file(error) || item.path().extension() != ".jsonl") continue;
+    const auto size = item.file_size(error);
+    if (error) { error.clear(); continue; }
+    entries.push_back({item.path(), size, item.last_write_time(error)});
+    bytes += size;
+  }
+  std::sort(entries.begin(), entries.end(), [](const auto &left, const auto &right) {
+    return left.access < right.access;
+  });
+  auto count = entries.size();
+  const auto [fact_count, fact_bytes] = catalog.fact_cache_usage();
+  for (const auto &entry : entries) {
+    if (count + fact_count <= catalog.maximum_cache_entries() &&
+        bytes + fact_bytes <= catalog.maximum_cache_bytes()) break;
+    if (entry.path == keep || PinnedPlan::pins().contains(path_to_utf8(entry.path))) continue;
+    if (std::filesystem::remove(entry.path, error)) {
+      --count;
+      bytes -= std::min(bytes, entry.bytes);
+    }
+    error.clear();
+  }
+}
+
+PinnedPlan cached_history_plan(Catalog *catalog, HistoryPlanOptions options,
+                               const std::string &pr_digest) {
+  if (!catalog) {
+    write_history_plan(options);
+    return PinnedPlan(options.output, false);
+  }
+  const auto head = resolved_head(options.repository, options.ref);
+  const auto key = stable_hash(canonical_json({
+      {"kind", "history_plan"}, {"schema_version", kSchemaVersion},
+      {"planner", "first_parent_v1"}, {"repository_id", options.repository_id},
+      {"repository", path_to_utf8(std::filesystem::weakly_canonical(options.repository))},
+      {"resolved_head", head}, {"start_exclusive", options.start_exclusive},
+      {"pr_fact_snapshot", pr_digest}}));
+  const auto directory = catalog->root() / "cache" / "history-plans-v1";
+  std::filesystem::create_directories(directory);
+  const auto target = directory / (key + ".jsonl");
+  std::unique_lock lock(PinnedPlan::mutex());
+  std::error_code error;
+  if (std::filesystem::exists(target) && valid_plan_payload(target)) {
+    std::filesystem::last_write_time(target, std::filesystem::file_time_type::clock::now(), error);
+    lock.unlock();
+    return PinnedPlan(target, true);
+  }
+  std::filesystem::remove(target, error);
+  const auto temporary = directory / (key + ".tmp-" +
+      stable_hash(std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())));
+  options.ref = head;
+  options.output = temporary;
+  try {
+    write_history_plan(options);
+    const auto size = std::filesystem::file_size(temporary);
+    const auto [fact_count, fact_bytes] = catalog->fact_cache_usage();
+    if (fact_count >= catalog->maximum_cache_entries() ||
+        size > catalog->maximum_cache_bytes() -
+                   std::min(catalog->maximum_cache_bytes(), fact_bytes))
+      {
+        lock.unlock();
+      return PinnedPlan(temporary, false);
+      }
+    std::filesystem::rename(temporary, target);
+    lock.unlock();
+    evict_history_plans(*catalog, target);
+    return PinnedPlan(target, true);
+  } catch (...) {
+    std::filesystem::remove(temporary, error);
+    throw;
+  }
+}
+
 const nlohmann::json &parameters(const nlohmann::json &request) {
   if (!request.contains("params") || !request.at("params").is_object())
     throw std::runtime_error("request.params must be an object");
@@ -107,128 +271,16 @@ QueryService::QueryService(std::shared_ptr<const FactStore> store)
 QueryService::QueryService(std::shared_ptr<const FactStore> store,
                            std::shared_ptr<Catalog> catalog,
                            std::shared_ptr<GitCoordinator> coordinator,
-                           std::shared_ptr<BackgroundWorker> worker)
+                           std::shared_ptr<BackgroundWorker> worker,
+                           std::shared_ptr<ConnectorService> connectors)
     : store_(std::move(store)), catalog_(std::move(catalog)),
-      coordinator_(std::move(coordinator)), worker_(std::move(worker)) {
+      coordinator_(std::move(coordinator)), worker_(std::move(worker)),
+      connectors_(std::move(connectors)) {
   if (!store_)
     throw std::invalid_argument("FactStore cannot be null");
   if (!catalog_ || !coordinator_)
     throw std::invalid_argument(
         "federated query service requires catalog and coordinator");
-}
-
-nlohmann::json QueryService::submit(const nlohmann::json &request) const {
-  if (!catalog_)
-    return execute(request);
-  const auto request_id = catalog_->create_request(request);
-  if (const auto existing = catalog_->request_job(request_id);
-      existing && (existing->value("state", std::string{}) == "complete" ||
-                   existing->value("state", std::string{}) == "cancelled")) {
-    auto response = *existing;
-    response["schema_version"] = kSchemaVersion;
-    response["ok"] = response.value("state", std::string{}) != "failed";
-    return response;
-  }
-  catalog_->update_request(request_id, "running", {{"phase", "planning"}});
-  const auto started = std::chrono::steady_clock::now();
-  const auto response = execute(request);
-  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                           std::chrono::steady_clock::now() - started)
-                           .count();
-  Telemetry::instance().increment("requests.submitted");
-  Telemetry::instance().gauge("requests.last_latency_ms", elapsed);
-  if (const auto current = catalog_->request_job(request_id);
-      current && current->value("state", std::string{}) == "cancelled") {
-    catalog_->cancel_request_tasks(request_id);
-    auto cancelled = *current;
-    cancelled["schema_version"] = kSchemaVersion;
-    cancelled["ok"] = true;
-    return cancelled;
-  }
-  const auto state =
-      !response.value("ok", false) ? "failed"
-      : response.value("result_status", std::string{}) == "complete"
-          ? "complete"
-          : "partial";
-  Telemetry::instance().span("request.plan", elapsed,
-                             {{"request_id", request_id},
-                              {"query", request.value("query", std::string{})},
-                              {"state", state}});
-  const auto error = response.value("error", nlohmann::json::object());
-  catalog_->update_request(
-      request_id, state,
-      {{"pending_work",
-        response.value("pending_work", nlohmann::json::array()).size()},
-       {"snapshot_id", response.value("snapshot_id", std::string{})}},
-      response, error);
-  auto job = *catalog_->request_job(request_id);
-  job["schema_version"] = kSchemaVersion;
-  job["ok"] = state != std::string{"failed"};
-  return job;
-}
-
-nlohmann::json QueryService::enqueue(const nlohmann::json &request) const {
-  if (!catalog_)
-    return execute(request);
-  const auto request_id = catalog_->create_request(request);
-  const auto existing = catalog_->request_job(request_id);
-  const auto state = existing ? existing->value("state", std::string{})
-                              : std::string{};
-  if (state == "complete" || state == "cancelled") {
-    auto response = *existing;
-    response["schema_version"] = kSchemaVersion;
-    response["ok"] = state != "failed";
-    return response;
-  }
-  catalog_->update_request(request_id, "queued", {{"phase", "queued"}});
-  auto response = *catalog_->request_job(request_id);
-  response["schema_version"] = kSchemaVersion;
-  response["ok"] = true;
-  return response;
-}
-
-nlohmann::json QueryService::request_status(const std::string &request_id,
-                                            bool refresh) const {
-  if (!catalog_)
-    return {{"ok", false}, {"error", {{"code", "jobs_unavailable"}}}};
-  const auto job = catalog_->request_job(request_id);
-  if (!job)
-    return {{"ok", false}, {"error", {{"code", "not_found"}}}};
-  const auto state = job->value("state", std::string{});
-  if (refresh && state != "complete" && state != "failed" &&
-      state != "cancelled")
-    return submit(job->at("request"));
-  auto response = *job;
-  response["schema_version"] = kSchemaVersion;
-  response["ok"] = state != "failed";
-  return response;
-}
-
-nlohmann::json
-QueryService::cancel_request(const std::string &request_id) const {
-  if (!catalog_ || !catalog_->request_job(request_id))
-    return {{"ok", false}, {"error", {{"code", "not_found"}}}};
-  catalog_->cancel_request_tasks(request_id);
-  catalog_->update_request(request_id, "cancelled", {{"phase", "cancelled"}});
-  auto response = *catalog_->request_job(request_id);
-  response["schema_version"] = kSchemaVersion;
-  response["ok"] = true;
-  return response;
-}
-
-nlohmann::json QueryService::fail_request(const std::string &request_id,
-                                          const std::string &code) const {
-  if (!catalog_ || !catalog_->request_job(request_id))
-    return {{"schema_version", kSchemaVersion},
-            {"ok", false},
-            {"error", {{"code", "not_found"}}}};
-  catalog_->cancel_request_tasks(request_id);
-  catalog_->update_request(request_id, "failed", {{"phase", "failed"}}, {},
-                           {{"code", code}});
-  auto response = *catalog_->request_job(request_id);
-  response["schema_version"] = kSchemaVersion;
-  response["ok"] = false;
-  return response;
 }
 
 nlohmann::json QueryService::execute(const nlohmann::json &request) const {
@@ -272,6 +324,37 @@ nlohmann::json QueryService::execute_impl(const nlohmann::json &request) const {
       throw std::runtime_error("unsupported request schema");
     const auto &params = parameters(request);
     const auto query = request.value("query", std::string{});
+    if (query == "tool.connector-sync") {
+      if (!connectors_) throw std::runtime_error("connector synchronization is not configured");
+      const auto name = params.value("connector", std::string{});
+      if (name.empty()) throw std::runtime_error("connector-sync requires connector");
+      const auto keys = params.value("issue_keys", std::vector<std::string>{});
+      auto result = connectors_->sync(name, params.value("full", false), keys);
+      return {{"schema_version", kSchemaVersion}, {"ok", true},
+              {"result_status", "complete"}, {"snapshot_id", catalog_->snapshot_id()},
+              {"facts", std::move(result)}, {"inference", nlohmann::json::array()}};
+    }
+    if (query == "tool.connector-status") {
+      if (!connectors_) throw std::runtime_error("connectors are not configured");
+      const auto name = params.value("connector", std::string{});
+      return {{"schema_version", kSchemaVersion}, {"ok", true},
+              {"result_status", "complete"}, {"facts", connectors_->status(name)},
+              {"inference", nlohmann::json::array()}};
+    }
+    if (query == "tool.pull-request-get" || query == "tool.issue-get") {
+      if (!connectors_) throw std::runtime_error("connectors are not configured");
+      const auto name = params.value("connector", std::string{});
+      const auto id = params.value(query == "tool.issue-get" ? "key" : "external_id",
+                                   std::string{});
+      if (name.empty() || id.empty()) throw std::runtime_error(query + " requires connector and external identity");
+      auto result = query == "tool.issue-get" ? connectors_->issue(name, id)
+                                               : connectors_->pull_request(name, id);
+      if (result.empty()) throw std::runtime_error("external fact not found");
+      return {{"schema_version", kSchemaVersion}, {"ok", true},
+              {"result_status", result.at("conflicts").empty() ? "complete" : "partial"},
+              {"snapshot_id", catalog_->snapshot_id()}, {"facts", std::move(result)},
+              {"inference", nlohmann::json::array()}};
+    }
     if (query == "tool.repository-changes" || query == "tool.history-summary" ||
         query == "tool.change-unit") {
       HistoryPlanOptions options;
@@ -297,21 +380,21 @@ nlohmann::json QueryService::execute_impl(const nlohmann::json &request) const {
           for (auto record : imports) {
             record.erase("import_id");
             record.erase("knowledge_commit");
-            imported << canonical_json(record);
+            imported << canonical_json(record) << '\n';
           }
           options.pr_facts = imported_pr_facts;
         }
       }
-      struct RemovePlan {
-        std::filesystem::path path, imports;
-        ~RemovePlan() {
+      struct RemoveImports {
+        std::filesystem::path path;
+        ~RemoveImports() {
           std::error_code ignored;
           std::filesystem::remove(path, ignored);
-          std::filesystem::remove(imports, ignored);
         }
-      } remove_plan{options.output, imported_pr_facts};
-      const auto plan_summary = write_history_plan(options);
-      std::ifstream input(options.output);
+      } remove_imports{imported_pr_facts};
+      auto pinned_plan = cached_history_plan(catalog_.get(), options,
+                                             file_digest(options.pr_facts));
+      std::ifstream input(pinned_plan.path());
       nlohmann::json units = nlohmann::json::array();
       nlohmann::json plan_header, summary;
       std::map<std::string, std::size_t> file_touches;
@@ -328,6 +411,13 @@ nlohmann::json QueryService::execute_impl(const nlohmann::json &request) const {
           units.push_back(std::move(record));
         }
       }
+      if (!input.eof() || plan_header.is_null() || summary.is_null())
+        throw std::runtime_error("cached history plan is incomplete");
+      auto plan_summary = summary;
+      plan_summary.erase("schema_version");
+      plan_summary.erase("record_type");
+      plan_summary["output"] = path_to_utf8(pinned_plan.path());
+      plan_summary["ref"] = options.ref;
       if (query == "tool.change-unit") {
         const auto wanted = params.value("integration_unit_id", std::string{});
         nlohmann::json found;
@@ -544,37 +634,6 @@ nlohmann::json QueryService::execute_impl(const nlohmann::json &request) const {
                          {"publications", publications}}},
               {"inference", nlohmann::json::array()}};
     }
-    if (query == "tool.request-status") {
-      return request_status(params.value("request_id", std::string{}),
-                            params.value("refresh", false));
-    }
-    if (query == "work.run") {
-      if (!worker_)
-        return {{"schema_version", kSchemaVersion},
-                {"ok", true},
-                {"result_status", "partial"},
-                {"result", {{"state", "worker_unavailable"}}}};
-      const auto result = worker_->run_once();
-      return {{"schema_version", kSchemaVersion},
-              {"ok", true},
-              {"result_status", result.value("state", std::string{}) == "idle"
-                                    ? "complete"
-                                    : "partial"},
-              {"snapshot_id", catalog_->snapshot_id()},
-              {"result", result}};
-    }
-    if (query == "work.retry") {
-      if (!catalog_)
-        throw std::runtime_error("work.retry requires federated service");
-      const auto task_id = params.value("task_id", std::string{});
-      if (task_id.empty())
-        throw std::runtime_error("work.retry requires task_id");
-      catalog_->retry_task(task_id);
-      return {{"schema_version", kSchemaVersion},
-              {"ok", true},
-              {"result_status", "complete"},
-              {"result", {{"task_id", task_id}, {"state", "pending"}}}};
-    }
     if (query == "build.import") {
       if (!catalog_)
         throw std::runtime_error("build.import requires federated service");
@@ -646,55 +705,6 @@ nlohmann::json QueryService::execute_impl(const nlohmann::json &request) const {
                result.value("state", std::string{}) == "synchronized"
                    ? "complete"
                    : "partial"},
-              {"snapshot_id", catalog_->snapshot_id()},
-              {"result", result}};
-    }
-    if (query == "work.acquire") {
-      if (!coordinator_)
-        throw std::runtime_error("work.acquire requires federated service");
-      if (!params.contains("task"))
-        throw std::runtime_error("work.acquire requires task");
-      const auto result = coordinator_->acquire(params.at("task"));
-      const auto state = result.value("state", std::string{});
-      return {
-          {"schema_version", kSchemaVersion},
-          {"ok", true},
-          {"result_status", state == "processing" || state == "processing_local"
-                                ? "complete"
-                                : "partial"},
-          {"snapshot_id", catalog_->snapshot_id()},
-          {"result", result}};
-    }
-    if (query == "work.heartbeat" || query == "work.complete" ||
-        query == "work.status") {
-      if (!coordinator_)
-        throw std::runtime_error(query + " requires federated service");
-      const auto task_id = params.value("task_id", std::string{});
-      if (task_id.empty())
-        throw std::runtime_error(query + " requires task_id");
-      nlohmann::json result;
-      if (query == "work.heartbeat")
-        result = coordinator_->heartbeat(task_id);
-      else if (query == "work.complete") {
-        const auto completed = params.value("result", nlohmann::json{});
-        const auto type = completed.value("record_type", std::string{});
-        if (type != "tu_manifest" && type != "tu_failure")
-          throw std::runtime_error(
-              "work.complete result must be a tu_manifest or tu_failure");
-        result = coordinator_->complete(task_id, completed);
-      } else {
-        coordinator_->sync();
-        result = coordinator_->status(task_id);
-        if (const auto fact = catalog_->fact_for_task(task_id)) {
-          result = *fact;
-          result["state"] = "completed";
-        }
-      }
-      return {{"schema_version", kSchemaVersion},
-              {"ok", true},
-              {"result_status",
-               result.value("state", std::string{}) == "completed" ? "complete"
-                                                                   : "partial"},
               {"snapshot_id", catalog_->snapshot_id()},
               {"result", result}};
     }

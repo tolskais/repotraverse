@@ -1,79 +1,56 @@
-# Production-oriented service operations
+# On-demand catalog operations
 
-These procedures cover deployment, coordination, and recovery of the v1 service.
-Repotraverse supplies facts and reviewed interpretations, not stability conclusions.
+Repotraverse has no permanent service or inbound network listener. Install the
+Windows package in a versioned directory, copy `config/catalog.example.json` to
+an operations-owned location, and keep the catalog and scratch directories on
+fast local storage.
 
-For the CLI experiment PoC, including separate output-directory rules and evidence
-collection, use [`poc-runbook.md`](poc-runbook.md).
+Every catalog-backed command requires `--config`. It opens SQLite directly,
+returns a schema-v1 snapshot envelope, transactionally queues missing work, and
+starts one detached hidden runner when needed. The runner heartbeats every five
+seconds, processes ordinary work in FIFO order, runs maintenance after the
+ordinary queue drains, publishes final facts, and releases its singleton lease
+in the same transaction as its final empty-queue check.
 
-## Deployment
+Use `--wait` to watch work associated with one invocation. Ctrl-C only stops the
+wait. Inspect redacted state with `work-status`; request cancellation with
+`work-cancel --work-id ID`. Retry by rerunning the originating command.
 
-Use the generic Windows x64 package on the intended 8-vCPU, 32-GB VM. Extract
-the ZIP to a versioned directory, copy `config/service.example.json` to
-an operations-owned location, and replace every path and repository ID. Keep
-the catalog and scratch roots on fast local storage; never place either in a VM
-image.
+## Credentials and connectors
 
-Initialize each instance once with
-`repotraverse identity init --catalog C:\repotraverse\catalog`, record the
-generated producer ID, and place the IDs of permitted
-peer instances in `trusted_producers`. An empty production allowlist trusts only
-the local producer. Grant the analysis Git credentials access to
-`repotraverse/v1/coordination/tasks/`, `repotraverse/v1/coordination/results/`, and
-`repotraverse/v1/coordination/claims/`, plus the configured knowledge refs.
-Register the service from an elevated shell:
+Credential configuration contains references, never secret values. An
+environment-backed credential is available only if the command that launches
+the runner has that variable. File and Windows credential references are
+resolved by the runner. SQLite stores only reference names as capabilities.
+Incompatible work remains `waiting_for_credential` until a later compatible
+command interacts with the catalog.
+
+Connector access is explicit:
 
 ```powershell
-.\tools\install-service.ps1 -Config C:\repotraverse\service.json
+repotraverse connector-sync --config C:\repotraverse\catalog.json `
+  --connector bitbucket-enterprise
+repotraverse connector-status --config C:\repotraverse\catalog.json `
+  --connector bitbucket-enterprise
 ```
 
-Readiness is `GET http://127.0.0.1:7341/v1/health/ready`; service identity and
-status are available at `/v1/status`, and local metrics are available at
-`/v1/metrics`. Configure an HTTPS OTLP endpoint to export logs, metrics, and
-request-planning spans. Export failure is counted locally and never blocks
-analysis.
+Ordinary source, history, and symbol commands never synchronize Bitbucket or
+Jira. Only normalized fields are published; tokens, headers, cookies, comments,
+attachments, worklogs, and raw provider responses are not persisted.
 
 ## Recovery
 
-The Service Control Manager restarts the process. Dispatching and processing
-tasks return to `pending` when the catalog reopens; Git leases prevent duplicate
-publication. Transient failures use exponential retry, while incompatible or
-repeated failures enter quarantine. Inspect their diagnostic fingerprint and
-use the CLI `work.retry` query only after correcting the cause.
+A later CLI command recovers a launching or active lease whose heartbeat is more
+than 30 seconds old and makes interrupted work runnable again. PID existence is
+not used as proof of ownership. There is no watchdog or supervisor. If detached
+process creation fails, only the still-matching launch token is cleared and work
+remains pending.
 
-Non-v1 and unversioned prototype catalogs are deliberately unsupported.
-For catalog corruption, stop the service, preserve the directory for incident
-analysis, create a new catalog directory, and restart. PR imports, receipts,
-inference proposals, decisions, and lineage reviews are re-imported from Git;
-compiler manifests are cache entries, and build captures must
-be re-imported because raw captures are intentionally not shared artifacts.
-Durable local request state should be included in catalog backups.
+Non-v1 and unversioned prototype catalogs are unsupported. For corruption,
+preserve the directory for incident analysis and create a new catalog. Analysis
+Git restores shared facts and decisions; compile contexts, cursors, leases, and
+caches remain catalog-local.
 
-## Failure handling
-
-- Git unavailable: queries remain partial, tasks stay unpublished, and workers
-  do not start them. Restore the remote and allow the coordination loop to retry.
-- Extractor timeout or output limit: the worker keeps retryable operational state;
-  increase a limit only after capacity review.
-- Disk pressure: the workspace pool evicts idle sparse revisions by byte and count
-  limits. Full capture workspaces are temporary. If a revision cannot fit while
-  preserving the configured reserve, it fails with `disk_space_insufficient`; reduce
-  concurrency, increase the workspace volume, or provide complete dependency capture.
-  Temporary result refs are pruned after the completed lease expires.
-- Progressive budget exhausted: retain `progressive-screening.v1.json` and the pilot
-  report. Git and syntax facts remain valid, but semantic history is partial. Increase
-  only the exhausted explicit cap on a new output directory.
-- Invalid producer record: remove the producer from the allowlist, preserve the
-  offending ref, and investigate before reenrollment.
-- Telemetry outage: use `/v1/metrics` and host-captured structured stderr;
-  analysis continues with bounded telemetry queues.
-
-## Upgrade and rollback
-
-Run the complete test suite and catalog recovery drill before promotion. Stop
-the service, back up the catalog, replace the versioned program directory, and
-restart. Future schema migrations must be transactional and forward-only.
-Rollback is permitted only when the previous binary supports the current
-catalog schema; otherwise restore the matching backup. Verify readiness,
-producer identity, queue depth, quarantine count, and a representative cached
-and uncached query after every change.
+OTLP remains outbound-only. Connector and telemetry failures are represented by
+redacted fingerprints. The Windows long-path manifest remains part of every
+shipped executable.

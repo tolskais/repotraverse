@@ -113,7 +113,7 @@ retains causal element/path sets; exhausted budgets become coverage gaps.
 
 ## Federated catalogs and leases
 
-Every VM serves queries from a transactionally consistent, bounded local SQLite cache.
+Every command reads a transactionally consistent, bounded local SQLite cache.
 Compiler results are transferred through one temporary ref per task under
 `repotraverse/v1/coordination/results/` and pruned after the completion lease expires.
 A producer ID is generated after VM deployment.
@@ -135,9 +135,9 @@ temporary full workspace. Byte/count limits, a free-space reserve, leases, and L
 eviction bound local disk use. A deterministic failed frontend run publishes a typed
 diagnostics fingerprint. Timeouts and resource limits remain retryable operational state.
 
-The local HTTP response may be partial. It identifies the materialized snapshot,
-observed coverage, and pending task ownership. Git synchronizes facts and leases;
-VMs do not expose services to one another.
+The CLI snapshot may be partial. It identifies the materialized snapshot,
+observed coverage, and pending work. Git synchronizes facts; VMs do not expose
+services to one another.
 
 History ordering does not serialize compiler work. Snapshot extraction is
 independent for each revision, translation unit, and normalized configuration
@@ -147,16 +147,17 @@ facts; a unique exact semantic-shape match currently produces a high-confidence
 automatic fact and candidate, while ambiguous matches remain reviewable. The LLM or
 developer can record accepted or rejected lineage separately.
 
-## Production-oriented service boundaries
+## Production catalog boundaries
 
 Every logical identifier includes an explicit repository ID. Submodules retain
 independent histories; a mapping records which child revision is pinned by a
 parent revision. Cross-repository lineage is never inferred.
 
-HTTP is loopback-only. Raw fact operations are synchronous; expensive compiler work
-uses durable request jobs. Git is authoritative for PR imports, reviewed knowledge,
-temporary tasks, results, and leases. The versioned SQLite catalog provides a bounded
-local cache, transactional queue, request state, and rebuildable indexes. Imported
+There is no inbound HTTP listener. Catalog commands return current facts immediately
+and queue missing compiler work for one detached runner. Git is authoritative for PR
+imports, reviewed knowledge, temporary tasks, results, and cross-catalog leases. The
+versioned SQLite catalog provides a bounded local cache, unified transactional work
+queue, singleton local runner lease, cursors, and rebuildable indexes. Imported
 compile contexts are local operational input
 and must be reimported after catalog replacement. Imported producer records are
 size-bounded, schema checked, content-address verified, and optionally restricted

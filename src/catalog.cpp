@@ -2,11 +2,13 @@
 #include "history/encoding.hpp"
 
 #include <chrono>
+#include <cctype>
 #include <fstream>
 #include <map>
 #include <random>
 #include <set>
 #include <stdexcept>
+#include <tuple>
 #include <unordered_map>
 
 #include <sqlite3.h>
@@ -90,6 +92,26 @@ std::string load_or_create_producer(const std::filesystem::path &root) {
   return value;
 }
 
+bool contains_secret_material(const nlohmann::json &value) {
+  if (value.is_array()) {
+    for (const auto &item : value)
+      if (contains_secret_material(item)) return true;
+    return false;
+  }
+  if (!value.is_object()) return false;
+  static const std::set<std::string> forbidden = {
+      "authorization", "headers", "cookie", "cookies", "token",
+      "password", "secret", "bearer", "raw_response"};
+  for (const auto &[key, item] : value.items()) {
+    std::string normalized = key;
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (forbidden.contains(normalized) || contains_secret_material(item))
+      return true;
+  }
+  return false;
+}
+
 } // namespace
 
 Catalog::Catalog(std::filesystem::path root, std::size_t maximum_cached_facts,
@@ -121,7 +143,7 @@ Catalog::Catalog(std::filesystem::path root, std::size_t maximum_cached_facts,
         "the pre-reset v1 catalog is unsupported; remove and rebuild the local cache");
   if (catalog_version == 0 &&
       integer_pragma("SELECT count(*) FROM sqlite_master WHERE type='table' "
-                     "AND name IN ('facts','scheduled_tasks','compile_contexts');") >
+                     "AND name IN ('facts','compile_contexts');") >
           0)
     throw std::runtime_error(
         "unversioned prototype catalog is unsupported; remove and rebuild it");
@@ -139,8 +161,13 @@ Catalog::Catalog(std::filesystem::path root, std::size_t maximum_cached_facts,
           "source_commit TEXT NOT NULL,created_at INTEGER NOT NULL DEFAULT 0,"
           "accessed_at INTEGER NOT NULL DEFAULT 0);");
   execute("CREATE INDEX IF NOT EXISTS facts_by_task ON facts(task_id);");
+  execute("CREATE TABLE IF NOT EXISTS manifest_cache_membership("
+          "manifest_id TEXT PRIMARY KEY,fact_id TEXT NOT NULL UNIQUE,"
+          "FOREIGN KEY(fact_id) REFERENCES facts(fact_id) ON DELETE CASCADE);");
   execute("CREATE TABLE IF NOT EXISTS imported_commits(commit_id TEXT PRIMARY "
           "KEY);");
+  execute("CREATE TABLE IF NOT EXISTS imported_ref_tips("
+          "ref_name TEXT PRIMARY KEY,commit_id TEXT NOT NULL);");
   execute(
       "CREATE TABLE IF NOT EXISTS compile_contexts(context_id TEXT NOT NULL,"
       "configuration TEXT NOT NULL,revision TEXT NOT NULL,translation_unit "
@@ -155,21 +182,8 @@ Catalog::Catalog(std::filesystem::path root, std::size_t maximum_cached_facts,
           "PRIMARY KEY(context_id,configuration,revision,path));");
   execute("CREATE INDEX IF NOT EXISTS contexts_by_file ON "
           "compile_context_files(path,revision);");
-  execute("CREATE TABLE IF NOT EXISTS scheduled_tasks(task_id TEXT PRIMARY "
-          "KEY,request_id TEXT NOT NULL,"
-          "state TEXT NOT NULL,task_json TEXT NOT NULL,created_at INTEGER NOT "
-          "NULL,attempt_count INTEGER NOT NULL DEFAULT 0,next_attempt_at "
-          "INTEGER NOT NULL DEFAULT 0,last_error TEXT NOT NULL DEFAULT ''); ");
-  execute("CREATE TABLE IF NOT EXISTS task_requests(task_id TEXT NOT NULL,"
-          "request_id TEXT NOT NULL,request_json TEXT NOT NULL,"
-          "PRIMARY KEY(task_id,request_id));");
   execute("CREATE TABLE IF NOT EXISTS published_tasks("
           "task_id TEXT PRIMARY KEY);");
-  execute("CREATE TABLE IF NOT EXISTS request_jobs("
-          "request_id TEXT PRIMARY KEY,request_json TEXT NOT NULL,state TEXT "
-          "NOT NULL,progress_json TEXT NOT NULL,result_json TEXT NOT NULL,"
-          "error_json TEXT NOT NULL,created_at INTEGER NOT NULL,updated_at "
-          "INTEGER NOT NULL);");
   execute("CREATE TABLE IF NOT EXISTS lineage_relations("
           "relation_id TEXT PRIMARY KEY,relation_json TEXT NOT NULL,"
           "review_state TEXT NOT NULL,updated_at INTEGER NOT NULL);");
@@ -181,14 +195,18 @@ Catalog::Catalog(std::filesystem::path root, std::size_t maximum_cached_facts,
           "repository_id TEXT NOT NULL,revision TEXT NOT NULL,context_id TEXT "
           "NOT NULL,source_element_id TEXT NOT NULL,target_element_id TEXT NOT "
           "NULL,manifest_id TEXT NOT NULL,PRIMARY KEY(repository_id,revision,"
-          "context_id,source_element_id,target_element_id,manifest_id));");
+          "context_id,source_element_id,target_element_id,manifest_id),"
+          "FOREIGN KEY(manifest_id) REFERENCES manifest_cache_membership(manifest_id) "
+          "ON DELETE CASCADE);");
   execute("CREATE INDEX IF NOT EXISTS reverse_element_dependencies ON "
           "element_dependencies(repository_id,revision,target_element_id);");
   execute("CREATE TABLE IF NOT EXISTS logical_elements("
           "repository_id TEXT NOT NULL,revision TEXT NOT NULL,context_id TEXT "
           "NOT NULL,manifest_id TEXT NOT NULL,element_id TEXT NOT NULL,"
           "kind TEXT NOT NULL,qualified_name TEXT NOT NULL,owner_path TEXT NOT "
-          "NULL,element_json TEXT NOT NULL,PRIMARY KEY(manifest_id,element_id));");
+          "NULL,element_json TEXT NOT NULL,PRIMARY KEY(manifest_id,element_id),"
+          "FOREIGN KEY(manifest_id) REFERENCES manifest_cache_membership(manifest_id) "
+          "ON DELETE CASCADE);");
   execute("CREATE INDEX IF NOT EXISTS elements_by_name ON logical_elements("
           "repository_id,revision,qualified_name,kind,owner_path);");
   execute("CREATE TABLE IF NOT EXISTS element_observations("
@@ -196,7 +214,9 @@ Catalog::Catalog(std::filesystem::path root, std::size_t maximum_cached_facts,
           "revision TEXT NOT NULL,context_id TEXT NOT NULL,variant_scope TEXT "
           "NOT NULL,translation_unit TEXT NOT NULL,owner_path TEXT NOT NULL,"
           "element_id TEXT NOT NULL,semantic_variant_id TEXT NOT NULL,"
-          "manifest_id TEXT NOT NULL,observation_json TEXT NOT NULL);");
+          "manifest_id TEXT NOT NULL,observation_json TEXT NOT NULL,"
+          "FOREIGN KEY(manifest_id) REFERENCES manifest_cache_membership(manifest_id) "
+          "ON DELETE CASCADE);");
   execute("CREATE INDEX IF NOT EXISTS observations_by_file ON "
           "element_observations(repository_id,revision,owner_path,element_id);");
   execute("CREATE TABLE IF NOT EXISTS evidence_receipts("
@@ -221,14 +241,63 @@ Catalog::Catalog(std::filesystem::path root, std::size_t maximum_cached_facts,
           "created_at INTEGER NOT NULL);");
   execute("CREATE INDEX IF NOT EXISTS pr_imports_by_repository ON "
           "pr_imports(repository_id,import_id);");
-  execute("UPDATE scheduled_tasks SET state='pending',next_attempt_at=0 WHERE "
-          "state IN ('dispatching','processing');");
+  execute("CREATE TABLE IF NOT EXISTS external_facts("
+          "content_id TEXT PRIMARY KEY,connector TEXT NOT NULL,kind TEXT NOT NULL,"
+          "external_id TEXT NOT NULL,source_updated_at INTEGER NOT NULL,"
+          "fact_json TEXT NOT NULL,source_commit TEXT NOT NULL,created_at INTEGER NOT NULL);");
+  execute("CREATE INDEX IF NOT EXISTS external_facts_effective ON external_facts("
+          "connector,kind,external_id,source_updated_at DESC,content_id);");
+  execute("CREATE TABLE IF NOT EXISTS connector_status("
+          "connector TEXT PRIMARY KEY,status_json TEXT NOT NULL,updated_at INTEGER NOT NULL);");
+  execute("CREATE TABLE IF NOT EXISTS work_items("
+          "work_id TEXT PRIMARY KEY,kind TEXT NOT NULL,parameters_json TEXT NOT NULL,"
+          "credential_reference TEXT NOT NULL DEFAULT '',fifo_sequence INTEGER NOT NULL UNIQUE,"
+          "state TEXT NOT NULL CHECK(state IN ('pending','running','waiting_for_credential',"
+          "'retry_wait','completed','failed','cancelled')),owner TEXT NOT NULL DEFAULT '',"
+          "attempt_count INTEGER NOT NULL DEFAULT 0,next_attempt_at INTEGER NOT NULL DEFAULT 0,"
+          "cancellation_requested INTEGER NOT NULL DEFAULT 0,maintenance INTEGER NOT NULL DEFAULT 0,"
+          "progress_json TEXT NOT NULL DEFAULT '{}',error_fingerprint TEXT NOT NULL DEFAULT '',"
+          "created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);");
+  execute("CREATE INDEX IF NOT EXISTS runnable_work ON work_items("
+          "state,maintenance,next_attempt_at,fifo_sequence);");
+  execute("CREATE UNIQUE INDEX IF NOT EXISTS one_running_work ON work_items(state) "
+          "WHERE state='running';");
+  execute("CREATE TABLE IF NOT EXISTS work_dependencies("
+          "work_id TEXT NOT NULL,depends_on TEXT NOT NULL,PRIMARY KEY(work_id,depends_on),"
+          "FOREIGN KEY(work_id) REFERENCES work_items(work_id) ON DELETE CASCADE,"
+          "FOREIGN KEY(depends_on) REFERENCES work_items(work_id) ON DELETE CASCADE);");
+  execute("CREATE TABLE IF NOT EXISTS work_invocations("
+          "work_id TEXT NOT NULL,invocation_id TEXT NOT NULL,PRIMARY KEY(work_id,invocation_id),"
+          "FOREIGN KEY(work_id) REFERENCES work_items(work_id) ON DELETE CASCADE);");
+  execute("CREATE INDEX IF NOT EXISTS work_by_invocation ON work_invocations(invocation_id,work_id);");
+  execute("CREATE TABLE IF NOT EXISTS runner_lease("
+          "singleton INTEGER PRIMARY KEY CHECK(singleton=1),state TEXT NOT NULL,"
+          "adoption_token TEXT NOT NULL DEFAULT '',owner TEXT NOT NULL DEFAULT '',pid INTEGER NOT NULL DEFAULT 0,"
+          "process_start_identity TEXT NOT NULL DEFAULT '',executable_identity TEXT NOT NULL DEFAULT '',"
+          "schema_identity TEXT NOT NULL DEFAULT '1',config_identity TEXT NOT NULL DEFAULT '',"
+          "credential_capabilities_json TEXT NOT NULL DEFAULT '[]',heartbeat_at INTEGER NOT NULL DEFAULT 0,"
+          "created_at INTEGER NOT NULL DEFAULT 0);");
   execute("PRAGMA user_version=1;");
 }
 
 Catalog::~Catalog() {
   if (database_)
     sqlite3_close(database_);
+}
+
+std::pair<std::size_t, std::uint64_t> Catalog::fact_cache_usage() const {
+  std::scoped_lock lock(mutex_);
+  sqlite3_stmt *statement = nullptr;
+  check(sqlite3_prepare_v2(
+            database_,
+            "SELECT count(*),COALESCE(sum(length(fact_json)),0) FROM facts",
+            -1, &statement, nullptr),
+        database_, "prepare fact cache usage");
+  check(sqlite3_step(statement), database_, "read fact cache usage");
+  const auto count = static_cast<std::size_t>(sqlite3_column_int64(statement, 0));
+  const auto bytes = static_cast<std::uint64_t>(sqlite3_column_int64(statement, 1));
+  sqlite3_finalize(statement);
+  return {count, bytes};
 }
 
 void Catalog::execute(const char *sql) const {
@@ -378,6 +447,19 @@ void Catalog::store_fact(const std::string &fact_id, const std::string &task_id,
   if (result.is_object() &&
       result.value("record_type", std::string{}) == "tu_manifest") {
     const auto manifest = result.get<TuManifest>();
+    sqlite3_stmt *membership = nullptr;
+    check(sqlite3_prepare_v2(
+              database_,
+              "INSERT OR REPLACE INTO manifest_cache_membership(manifest_id,fact_id) "
+              "VALUES(?,?)",
+              -1, &membership, nullptr),
+          database_, "prepare manifest cache membership");
+    sqlite3_bind_text(membership, 1, manifest.manifest_id.c_str(), -1,
+                      SQLITE_TRANSIENT);
+    sqlite3_bind_text(membership, 2, fact_id.c_str(), -1, SQLITE_TRANSIENT);
+    const auto membership_code = sqlite3_step(membership);
+    sqlite3_finalize(membership);
+    check(membership_code, database_, "store manifest cache membership");
     std::unordered_map<std::string, LogicalElement> elements;
     for (const auto &element : manifest.elements) {
       elements.emplace(element.element_id, element);
@@ -519,8 +601,8 @@ void Catalog::store_fact(const std::string &fact_id, const std::string &task_id,
   }
   statement = nullptr;
   check(sqlite3_prepare_v2(database_,
-                           "UPDATE scheduled_tasks SET state='completed' "
-                           "WHERE task_id=?",
+                           "UPDATE work_items SET state='completed',owner='',updated_at=strftime('%s','now') "
+                           "WHERE work_id=?",
                            -1, &statement, nullptr),
         database_, "prepare completed task update");
   sqlite3_bind_text(statement, 1, task_id.c_str(), -1, SQLITE_TRANSIENT);
@@ -555,21 +637,14 @@ void Catalog::store_fact(const std::string &fact_id, const std::string &task_id,
     bytes -= std::min(bytes, removed_bytes);
   }
   execute_sql(database_,
-              "DELETE FROM element_dependencies WHERE manifest_id NOT IN "
-              "(SELECT json_extract(fact_json,'$.result.manifest_id') FROM facts);"
-              "DELETE FROM element_observations WHERE manifest_id NOT IN "
-              "(SELECT json_extract(fact_json,'$.result.manifest_id') FROM facts);"
-              "DELETE FROM logical_elements WHERE manifest_id NOT IN "
-              "(SELECT json_extract(fact_json,'$.result.manifest_id') FROM facts);",
-              "prune evicted semantic indexes");
-  execute_sql(database_,
-              "UPDATE scheduled_tasks SET state='pending',next_attempt_at=0 "
+              "UPDATE work_items SET state='pending',next_attempt_at=0 "
               "WHERE state='completed' AND NOT EXISTS "
-              "(SELECT 1 FROM facts WHERE facts.task_id=scheduled_tasks.task_id);"
+              "(SELECT 1 FROM facts WHERE facts.task_id=work_items.work_id);"
               "DELETE FROM published_tasks WHERE task_id IN "
-              "(SELECT task_id FROM scheduled_tasks WHERE state='pending');",
+              "(SELECT work_id FROM work_items WHERE state='pending');",
               "reschedule evicted cache facts");
   transaction.commit();
+  snapshot_id_cache_.reset();
 }
 
 std::optional<nlohmann::json>
@@ -630,6 +705,35 @@ void Catalog::mark_imported(const std::string &commit) {
   const auto code = sqlite3_step(statement);
   sqlite3_finalize(statement);
   check(code, database_, "store imported commit");
+}
+
+std::string Catalog::imported_ref_tip(const std::string &ref) const {
+  std::scoped_lock lock(mutex_);
+  sqlite3_stmt *statement = nullptr;
+  check(sqlite3_prepare_v2(database_,
+                           "SELECT commit_id FROM imported_ref_tips WHERE ref_name=?",
+                           -1, &statement, nullptr), database_, "prepare imported ref tip");
+  sqlite3_bind_text(statement, 1, ref.c_str(), -1, SQLITE_TRANSIENT);
+  std::string result;
+  if (sqlite3_step(statement) == SQLITE_ROW)
+    result = reinterpret_cast<const char *>(sqlite3_column_text(statement, 0));
+  sqlite3_finalize(statement);
+  return result;
+}
+
+void Catalog::mark_imported_ref_tip(const std::string &ref,
+                                    const std::string &commit) {
+  if (ref.empty() || commit.empty()) return;
+  std::scoped_lock lock(mutex_);
+  sqlite3_stmt *statement = nullptr;
+  check(sqlite3_prepare_v2(database_,
+                           "INSERT OR REPLACE INTO imported_ref_tips(ref_name,commit_id) VALUES(?,?)",
+                           -1, &statement, nullptr), database_, "prepare imported ref tip update");
+  sqlite3_bind_text(statement, 1, ref.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(statement, 2, commit.c_str(), -1, SQLITE_TRANSIENT);
+  const auto code = sqlite3_step(statement);
+  sqlite3_finalize(statement);
+  check(code, database_, "store imported ref tip");
 }
 
 void Catalog::store_compile_context(const CompileContext &context) {
@@ -730,34 +834,64 @@ void Catalog::schedule_task(const std::string &task_id,
   Transaction transaction(database_);
   sqlite3_stmt *s = nullptr;
   check(sqlite3_prepare_v2(database_,
-                           "INSERT OR IGNORE INTO "
-                           "scheduled_tasks(task_id,request_id,state,task_json,"
-                           "created_at) VALUES(?,?,'pending',?,?)",
+                           "INSERT OR IGNORE INTO work_items(work_id,kind,parameters_json,"
+                           "fifo_sequence,state,created_at,updated_at) VALUES(?,"
+                           "'extraction',?,COALESCE((SELECT max(fifo_sequence)+1 FROM work_items),1),"
+                           "'pending',?,?)",
                            -1, &s, nullptr),
         database_, "prepare task");
   const auto request = task.value("request_id", std::string{}),
              value = task.dump();
   sqlite3_bind_text(s, 1, task_id.c_str(), -1, SQLITE_TRANSIENT);
-  sqlite3_bind_text(s, 2, request.c_str(), -1, SQLITE_TRANSIENT);
-  sqlite3_bind_text(s, 3, value.c_str(), -1, SQLITE_TRANSIENT);
-  sqlite3_bind_int64(
-      s, 4,
-      std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()));
+  sqlite3_bind_text(s, 2, value.c_str(), -1, SQLITE_TRANSIENT);
+  const auto now = std::chrono::system_clock::to_time_t(
+      std::chrono::system_clock::now());
+  sqlite3_bind_int64(s, 3, now);
+  sqlite3_bind_int64(s, 4, now);
   const auto code = sqlite3_step(s);
   sqlite3_finalize(s);
   check(code, database_, "schedule task");
   s = nullptr;
-  check(sqlite3_prepare_v2(database_,
-                           "INSERT OR REPLACE INTO task_requests("
-                           "task_id,request_id,request_json) VALUES(?,?,?)",
-                           -1, &s, nullptr),
-        database_, "prepare task request");
-  sqlite3_bind_text(s, 1, task_id.c_str(), -1, SQLITE_TRANSIENT);
-  sqlite3_bind_text(s, 2, request.c_str(), -1, SQLITE_TRANSIENT);
-  sqlite3_bind_text(s, 3, value.c_str(), -1, SQLITE_TRANSIENT);
-  const auto request_code = sqlite3_step(s);
-  sqlite3_finalize(s);
-  check(request_code, database_, "store task request");
+  if (!request.empty()) {
+    s = nullptr;
+    check(sqlite3_prepare_v2(
+              database_,
+              "INSERT OR IGNORE INTO work_invocations(work_id,invocation_id) VALUES(?,?)",
+              -1, &s, nullptr),
+          database_, "prepare extraction invocation");
+    sqlite3_bind_text(s, 1, task_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 2, request.c_str(), -1, SQLITE_TRANSIENT);
+    check(sqlite3_step(s), database_, "link extraction invocation");
+    sqlite3_finalize(s);
+  }
+  if (!launch_executable_identity_.empty()) {
+    execute_sql(database_,
+                "DELETE FROM runner_lease WHERE singleton=1 AND heartbeat_at<strftime('%s','now')-30",
+                "recover stale runner during extraction enqueue");
+    std::random_device random;
+    const auto token = stable_hash(std::to_string(
+        std::chrono::high_resolution_clock::now().time_since_epoch().count()) +
+                                   ":" + std::to_string(random()) + ":" +
+                                   std::to_string(random()));
+    const auto capabilities =
+        nlohmann::json(launch_credential_capabilities_).dump();
+    check(sqlite3_prepare_v2(
+              database_,
+              "INSERT OR IGNORE INTO runner_lease(singleton,state,adoption_token,"
+              "executable_identity,config_identity,credential_capabilities_json,"
+              "heartbeat_at,created_at) VALUES(1,'launching',?,?,?,?,"
+              "strftime('%s','now'),strftime('%s','now'))",
+              -1, &s, nullptr),
+          database_, "prepare extraction runner launch");
+    sqlite3_bind_text(s, 1, token.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 2, launch_executable_identity_.c_str(), -1,
+                      SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 3, launch_config_identity_.c_str(), -1,
+                      SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 4, capabilities.c_str(), -1, SQLITE_TRANSIENT);
+    check(sqlite3_step(s), database_, "claim runner during extraction enqueue");
+    sqlite3_finalize(s);
+  }
   transaction.commit();
 }
 
@@ -766,13 +900,13 @@ nlohmann::json Catalog::pending_tasks(const std::string &request) const {
   sqlite3_stmt *s = nullptr;
   const char *sql =
       request.empty()
-          ? "SELECT task_id,state,task_json FROM scheduled_tasks "
-            "WHERE state!='completed' "
-            "ORDER BY created_at,task_id"
-          : "SELECT t.task_id,t.state,r.request_json FROM scheduled_tasks t "
-            "JOIN task_requests r ON r.task_id=t.task_id "
-            "WHERE r.request_id=? AND t.state!='completed' "
-            "ORDER BY t.created_at,t.task_id";
+          ? "SELECT work_id,state,parameters_json FROM work_items "
+            "WHERE kind='extraction' AND state!='completed' "
+            "ORDER BY fifo_sequence"
+          : "SELECT t.work_id,t.state,t.parameters_json FROM work_items t "
+            "JOIN work_invocations r ON r.work_id=t.work_id "
+            "WHERE r.invocation_id=? AND t.state!='completed' "
+            "ORDER BY t.fifo_sequence";
   check(sqlite3_prepare_v2(database_, sql, -1, &s, nullptr), database_,
         "prepare pending tasks");
   if (!request.empty())
@@ -795,9 +929,10 @@ nlohmann::json Catalog::results_for_request(const std::string &request) const {
   sqlite3_stmt *statement = nullptr;
   check(sqlite3_prepare_v2(
             database_,
-            "SELECT r.request_json,f.fact_json FROM task_requests r "
-            "JOIN facts f ON f.task_id=r.task_id WHERE r.request_id=? "
-            "ORDER BY r.task_id,f.fact_id",
+            "SELECT w.parameters_json,f.fact_json FROM work_invocations r "
+            "JOIN work_items w ON w.work_id=r.work_id "
+            "JOIN facts f ON f.task_id=r.work_id WHERE r.invocation_id=? "
+            "ORDER BY r.work_id,f.fact_id",
             -1, &statement, nullptr),
         database_, "prepare request results");
   sqlite3_bind_text(statement, 1, request.c_str(), -1, SQLITE_TRANSIENT);
@@ -818,13 +953,13 @@ std::optional<nlohmann::json> Catalog::next_pending_task() const {
   sqlite3_stmt *s = nullptr;
   check(sqlite3_prepare_v2(
             database_,
-            "UPDATE scheduled_tasks SET state='dispatching' WHERE task_id=("
-            "SELECT task_id FROM scheduled_tasks WHERE state IN "
-            "('pending','waiting','transient_failure') AND next_attempt_at<="
+            "UPDATE work_items SET state='running' WHERE work_id=("
+            "SELECT work_id FROM work_items WHERE kind='extraction' AND state IN "
+            "('pending','waiting_for_credential','retry_wait') AND next_attempt_at<="
             "strftime('%s','now') AND EXISTS(SELECT 1 FROM published_tasks p "
-            "WHERE p.task_id=scheduled_tasks.task_id) ORDER BY "
-            "next_attempt_at,created_at,task_id "
-            "LIMIT 1) RETURNING task_id,task_json,attempt_count",
+            "WHERE p.task_id=work_items.work_id) ORDER BY "
+            "next_attempt_at,fifo_sequence "
+            "LIMIT 1) RETURNING work_id,parameters_json,attempt_count",
             -1, &s, nullptr),
         database_, "prepare next task");
   if (sqlite3_step(s) != SQLITE_ROW) {
@@ -846,11 +981,11 @@ nlohmann::json Catalog::fail_task(const std::string &task_id,
   sqlite3_stmt *statement = nullptr;
   check(sqlite3_prepare_v2(
             database_,
-            "UPDATE scheduled_tasks SET attempt_count=attempt_count+1,"
-            "state=CASE WHEN attempt_count+1>=? THEN 'quarantined' ELSE "
-            "'transient_failure' END,last_error=?,next_attempt_at="
+            "UPDATE work_items SET attempt_count=attempt_count+1,"
+            "state=CASE WHEN attempt_count+1>=? THEN 'failed' ELSE "
+            "'retry_wait' END,error_fingerprint=?,next_attempt_at="
             "strftime('%s','now') + min(300,(1 << min(attempt_count,8))),"
-            "created_at=strftime('%s','now') WHERE task_id=? RETURNING "
+            "updated_at=strftime('%s','now') WHERE work_id=? RETURNING "
             "attempt_count,state,next_attempt_at",
             -1, &statement, nullptr),
         database_, "prepare failed task update");
@@ -865,119 +1000,6 @@ nlohmann::json Catalog::fail_task(const std::string &task_id,
                            {"next_attempt_at", sqlite3_column_int64(statement, 2)}};
   sqlite3_finalize(statement);
   return result;
-}
-
-void Catalog::retry_task(const std::string &task_id) {
-  std::scoped_lock lock(mutex_);
-  sqlite3_stmt *statement = nullptr;
-  check(sqlite3_prepare_v2(
-            database_,
-            "UPDATE scheduled_tasks SET state='pending',attempt_count=0,"
-            "next_attempt_at=0,last_error='' WHERE task_id=? AND state IN "
-            "('quarantined','incompatible_worker','cancelled')",
-            -1, &statement, nullptr),
-        database_, "prepare task retry");
-  sqlite3_bind_text(statement, 1, task_id.c_str(), -1, SQLITE_TRANSIENT);
-  const auto code = sqlite3_step(statement);
-  sqlite3_finalize(statement);
-  check(code, database_, "retry task");
-}
-
-void Catalog::cancel_request_tasks(const std::string &request_id) {
-  std::scoped_lock lock(mutex_);
-  sqlite3_stmt *statement = nullptr;
-  check(sqlite3_prepare_v2(
-            database_,
-            "UPDATE scheduled_tasks SET state='cancelled' WHERE task_id IN "
-            "(SELECT task_id FROM task_requests WHERE request_id=?) AND state "
-            "IN ('pending','waiting','transient_failure','dispatching')",
-            -1, &statement, nullptr),
-        database_, "prepare request cancellation");
-  sqlite3_bind_text(statement, 1, request_id.c_str(), -1, SQLITE_TRANSIENT);
-  const auto code = sqlite3_step(statement);
-  sqlite3_finalize(statement);
-  check(code, database_, "cancel request tasks");
-}
-
-std::string Catalog::create_request(const nlohmann::json &request) {
-  const auto serialized = request.dump();
-  const auto request_id = stable_hash(serialized);
-  const auto now =
-      std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-  std::scoped_lock lock(mutex_);
-  sqlite3_stmt *statement = nullptr;
-  check(sqlite3_prepare_v2(
-            database_,
-            "INSERT OR IGNORE INTO request_jobs(request_id,request_json,state,"
-            "progress_json,result_json,error_json,created_at,updated_at) "
-            "VALUES(?,?,'queued','{}','{}','{}',?,?)",
-            -1, &statement, nullptr),
-        database_, "prepare request job");
-  sqlite3_bind_text(statement, 1, request_id.c_str(), -1, SQLITE_TRANSIENT);
-  sqlite3_bind_text(statement, 2, serialized.c_str(), -1, SQLITE_TRANSIENT);
-  sqlite3_bind_int64(statement, 3, now);
-  sqlite3_bind_int64(statement, 4, now);
-  const auto code = sqlite3_step(statement);
-  sqlite3_finalize(statement);
-  check(code, database_, "create request job");
-  return request_id;
-}
-
-std::optional<nlohmann::json>
-Catalog::request_job(const std::string &request_id) const {
-  std::scoped_lock lock(mutex_);
-  sqlite3_stmt *statement = nullptr;
-  check(sqlite3_prepare_v2(
-            database_,
-            "SELECT request_json,state,progress_json,result_json,error_json,"
-            "created_at,updated_at FROM request_jobs WHERE request_id=?",
-            -1, &statement, nullptr),
-        database_, "prepare request job lookup");
-  sqlite3_bind_text(statement, 1, request_id.c_str(), -1, SQLITE_TRANSIENT);
-  if (sqlite3_step(statement) != SQLITE_ROW) {
-    sqlite3_finalize(statement);
-    return std::nullopt;
-  }
-  nlohmann::json result = {
-      {"request_id", request_id},
-      {"request", nlohmann::json::parse(reinterpret_cast<const char *>(
-                      sqlite3_column_text(statement, 0)))},
-      {"state", reinterpret_cast<const char *>(sqlite3_column_text(statement, 1))},
-      {"progress", nlohmann::json::parse(reinterpret_cast<const char *>(
-                       sqlite3_column_text(statement, 2)))},
-      {"result", nlohmann::json::parse(reinterpret_cast<const char *>(
-                     sqlite3_column_text(statement, 3)))},
-      {"error", nlohmann::json::parse(reinterpret_cast<const char *>(
-                    sqlite3_column_text(statement, 4)))},
-      {"created_at", sqlite3_column_int64(statement, 5)},
-      {"updated_at", sqlite3_column_int64(statement, 6)}};
-  sqlite3_finalize(statement);
-  return result;
-}
-
-void Catalog::update_request(const std::string &request_id,
-                             const std::string &state,
-                             const nlohmann::json &progress,
-                             const nlohmann::json &result,
-                             const nlohmann::json &error) {
-  std::scoped_lock lock(mutex_);
-  sqlite3_stmt *statement = nullptr;
-  check(sqlite3_prepare_v2(
-            database_,
-            "UPDATE request_jobs SET state=?,progress_json=?,result_json=?,"
-            "error_json=?,updated_at=strftime('%s','now') WHERE request_id=?",
-            -1, &statement, nullptr),
-        database_, "prepare request job update");
-  const auto progress_json = progress.dump(), result_json = result.dump(),
-             error_json = error.dump();
-  sqlite3_bind_text(statement, 1, state.c_str(), -1, SQLITE_TRANSIENT);
-  sqlite3_bind_text(statement, 2, progress_json.c_str(), -1, SQLITE_TRANSIENT);
-  sqlite3_bind_text(statement, 3, result_json.c_str(), -1, SQLITE_TRANSIENT);
-  sqlite3_bind_text(statement, 4, error_json.c_str(), -1, SQLITE_TRANSIENT);
-  sqlite3_bind_text(statement, 5, request_id.c_str(), -1, SQLITE_TRANSIENT);
-  const auto code = sqlite3_step(statement);
-  sqlite3_finalize(statement);
-  check(code, database_, "update request job");
 }
 
 void Catalog::store_lineage_relation(const LineageRelation &relation) {
@@ -1089,13 +1111,15 @@ nlohmann::json Catalog::semantic_dependents(
     const std::string &repository_id, const std::string &revision,
     const std::vector<std::string> &element_ids, std::size_t maximum) const {
   std::scoped_lock lock(mutex_);
-  std::set<std::string> visited(element_ids.begin(), element_ids.end());
+  std::set<std::string> expanded;
+  std::set<std::tuple<std::string, std::string, std::string, std::string>> emitted;
   std::vector<std::string> frontier(element_ids.begin(), element_ids.end());
   nlohmann::json rows = nlohmann::json::array();
   bool truncated = false;
   while (!frontier.empty() && !truncated) {
     const auto target = std::move(frontier.back());
     frontier.pop_back();
+    if (!expanded.insert(target).second) continue;
     sqlite3_stmt *statement = nullptr;
     check(sqlite3_prepare_v2(
               database_,
@@ -1111,15 +1135,14 @@ nlohmann::json Catalog::semantic_dependents(
     while (sqlite3_step(statement) == SQLITE_ROW) {
       const std::string source = reinterpret_cast<const char *>(
           sqlite3_column_text(statement, 0));
-      if (!visited.insert(source).second) continue;
-      rows.push_back({
-          {"element_id", source},
-          {"depends_on", target},
-          {"context_id", reinterpret_cast<const char *>(
-                             sqlite3_column_text(statement, 1))},
-          {"manifest_id", reinterpret_cast<const char *>(
-                              sqlite3_column_text(statement, 2))}});
-      frontier.push_back(source);
+      const std::string context = reinterpret_cast<const char *>(
+          sqlite3_column_text(statement, 1));
+      const std::string manifest = reinterpret_cast<const char *>(
+          sqlite3_column_text(statement, 2));
+      if (emitted.emplace(source, target, context, manifest).second)
+        rows.push_back({{"element_id", source}, {"depends_on", target},
+                        {"context_id", context}, {"manifest_id", manifest}});
+      if (!expanded.contains(source)) frontier.push_back(source);
       if (rows.size() >= maximum) {
         truncated = true;
         break;
@@ -1139,27 +1162,48 @@ nlohmann::json Catalog::symbol_search(const std::string &repository_id,
   const auto kind = selector.value("kind", std::string{});
   const auto path = selector.value("path", std::string{});
   const auto match = selector.value("match", std::string{"contains"});
-  const auto pattern = name.empty() ? std::string{"%"}
-      : match == "exact" ? name
-      : match == "prefix" ? name + "%" : "%" + name + "%";
+  if (match != "exact" && match != "prefix" && match != "contains")
+    throw std::invalid_argument("symbol selector match must be exact, prefix, or contains");
+  std::string predicate;
+  if (name.empty()) predicate = "1=1";
+  else if (match == "exact") predicate = "qualified_name=?";
+  else if (match == "prefix")
+    predicate = "qualified_name>=? AND qualified_name<?";
+  else predicate = "qualified_name LIKE ?";
+  std::string sql =
+      "SELECT element_json,context_id,manifest_id,revision FROM logical_elements "
+      "WHERE repository_id=? ";
+  if (!revision.empty()) sql += "AND revision=? ";
+  sql += "AND " + predicate + " ";
+  if (!kind.empty()) sql += "AND kind=? ";
+  if (!path.empty()) sql += "AND owner_path=? ";
+  sql += "ORDER BY qualified_name,kind,owner_path,context_id LIMIT ?";
   sqlite3_stmt *statement = nullptr;
-  check(sqlite3_prepare_v2(
-            database_,
-            "SELECT element_json,context_id,manifest_id,revision FROM logical_elements "
-            "WHERE repository_id=? AND (?='' OR revision=?) AND qualified_name LIKE ? "
-            "AND (?='' OR kind=?) AND (?='' OR owner_path=?) "
-            "ORDER BY qualified_name,kind,owner_path,context_id LIMIT ?",
-            -1, &statement, nullptr),
+  check(sqlite3_prepare_v2(database_, sql.c_str(), -1, &statement, nullptr),
         database_, "prepare symbol search");
-  sqlite3_bind_text(statement, 1, repository_id.c_str(), -1, SQLITE_TRANSIENT);
-  sqlite3_bind_text(statement, 2, revision.c_str(), -1, SQLITE_TRANSIENT);
-  sqlite3_bind_text(statement, 3, revision.c_str(), -1, SQLITE_TRANSIENT);
-  sqlite3_bind_text(statement, 4, pattern.c_str(), -1, SQLITE_TRANSIENT);
-  sqlite3_bind_text(statement, 5, kind.c_str(), -1, SQLITE_TRANSIENT);
-  sqlite3_bind_text(statement, 6, kind.c_str(), -1, SQLITE_TRANSIENT);
-  sqlite3_bind_text(statement, 7, path.c_str(), -1, SQLITE_TRANSIENT);
-  sqlite3_bind_text(statement, 8, path.c_str(), -1, SQLITE_TRANSIENT);
-  sqlite3_bind_int64(statement, 9, static_cast<sqlite3_int64>(maximum + 1));
+  int parameter = 1;
+  sqlite3_bind_text(statement, parameter++, repository_id.c_str(), -1, SQLITE_TRANSIENT);
+  if (!revision.empty())
+    sqlite3_bind_text(statement, parameter++, revision.c_str(), -1, SQLITE_TRANSIENT);
+  if (!name.empty()) {
+    if (match == "contains") {
+      const auto pattern = "%" + name + "%";
+      sqlite3_bind_text(statement, parameter++, pattern.c_str(), -1, SQLITE_TRANSIENT);
+    } else {
+      sqlite3_bind_text(statement, parameter++, name.c_str(), -1, SQLITE_TRANSIENT);
+      if (match == "prefix") {
+        auto upper = name;
+        upper.push_back(static_cast<char>(0xff));
+        sqlite3_bind_text(statement, parameter++, upper.data(),
+                          static_cast<int>(upper.size()), SQLITE_TRANSIENT);
+      }
+    }
+  }
+  if (!kind.empty())
+    sqlite3_bind_text(statement, parameter++, kind.c_str(), -1, SQLITE_TRANSIENT);
+  if (!path.empty())
+    sqlite3_bind_text(statement, parameter++, path.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_int64(statement, parameter, static_cast<sqlite3_int64>(maximum + 1));
   nlohmann::json rows = nlohmann::json::array();
   while (sqlite3_step(statement) == SQLITE_ROW) {
     auto row = nlohmann::json::parse(
@@ -1210,6 +1254,7 @@ void Catalog::store_receipt(const EvidenceReceipt &receipt) {
   const auto code = sqlite3_step(statement);
   sqlite3_finalize(statement);
   check(code, database_, "store evidence receipt");
+  snapshot_id_cache_.reset();
 }
 
 std::optional<EvidenceReceipt> Catalog::receipt(const std::string &receipt_id) const {
@@ -1259,6 +1304,7 @@ void Catalog::store_inference_claim(const InferenceClaim &claim) {
   const auto code = sqlite3_step(statement);
   sqlite3_finalize(statement);
   check(code, database_, "store inference claim");
+  snapshot_id_cache_.reset();
 }
 
 void Catalog::store_knowledge_decision(const KnowledgeDecision &decision,
@@ -1300,6 +1346,7 @@ void Catalog::store_knowledge_decision(const KnowledgeDecision &decision,
   const auto code = sqlite3_step(statement);
   sqlite3_finalize(statement);
   check(code, database_, "store knowledge decision");
+  snapshot_id_cache_.reset();
 }
 
 nlohmann::json Catalog::inference_for_transition(
@@ -1381,14 +1428,23 @@ void Catalog::store_pr_import(const std::string &import_id,
   const auto code = sqlite3_step(statement);
   sqlite3_finalize(statement);
   check(code, database_, "store PR import");
+  snapshot_id_cache_.reset();
 }
 
 nlohmann::json Catalog::pr_imports(const std::string &repository_id) const {
   std::scoped_lock lock(mutex_);
   sqlite3_stmt *statement = nullptr;
   check(sqlite3_prepare_v2(database_,
-                           "SELECT import_id,record_json,source_commit FROM pr_imports "
-                           "WHERE repository_id=? ORDER BY import_id",
+                           "WITH ranked AS (SELECT import_id,record_json,source_commit,"
+                           "row_number() OVER (PARTITION BY "
+                           "COALESCE(json_extract(record_json,'$.connector'),"
+                           "json_extract(record_json,'$.source'),''),"
+                           "COALESCE(json_extract(record_json,'$.external_id'),"
+                           "json_extract(record_json,'$.pr_id'),import_id) "
+                           "ORDER BY COALESCE(json_extract(record_json,'$.updated_at'),created_at) DESC,"
+                           "import_id) AS rank FROM pr_imports WHERE repository_id=?) "
+                           "SELECT import_id,record_json,source_commit FROM ranked "
+                           "WHERE rank=1 ORDER BY import_id",
                            -1, &statement, nullptr),
         database_, "prepare PR imports");
   sqlite3_bind_text(statement, 1, repository_id.c_str(), -1, SQLITE_TRANSIENT);
@@ -1404,16 +1460,139 @@ nlohmann::json Catalog::pr_imports(const std::string &repository_id) const {
   return rows;
 }
 
+void Catalog::store_external_fact(const std::string &connector,
+                                  const std::string &kind,
+                                  const std::string &external_id,
+                                  const std::string &content_id,
+                                  std::int64_t source_updated_at,
+                                  const nlohmann::json &fact,
+                                  const std::string &source_commit) {
+  if (connector.empty() || (kind != "pull_request" && kind != "issue") ||
+      external_id.empty() || content_id.empty() || source_updated_at < 0 ||
+      !fact.is_object())
+    throw std::invalid_argument("invalid normalized external fact");
+  for (const auto *forbidden : {"comments", "attachments", "worklogs",
+                                "authorization", "cookies", "token"})
+    if (fact.contains(forbidden))
+      throw std::invalid_argument("external fact contains a forbidden durable field");
+  const auto serialized = fact.dump();
+  std::scoped_lock lock(mutex_);
+  sqlite3_stmt *statement = nullptr;
+  check(sqlite3_prepare_v2(
+            database_,
+            "INSERT OR IGNORE INTO external_facts(content_id,connector,kind,"
+            "external_id,source_updated_at,fact_json,source_commit,created_at) "
+            "VALUES(?,?,?,?,?,?,?,strftime('%s','now'))",
+            -1, &statement, nullptr),
+        database_, "prepare external fact");
+  sqlite3_bind_text(statement, 1, content_id.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(statement, 2, connector.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(statement, 3, kind.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(statement, 4, external_id.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_int64(statement, 5, source_updated_at);
+  sqlite3_bind_text(statement, 6, serialized.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(statement, 7, source_commit.c_str(), -1, SQLITE_TRANSIENT);
+  const auto code = sqlite3_step(statement);
+  sqlite3_finalize(statement);
+  check(code, database_, "store external fact");
+  snapshot_id_cache_.reset();
+}
+
+nlohmann::json Catalog::external_fact(const std::string &connector,
+                                      const std::string &kind,
+                                      const std::string &external_id) const {
+  std::scoped_lock lock(mutex_);
+  sqlite3_stmt *statement = nullptr;
+  check(sqlite3_prepare_v2(
+            database_,
+            "SELECT content_id,source_updated_at,fact_json,source_commit FROM external_facts "
+            "WHERE connector=? AND kind=? AND external_id=? "
+            "ORDER BY source_updated_at DESC,content_id",
+            -1, &statement, nullptr),
+        database_, "prepare external fact lookup");
+  sqlite3_bind_text(statement, 1, connector.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(statement, 2, kind.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(statement, 3, external_id.c_str(), -1, SQLITE_TRANSIENT);
+  nlohmann::json effective;
+  nlohmann::json conflicts = nlohmann::json::array();
+  std::int64_t newest = -1;
+  while (sqlite3_step(statement) == SQLITE_ROW) {
+    const auto updated = sqlite3_column_int64(statement, 1);
+    if (newest >= 0 && updated != newest) break;
+    auto row = nlohmann::json::parse(
+        reinterpret_cast<const char *>(sqlite3_column_text(statement, 2)));
+    row["content_id"] = reinterpret_cast<const char *>(sqlite3_column_text(statement, 0));
+    row["source_commit"] = reinterpret_cast<const char *>(sqlite3_column_text(statement, 3));
+    row["source_updated_at"] = updated;
+    if (newest < 0) {
+      newest = updated;
+      effective = row;
+    } else {
+      conflicts.push_back(std::move(row));
+    }
+  }
+  sqlite3_finalize(statement);
+  if (effective.is_null()) return nlohmann::json{};
+  return {{"effective", std::move(effective)},
+          {"conflicts", std::move(conflicts)}};
+}
+
+void Catalog::store_connector_status(const std::string &connector,
+                                     const nlohmann::json &status) {
+  if (connector.empty() || !status.is_object())
+    throw std::invalid_argument("invalid connector status");
+  auto redacted = status;
+  for (const auto *secret : {"authorization", "cookie", "token"}) redacted.erase(secret);
+  const auto serialized = redacted.dump();
+  std::scoped_lock lock(mutex_);
+  sqlite3_stmt *statement = nullptr;
+  check(sqlite3_prepare_v2(database_,
+                           "INSERT OR REPLACE INTO connector_status(connector,status_json,updated_at) "
+                           "VALUES(?,?,strftime('%s','now'))", -1, &statement, nullptr),
+        database_, "prepare connector status");
+  sqlite3_bind_text(statement, 1, connector.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(statement, 2, serialized.c_str(), -1, SQLITE_TRANSIENT);
+  const auto code = sqlite3_step(statement);
+  sqlite3_finalize(statement);
+  check(code, database_, "store connector status");
+}
+
+nlohmann::json Catalog::connector_status(const std::string &connector) const {
+  std::scoped_lock lock(mutex_);
+  sqlite3_stmt *statement = nullptr;
+  check(sqlite3_prepare_v2(database_,
+                           "SELECT status_json,updated_at FROM connector_status WHERE connector=?",
+                           -1, &statement, nullptr), database_, "prepare connector status lookup");
+  sqlite3_bind_text(statement, 1, connector.c_str(), -1, SQLITE_TRANSIENT);
+  if (sqlite3_step(statement) != SQLITE_ROW) {
+    sqlite3_finalize(statement);
+    return {{"connector", connector}, {"state", "never_synchronized"}};
+  }
+  auto result = nlohmann::json::parse(
+      reinterpret_cast<const char *>(sqlite3_column_text(statement, 0)));
+  result["updated_at"] = sqlite3_column_int64(statement, 1);
+  sqlite3_finalize(statement);
+  return result;
+}
+
 void Catalog::set_task_state(const std::string &task_id,
                              const std::string &state) {
+  const auto queue_state = state == "processing" || state == "dispatching"
+                               ? std::string{"running"}
+                           : state == "waiting" ? std::string{"pending"}
+                           : state == "incompatible_worker"
+                               ? std::string{"waiting_for_credential"}
+                           : state == "transient_failure"
+                               ? std::string{"retry_wait"}
+                           : state == "quarantined" ? std::string{"failed"}
+                                                    : state;
   std::scoped_lock lock(mutex_);
   sqlite3_stmt *s = nullptr;
   check(sqlite3_prepare_v2(database_,
-                           "UPDATE scheduled_tasks SET state=?,created_at=? "
-                           "WHERE task_id=?",
+                           "UPDATE work_items SET state=?,updated_at=? WHERE work_id=?",
                            -1, &s, nullptr),
         database_, "prepare task state");
-  sqlite3_bind_text(s, 1, state.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(s, 1, queue_state.c_str(), -1, SQLITE_TRANSIENT);
   sqlite3_bind_int64(
       s, 2,
       std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()));
@@ -1452,6 +1631,7 @@ void Catalog::mark_task_published(const std::string &task_id) {
 
 std::string Catalog::snapshot_id() const {
   std::scoped_lock lock(mutex_);
+  if (snapshot_id_cache_) return *snapshot_id_cache_;
   sqlite3_stmt *statement = nullptr;
   check(sqlite3_prepare_v2(database_,
                            "SELECT identity FROM ("
@@ -1460,7 +1640,8 @@ std::string Catalog::snapshot_id() const {
                            "SELECT 'claim:'||claim_id FROM inference_claims UNION ALL "
                            "SELECT 'decision:'||decision_id||':'||knowledge_commit "
                            "FROM knowledge_decisions UNION ALL "
-                           "SELECT 'pr:'||import_id FROM pr_imports) ORDER BY identity", -1,
+                           "SELECT 'pr:'||import_id FROM pr_imports UNION ALL "
+                           "SELECT 'external:'||content_id FROM external_facts) ORDER BY identity", -1,
                            &statement, nullptr),
         database_, "prepare snapshot");
   std::string input;
@@ -1469,7 +1650,550 @@ std::string Catalog::snapshot_id() const {
     input.push_back('\n');
   }
   sqlite3_finalize(statement);
-  return stable_hash(input);
+  snapshot_id_cache_ = stable_hash(input);
+  return *snapshot_id_cache_;
+}
+
+Catalog::EnqueueResult Catalog::enqueue_work(
+    const std::string &kind, const nlohmann::json &parameters,
+    const std::string &invocation_id, const std::string &credential_reference,
+    bool maintenance, const std::vector<std::string> &dependencies) {
+  if (kind.empty() || !parameters.is_object())
+    throw std::invalid_argument("work requires a kind and object parameters");
+  if (contains_secret_material(parameters))
+    throw std::invalid_argument("work parameters cannot contain secret material");
+  const auto serialized = canonical_json(parameters);
+  const auto work_id = stable_hash("work-v1\n" + kind + "\n" + serialized +
+                                   "\n" + credential_reference);
+  std::scoped_lock lock(mutex_);
+  Transaction transaction(database_);
+  sqlite3_stmt *statement = nullptr;
+  check(sqlite3_prepare_v2(
+            database_,
+            "INSERT OR IGNORE INTO work_items(work_id,kind,parameters_json,"
+            "credential_reference,fifo_sequence,state,maintenance,created_at,updated_at) "
+            "VALUES(?,?,?,?,COALESCE((SELECT max(fifo_sequence)+1 FROM work_items),1),"
+            "'pending',?,strftime('%s','now'),strftime('%s','now'))",
+            -1, &statement, nullptr),
+        database_, "prepare work enqueue");
+  sqlite3_bind_text(statement, 1, work_id.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(statement, 2, kind.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(statement, 3, serialized.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(statement, 4, credential_reference.c_str(), -1,
+                    SQLITE_TRANSIENT);
+  sqlite3_bind_int(statement, 5, maintenance ? 1 : 0);
+  check(sqlite3_step(statement), database_, "enqueue work");
+  const bool inserted = sqlite3_changes(database_) != 0;
+  sqlite3_finalize(statement);
+  if (!inserted) {
+    check(sqlite3_prepare_v2(
+              database_,
+              "UPDATE work_items SET state='pending',attempt_count=0,next_attempt_at=0,"
+              "cancellation_requested=0,error_fingerprint='',updated_at=strftime('%s','now') "
+              "WHERE work_id=? AND state IN ('failed','cancelled')",
+              -1, &statement, nullptr),
+          database_, "prepare work rerun");
+    sqlite3_bind_text(statement, 1, work_id.c_str(), -1, SQLITE_TRANSIENT);
+    check(sqlite3_step(statement), database_, "rerun work");
+    sqlite3_finalize(statement);
+  }
+  if (!invocation_id.empty()) {
+    check(sqlite3_prepare_v2(
+              database_,
+              "INSERT OR IGNORE INTO work_invocations(work_id,invocation_id) VALUES(?,?)",
+              -1, &statement, nullptr),
+          database_, "prepare work invocation");
+    sqlite3_bind_text(statement, 1, work_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(statement, 2, invocation_id.c_str(), -1,
+                      SQLITE_TRANSIENT);
+    check(sqlite3_step(statement), database_, "link work invocation");
+    sqlite3_finalize(statement);
+  }
+  for (const auto &dependency : dependencies) {
+    check(sqlite3_prepare_v2(
+              database_,
+              "INSERT OR IGNORE INTO work_dependencies(work_id,depends_on) VALUES(?,?)",
+              -1, &statement, nullptr),
+          database_, "prepare work dependency");
+    sqlite3_bind_text(statement, 1, work_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(statement, 2, dependency.c_str(), -1, SQLITE_TRANSIENT);
+    check(sqlite3_step(statement), database_, "link work dependency");
+    sqlite3_finalize(statement);
+  }
+  if (!launch_executable_identity_.empty() &&
+      (credential_reference.empty() ||
+       launch_credential_capabilities_.contains(credential_reference))) {
+    execute_sql(database_,
+                "DELETE FROM runner_lease WHERE singleton=1 AND heartbeat_at<strftime('%s','now')-30",
+                "recover stale runner during enqueue");
+    std::random_device random;
+    const auto token = stable_hash(std::to_string(
+        std::chrono::high_resolution_clock::now().time_since_epoch().count()) +
+                                   ":" + std::to_string(random()) + ":" +
+                                   std::to_string(random()));
+    const auto capabilities =
+        nlohmann::json(launch_credential_capabilities_).dump();
+    check(sqlite3_prepare_v2(
+              database_,
+              "INSERT OR IGNORE INTO runner_lease(singleton,state,adoption_token,"
+              "executable_identity,config_identity,credential_capabilities_json,"
+              "heartbeat_at,created_at) VALUES(1,'launching',?,?,?,?,"
+              "strftime('%s','now'),strftime('%s','now'))",
+              -1, &statement, nullptr),
+          database_, "prepare atomic runner launch");
+    sqlite3_bind_text(statement, 1, token.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(statement, 2, launch_executable_identity_.c_str(), -1,
+                      SQLITE_TRANSIENT);
+    sqlite3_bind_text(statement, 3, launch_config_identity_.c_str(), -1,
+                      SQLITE_TRANSIENT);
+    sqlite3_bind_text(statement, 4, capabilities.c_str(), -1,
+                      SQLITE_TRANSIENT);
+    check(sqlite3_step(statement), database_, "claim runner during enqueue");
+    sqlite3_finalize(statement);
+  }
+  transaction.commit();
+  return {work_id, inserted};
+}
+
+void Catalog::configure_launch(
+    const std::set<std::string> &credential_capabilities,
+    const std::string &executable_identity, const std::string &config_identity) {
+  std::scoped_lock lock(mutex_);
+  launch_credential_capabilities_ = credential_capabilities;
+  launch_executable_identity_ = executable_identity;
+  launch_config_identity_ = config_identity;
+}
+
+std::optional<std::string> Catalog::pending_launch_token() const {
+  std::scoped_lock lock(mutex_);
+  sqlite3_stmt *statement = nullptr;
+  check(sqlite3_prepare_v2(
+            database_,
+            "SELECT adoption_token FROM runner_lease WHERE singleton=1 AND state='launching' "
+            "AND executable_identity=? AND config_identity=?",
+            -1, &statement, nullptr),
+        database_, "prepare pending launch token");
+  sqlite3_bind_text(statement, 1, launch_executable_identity_.c_str(), -1,
+                    SQLITE_TRANSIENT);
+  sqlite3_bind_text(statement, 2, launch_config_identity_.c_str(), -1,
+                    SQLITE_TRANSIENT);
+  if (sqlite3_step(statement) != SQLITE_ROW) {
+    sqlite3_finalize(statement);
+    return std::nullopt;
+  }
+  const auto token = std::string{reinterpret_cast<const char *>(
+      sqlite3_column_text(statement, 0))};
+  sqlite3_finalize(statement);
+  return token;
+}
+
+std::optional<std::string> Catalog::claim_runner_launch(
+    const std::set<std::string> &credential_capabilities,
+    const std::string &executable_identity,
+    const std::string &config_identity) {
+  std::scoped_lock lock(mutex_);
+  Transaction transaction(database_);
+  execute_sql(database_,
+              "UPDATE work_items SET state='pending',owner='',updated_at=strftime('%s','now') "
+              "WHERE state='running' AND NOT EXISTS(SELECT 1 FROM runner_lease WHERE singleton=1 "
+              "AND heartbeat_at>=strftime('%s','now')-30)",
+              "recover interrupted work");
+  execute_sql(database_,
+              "DELETE FROM runner_lease WHERE singleton=1 AND heartbeat_at<strftime('%s','now')-30",
+              "recover stale runner lease");
+  sqlite3_stmt *statement = nullptr;
+  check(sqlite3_prepare_v2(database_,
+                           "SELECT 1 FROM runner_lease WHERE singleton=1", -1,
+                           &statement, nullptr),
+        database_, "prepare runner lease lookup");
+  const bool leased = sqlite3_step(statement) == SQLITE_ROW;
+  sqlite3_finalize(statement);
+  if (leased) {
+    transaction.commit();
+    return std::nullopt;
+  }
+  check(sqlite3_prepare_v2(
+            database_,
+            "SELECT credential_reference FROM work_items w WHERE state IN "
+            "('pending','retry_wait','waiting_for_credential') AND next_attempt_at<=strftime('%s','now') "
+            "AND cancellation_requested=0 AND NOT EXISTS(SELECT 1 FROM work_dependencies d "
+            "JOIN work_items p ON p.work_id=d.depends_on WHERE d.work_id=w.work_id "
+            "AND p.state!='completed') ORDER BY maintenance,fifo_sequence",
+            -1, &statement, nullptr),
+        database_, "prepare runnable work lookup");
+  bool compatible = false;
+  while (sqlite3_step(statement) == SQLITE_ROW) {
+    const auto *text = reinterpret_cast<const char *>(sqlite3_column_text(statement, 0));
+    const std::string credential = text ? text : "";
+    if (credential.empty() || credential_capabilities.contains(credential)) {
+      compatible = true;
+      break;
+    }
+  }
+  sqlite3_finalize(statement);
+  if (!compatible) {
+    execute_sql(database_,
+                "UPDATE work_items SET state='waiting_for_credential' WHERE state IN "
+                "('pending','retry_wait') AND credential_reference!=''",
+                "mark credential-blocked work");
+    transaction.commit();
+    return std::nullopt;
+  }
+  std::random_device random;
+  const auto token = stable_hash(std::to_string(
+      std::chrono::high_resolution_clock::now().time_since_epoch().count()) +
+                                 ":" + std::to_string(random()) + ":" +
+                                 std::to_string(random()));
+  const auto capabilities = nlohmann::json(credential_capabilities).dump();
+  check(sqlite3_prepare_v2(
+            database_,
+            "INSERT INTO runner_lease(singleton,state,adoption_token,executable_identity,"
+            "config_identity,credential_capabilities_json,heartbeat_at,created_at) "
+            "VALUES(1,'launching',?,?,?,?,strftime('%s','now'),strftime('%s','now'))",
+            -1, &statement, nullptr),
+        database_, "prepare runner launch claim");
+  sqlite3_bind_text(statement, 1, token.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(statement, 2, executable_identity.c_str(), -1,
+                    SQLITE_TRANSIENT);
+  sqlite3_bind_text(statement, 3, config_identity.c_str(), -1,
+                    SQLITE_TRANSIENT);
+  sqlite3_bind_text(statement, 4, capabilities.c_str(), -1, SQLITE_TRANSIENT);
+  check(sqlite3_step(statement), database_, "claim runner launch");
+  sqlite3_finalize(statement);
+  transaction.commit();
+  return token;
+}
+
+bool Catalog::clear_failed_launch(const std::string &adoption_token) {
+  std::scoped_lock lock(mutex_);
+  sqlite3_stmt *statement = nullptr;
+  check(sqlite3_prepare_v2(database_,
+                           "DELETE FROM runner_lease WHERE singleton=1 AND state='launching' "
+                           "AND adoption_token=?",
+                           -1, &statement, nullptr),
+        database_, "prepare failed launch cleanup");
+  sqlite3_bind_text(statement, 1, adoption_token.c_str(), -1, SQLITE_TRANSIENT);
+  check(sqlite3_step(statement), database_, "clear failed launch");
+  const bool cleared = sqlite3_changes(database_) != 0;
+  sqlite3_finalize(statement);
+  return cleared;
+}
+
+bool Catalog::adopt_runner(
+    const std::string &adoption_token, const std::string &owner,
+    std::int64_t pid, const std::string &process_start_identity,
+    const std::string &executable_identity, const std::string &config_identity,
+    const std::set<std::string> &credential_capabilities) {
+  const auto capabilities = nlohmann::json(credential_capabilities).dump();
+  std::scoped_lock lock(mutex_);
+  sqlite3_stmt *statement = nullptr;
+  check(sqlite3_prepare_v2(
+            database_,
+            "UPDATE runner_lease SET state='active',adoption_token='',owner=?,pid=?,"
+            "process_start_identity=?,credential_capabilities_json=?,heartbeat_at=strftime('%s','now') "
+            "WHERE singleton=1 AND state='launching' AND adoption_token=? "
+            "AND executable_identity=? AND config_identity=? AND schema_identity='1'",
+            -1, &statement, nullptr),
+        database_, "prepare runner adoption");
+  sqlite3_bind_text(statement, 1, owner.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_int64(statement, 2, pid);
+  sqlite3_bind_text(statement, 3, process_start_identity.c_str(), -1,
+                    SQLITE_TRANSIENT);
+  sqlite3_bind_text(statement, 4, capabilities.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(statement, 5, adoption_token.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(statement, 6, executable_identity.c_str(), -1,
+                    SQLITE_TRANSIENT);
+  sqlite3_bind_text(statement, 7, config_identity.c_str(), -1,
+                    SQLITE_TRANSIENT);
+  check(sqlite3_step(statement), database_, "adopt runner");
+  const bool adopted = sqlite3_changes(database_) != 0;
+  sqlite3_finalize(statement);
+  return adopted;
+}
+
+bool Catalog::heartbeat_runner(const std::string &owner) {
+  std::scoped_lock lock(mutex_);
+  sqlite3_stmt *statement = nullptr;
+  check(sqlite3_prepare_v2(database_,
+                           "UPDATE runner_lease SET heartbeat_at=strftime('%s','now') "
+                           "WHERE singleton=1 AND state='active' AND owner=?",
+                           -1, &statement, nullptr),
+        database_, "prepare runner heartbeat");
+  sqlite3_bind_text(statement, 1, owner.c_str(), -1, SQLITE_TRANSIENT);
+  check(sqlite3_step(statement), database_, "heartbeat runner");
+  const bool alive = sqlite3_changes(database_) != 0;
+  sqlite3_finalize(statement);
+  return alive;
+}
+
+std::optional<nlohmann::json> Catalog::claim_next_work(
+    const std::string &owner,
+    const std::set<std::string> &credential_capabilities) {
+  std::scoped_lock lock(mutex_);
+  Transaction transaction(database_);
+  sqlite3_stmt *statement = nullptr;
+  check(sqlite3_prepare_v2(
+            database_,
+            "UPDATE work_items AS w SET state='failed',error_fingerprint=?,"
+            "updated_at=strftime('%s','now') WHERE state IN "
+            "('pending','retry_wait','waiting_for_credential') AND EXISTS("
+            "SELECT 1 FROM work_dependencies d JOIN work_items p ON p.work_id=d.depends_on "
+            "WHERE d.work_id=w.work_id AND p.state IN ('failed','cancelled'))",
+            -1, &statement, nullptr),
+        database_, "prepare failed dependency propagation");
+  const auto dependency_failure = stable_hash("dependency_failed");
+  sqlite3_bind_text(statement, 1, dependency_failure.c_str(), -1,
+                    SQLITE_TRANSIENT);
+  check(sqlite3_step(statement), database_, "propagate failed dependency");
+  sqlite3_finalize(statement);
+  statement = nullptr;
+  check(sqlite3_prepare_v2(database_,
+                           "SELECT owner FROM runner_lease WHERE singleton=1 AND state='active'",
+                           -1, &statement, nullptr),
+        database_, "prepare active runner check");
+  if (sqlite3_step(statement) != SQLITE_ROW ||
+      owner != reinterpret_cast<const char *>(sqlite3_column_text(statement, 0))) {
+    sqlite3_finalize(statement);
+    transaction.commit();
+    return std::nullopt;
+  }
+  sqlite3_finalize(statement);
+  check(sqlite3_prepare_v2(
+            database_,
+            "SELECT work_id,kind,parameters_json,credential_reference,attempt_count "
+            "FROM work_items w WHERE state IN ('pending','retry_wait','waiting_for_credential') "
+            "AND next_attempt_at<=strftime('%s','now') AND cancellation_requested=0 "
+            "AND NOT EXISTS(SELECT 1 FROM work_dependencies d JOIN work_items p "
+            "ON p.work_id=d.depends_on WHERE d.work_id=w.work_id AND p.state!='completed') "
+            "ORDER BY maintenance,fifo_sequence",
+            -1, &statement, nullptr),
+        database_, "prepare next work");
+  nlohmann::json result;
+  std::vector<std::string> incompatible;
+  while (sqlite3_step(statement) == SQLITE_ROW) {
+    const auto *credential_text =
+        reinterpret_cast<const char *>(sqlite3_column_text(statement, 3));
+    const std::string credential = credential_text ? credential_text : "";
+    if (!credential.empty() && !credential_capabilities.contains(credential)) {
+      incompatible.emplace_back(reinterpret_cast<const char *>(
+          sqlite3_column_text(statement, 0)));
+      continue;
+    }
+    result = {{"work_id", reinterpret_cast<const char *>(sqlite3_column_text(statement, 0))},
+              {"kind", reinterpret_cast<const char *>(sqlite3_column_text(statement, 1))},
+              {"parameters", nlohmann::json::parse(reinterpret_cast<const char *>(
+                                  sqlite3_column_text(statement, 2)))},
+              {"credential_reference", credential},
+              {"attempt_count", sqlite3_column_int(statement, 4)}};
+    break;
+  }
+  sqlite3_finalize(statement);
+  for (const auto &blocked : incompatible) {
+    check(sqlite3_prepare_v2(database_,
+                             "UPDATE work_items SET state='waiting_for_credential',"
+                             "updated_at=strftime('%s','now') WHERE work_id=?",
+                             -1, &statement, nullptr),
+          database_, "prepare credential wait");
+    sqlite3_bind_text(statement, 1, blocked.c_str(), -1, SQLITE_TRANSIENT);
+    check(sqlite3_step(statement), database_, "mark credential wait");
+    sqlite3_finalize(statement);
+  }
+  if (result.is_null()) {
+    transaction.commit();
+    return std::nullopt;
+  }
+  check(sqlite3_prepare_v2(database_,
+                           "UPDATE work_items SET state='running',owner=?,updated_at=strftime('%s','now') "
+                           "WHERE work_id=?",
+                           -1, &statement, nullptr),
+        database_, "prepare work claim");
+  sqlite3_bind_text(statement, 1, owner.c_str(), -1, SQLITE_TRANSIENT);
+  const auto work_id = result.at("work_id").get<std::string>();
+  sqlite3_bind_text(statement, 2, work_id.c_str(), -1, SQLITE_TRANSIENT);
+  check(sqlite3_step(statement), database_, "claim work");
+  sqlite3_finalize(statement);
+  transaction.commit();
+  return result;
+}
+
+void Catalog::complete_work(const std::string &work_id,
+                            const std::string &owner,
+                            const nlohmann::json &progress) {
+  std::scoped_lock lock(mutex_);
+  sqlite3_stmt *statement = nullptr;
+  check(sqlite3_prepare_v2(database_,
+                           "UPDATE work_items SET state=CASE WHEN cancellation_requested "
+                           "THEN 'cancelled' ELSE 'completed' END,owner='',progress_json=?,"
+                           "updated_at=strftime('%s','now') WHERE work_id=? AND state='running' AND owner=?",
+                           -1, &statement, nullptr),
+        database_, "prepare work completion");
+  const auto serialized = progress.dump();
+  sqlite3_bind_text(statement, 1, serialized.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(statement, 2, work_id.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(statement, 3, owner.c_str(), -1, SQLITE_TRANSIENT);
+  check(sqlite3_step(statement), database_, "complete work");
+  sqlite3_finalize(statement);
+}
+
+nlohmann::json Catalog::fail_work(const std::string &work_id,
+                                  const std::string &owner,
+                                  const std::string &error_fingerprint,
+                                  std::uint32_t maximum_attempts) {
+  std::scoped_lock lock(mutex_);
+  sqlite3_stmt *statement = nullptr;
+  check(sqlite3_prepare_v2(
+            database_,
+            "UPDATE work_items SET attempt_count=attempt_count+1,owner='',"
+            "state=CASE WHEN cancellation_requested THEN 'cancelled' WHEN attempt_count+1>=? "
+            "THEN 'failed' ELSE 'retry_wait' END,error_fingerprint=?,"
+            "next_attempt_at=strftime('%s','now')+min(300,(1 << min(attempt_count,8))),"
+            "updated_at=strftime('%s','now') WHERE work_id=? AND state='running' AND owner=? "
+            "RETURNING attempt_count,state,next_attempt_at",
+            -1, &statement, nullptr),
+        database_, "prepare work failure");
+  sqlite3_bind_int(statement, 1, static_cast<int>(maximum_attempts));
+  sqlite3_bind_text(statement, 2, error_fingerprint.c_str(), -1,
+                    SQLITE_TRANSIENT);
+  sqlite3_bind_text(statement, 3, work_id.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(statement, 4, owner.c_str(), -1, SQLITE_TRANSIENT);
+  check(sqlite3_step(statement), database_, "fail work");
+  nlohmann::json result = {{"attempt_count", sqlite3_column_int(statement, 0)},
+                           {"state", reinterpret_cast<const char *>(sqlite3_column_text(statement, 1))},
+                           {"next_attempt_at", sqlite3_column_int64(statement, 2)}};
+  sqlite3_finalize(statement);
+  return result;
+}
+
+bool Catalog::release_runner_if_empty(const std::string &owner) {
+  std::scoped_lock lock(mutex_);
+  Transaction transaction(database_);
+  sqlite3_stmt *statement = nullptr;
+  check(sqlite3_prepare_v2(
+            database_,
+            "SELECT 1 FROM work_items w WHERE state IN ('pending','retry_wait') "
+            "AND next_attempt_at<=strftime('%s','now') AND cancellation_requested=0 "
+            "AND NOT EXISTS(SELECT 1 FROM work_dependencies d JOIN work_items p ON p.work_id=d.depends_on "
+            "WHERE d.work_id=w.work_id AND p.state!='completed') LIMIT 1",
+            -1, &statement, nullptr),
+        database_, "prepare final queue check");
+  const bool runnable = sqlite3_step(statement) == SQLITE_ROW;
+  sqlite3_finalize(statement);
+  if (runnable) {
+    transaction.commit();
+    return false;
+  }
+  check(sqlite3_prepare_v2(database_,
+                           "DELETE FROM runner_lease WHERE singleton=1 AND state='active' AND owner=?",
+                           -1, &statement, nullptr),
+        database_, "prepare runner release");
+  sqlite3_bind_text(statement, 1, owner.c_str(), -1, SQLITE_TRANSIENT);
+  check(sqlite3_step(statement), database_, "release runner");
+  const bool released = sqlite3_changes(database_) != 0;
+  sqlite3_finalize(statement);
+  transaction.commit();
+  return released;
+}
+
+nlohmann::json Catalog::work_status(const std::string &work_id) const {
+  std::scoped_lock lock(mutex_);
+  sqlite3_stmt *statement = nullptr;
+  const char *sql = work_id.empty()
+                        ? "SELECT work_id,kind,state,attempt_count,cancellation_requested,"
+                          "progress_json,error_fingerprint,created_at,updated_at FROM work_items "
+                          "ORDER BY fifo_sequence"
+                        : "SELECT work_id,kind,state,attempt_count,cancellation_requested,"
+                          "progress_json,error_fingerprint,created_at,updated_at FROM work_items "
+                          "WHERE work_id=?";
+  check(sqlite3_prepare_v2(database_, sql, -1, &statement, nullptr), database_,
+        "prepare work status");
+  if (!work_id.empty())
+    sqlite3_bind_text(statement, 1, work_id.c_str(), -1, SQLITE_TRANSIENT);
+  nlohmann::json rows = nlohmann::json::array();
+  while (sqlite3_step(statement) == SQLITE_ROW)
+    rows.push_back({{"work_id", reinterpret_cast<const char *>(sqlite3_column_text(statement, 0))},
+                    {"kind", reinterpret_cast<const char *>(sqlite3_column_text(statement, 1))},
+                    {"state", reinterpret_cast<const char *>(sqlite3_column_text(statement, 2))},
+                    {"attempt_count", sqlite3_column_int(statement, 3)},
+                    {"cancellation_requested", sqlite3_column_int(statement, 4) != 0},
+                    {"progress", nlohmann::json::parse(reinterpret_cast<const char *>(sqlite3_column_text(statement, 5)))},
+                    {"error_fingerprint", reinterpret_cast<const char *>(sqlite3_column_text(statement, 6))},
+                    {"created_at", sqlite3_column_int64(statement, 7)},
+                    {"updated_at", sqlite3_column_int64(statement, 8)}});
+  sqlite3_finalize(statement);
+  return rows;
+}
+
+bool Catalog::cancel_work(const std::string &work_id) {
+  std::scoped_lock lock(mutex_);
+  sqlite3_stmt *statement = nullptr;
+  check(sqlite3_prepare_v2(database_,
+                           "UPDATE work_items SET cancellation_requested=1,"
+                           "state=CASE WHEN state='running' THEN state ELSE 'cancelled' END,"
+                           "updated_at=strftime('%s','now') WHERE work_id=? "
+                           "AND state NOT IN ('completed','failed','cancelled')",
+                           -1, &statement, nullptr),
+        database_, "prepare work cancellation");
+  sqlite3_bind_text(statement, 1, work_id.c_str(), -1, SQLITE_TRANSIENT);
+  check(sqlite3_step(statement), database_, "cancel work");
+  const bool changed = sqlite3_changes(database_) != 0;
+  sqlite3_finalize(statement);
+  return changed;
+}
+
+bool Catalog::work_cancellation_requested(const std::string &work_id) const {
+  std::scoped_lock lock(mutex_);
+  sqlite3_stmt *statement = nullptr;
+  check(sqlite3_prepare_v2(database_,
+                           "SELECT cancellation_requested FROM work_items WHERE work_id=?",
+                           -1, &statement, nullptr),
+        database_, "prepare work cancellation lookup");
+  sqlite3_bind_text(statement, 1, work_id.c_str(), -1, SQLITE_TRANSIENT);
+  const bool cancelled = sqlite3_step(statement) == SQLITE_ROW &&
+                         sqlite3_column_int(statement, 0) != 0;
+  sqlite3_finalize(statement);
+  return cancelled;
+}
+
+bool Catalog::invocation_settled(const std::string &invocation_id) const {
+  std::scoped_lock lock(mutex_);
+  sqlite3_stmt *statement = nullptr;
+  check(sqlite3_prepare_v2(
+            database_,
+            "SELECT count(*) FROM work_invocations i JOIN work_items w ON w.work_id=i.work_id "
+            "WHERE i.invocation_id=? AND w.state NOT IN ('completed','failed','cancelled')",
+            -1, &statement, nullptr),
+        database_, "prepare invocation status");
+  sqlite3_bind_text(statement, 1, invocation_id.c_str(), -1, SQLITE_TRANSIENT);
+  check(sqlite3_step(statement), database_, "read invocation status");
+  const bool settled = sqlite3_column_int64(statement, 0) == 0;
+  sqlite3_finalize(statement);
+  return settled;
+}
+
+nlohmann::json Catalog::runner_status() const {
+  std::scoped_lock lock(mutex_);
+  sqlite3_stmt *statement = nullptr;
+  check(sqlite3_prepare_v2(
+            database_,
+            "SELECT state,pid,executable_identity,schema_identity,config_identity,"
+            "credential_capabilities_json,heartbeat_at,created_at FROM runner_lease WHERE singleton=1",
+            -1, &statement, nullptr),
+        database_, "prepare runner status");
+  if (sqlite3_step(statement) != SQLITE_ROW) {
+    sqlite3_finalize(statement);
+    return {{"state", "inactive"}};
+  }
+  nlohmann::json result = {
+      {"state", reinterpret_cast<const char *>(sqlite3_column_text(statement, 0))},
+      {"pid", sqlite3_column_int64(statement, 1)},
+      {"executable_identity", reinterpret_cast<const char *>(sqlite3_column_text(statement, 2))},
+      {"schema_identity", reinterpret_cast<const char *>(sqlite3_column_text(statement, 3))},
+      {"config_identity", reinterpret_cast<const char *>(sqlite3_column_text(statement, 4))},
+      {"credential_capabilities", nlohmann::json::parse(reinterpret_cast<const char *>(sqlite3_column_text(statement, 5)))},
+      {"heartbeat_at", sqlite3_column_int64(statement, 6)},
+      {"created_at", sqlite3_column_int64(statement, 7)}};
+  sqlite3_finalize(statement);
+  return result;
 }
 
 } // namespace history

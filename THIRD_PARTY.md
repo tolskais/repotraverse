@@ -28,3 +28,10 @@ the internal build environment. Its exact LLVM and Clang versions are embedded
 in `clang-extractor --version`. Windows packaging records the LLVM project and
 version in the release SBOM and installs the SDK's `LICENSE.TXT` under
 `licenses/llvm`.
+
+# libcurl
+
+Repotraverse links against the externally provisioned libcurl 8.21.0 SDK.
+Windows builds use a static Schannel/SSPI build supplied through
+`REPOTRAVERSE_CURL_ROOT`; CMake never downloads it. libcurl is licensed under
+the curl license: https://curl.se/docs/copyright.html

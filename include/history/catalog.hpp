@@ -3,7 +3,10 @@
 #include <filesystem>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "history/ir.hpp"
 #include <nlohmann/json.hpp>
@@ -14,6 +17,10 @@ namespace history {
 
 class Catalog {
 public:
+  struct EnqueueResult {
+    std::string work_id;
+    bool inserted{};
+  };
   explicit Catalog(std::filesystem::path root,
                    std::size_t maximum_cached_facts = 10000,
                    std::uint64_t maximum_cached_fact_bytes =
@@ -24,6 +31,9 @@ public:
 
   const std::filesystem::path &root() const { return root_; }
   const std::string &producer_id() const { return producer_id_; }
+  std::size_t maximum_cache_entries() const { return maximum_cached_facts_; }
+  std::uint64_t maximum_cache_bytes() const { return maximum_cached_fact_bytes_; }
+  std::pair<std::size_t, std::uint64_t> fact_cache_usage() const;
 
   void observe_claim(const std::string &task_id, const std::string &ref_oid,
                      const nlohmann::json &lease);
@@ -35,6 +45,8 @@ public:
   std::optional<nlohmann::json> fact_for_task(const std::string &task_id) const;
   bool imported(const std::string &commit) const;
   void mark_imported(const std::string &commit);
+  std::string imported_ref_tip(const std::string &ref) const;
+  void mark_imported_ref_tip(const std::string &ref, const std::string &commit);
   void store_compile_context(const CompileContext &context);
   std::vector<CompileContext>
   compile_contexts(const std::string &translation_unit,
@@ -47,14 +59,6 @@ public:
   nlohmann::json fail_task(const std::string &task_id,
                            const std::string &diagnostic,
                            std::uint32_t maximum_attempts);
-  void retry_task(const std::string &task_id);
-  void cancel_request_tasks(const std::string &request_id);
-  std::string create_request(const nlohmann::json &request);
-  std::optional<nlohmann::json> request_job(const std::string &request_id) const;
-  void update_request(const std::string &request_id, const std::string &state,
-                      const nlohmann::json &progress,
-                      const nlohmann::json &result = {},
-                      const nlohmann::json &error = {});
   void store_lineage_relation(const LineageRelation &relation);
   std::optional<LineageRelation>
   lineage_relation(const std::string &relation_id) const;
@@ -84,9 +88,60 @@ public:
                        const nlohmann::json &record,
                        const std::string &source_commit = {});
   nlohmann::json pr_imports(const std::string &repository_id) const;
+  void store_external_fact(const std::string &connector,
+                           const std::string &kind,
+                           const std::string &external_id,
+                           const std::string &content_id,
+                           std::int64_t source_updated_at,
+                           const nlohmann::json &fact,
+                           const std::string &source_commit = {});
+  nlohmann::json external_fact(const std::string &connector,
+                               const std::string &kind,
+                               const std::string &external_id) const;
+  void store_connector_status(const std::string &connector,
+                              const nlohmann::json &status);
+  nlohmann::json connector_status(const std::string &connector) const;
   bool task_published(const std::string &task_id) const;
   void mark_task_published(const std::string &task_id);
   std::string snapshot_id() const;
+
+  EnqueueResult enqueue_work(const std::string &kind,
+                             const nlohmann::json &parameters,
+                             const std::string &invocation_id = {},
+                             const std::string &credential_reference = {},
+                             bool maintenance = false,
+                             const std::vector<std::string> &dependencies = {});
+  void configure_launch(const std::set<std::string> &credential_capabilities,
+                        const std::string &executable_identity,
+                        const std::string &config_identity);
+  std::optional<std::string> pending_launch_token() const;
+  std::optional<std::string>
+  claim_runner_launch(const std::set<std::string> &credential_capabilities,
+                      const std::string &executable_identity,
+                      const std::string &config_identity);
+  bool clear_failed_launch(const std::string &adoption_token);
+  bool adopt_runner(const std::string &adoption_token,
+                    const std::string &owner, std::int64_t pid,
+                    const std::string &process_start_identity,
+                    const std::string &executable_identity,
+                    const std::string &config_identity,
+                    const std::set<std::string> &credential_capabilities);
+  bool heartbeat_runner(const std::string &owner);
+  std::optional<nlohmann::json>
+  claim_next_work(const std::string &owner,
+                  const std::set<std::string> &credential_capabilities);
+  void complete_work(const std::string &work_id, const std::string &owner,
+                     const nlohmann::json &progress = {});
+  nlohmann::json fail_work(const std::string &work_id,
+                           const std::string &owner,
+                           const std::string &error_fingerprint,
+                           std::uint32_t maximum_attempts);
+  bool release_runner_if_empty(const std::string &owner);
+  nlohmann::json work_status(const std::string &work_id = {}) const;
+  bool cancel_work(const std::string &work_id);
+  bool work_cancellation_requested(const std::string &work_id) const;
+  bool invocation_settled(const std::string &invocation_id) const;
+  nlohmann::json runner_status() const;
 
 private:
   void execute(const char *sql) const;
@@ -98,6 +153,10 @@ private:
   mutable std::mutex mutex_;
   std::size_t maximum_cached_facts_;
   std::uint64_t maximum_cached_fact_bytes_;
+  mutable std::optional<std::string> snapshot_id_cache_;
+  std::set<std::string> launch_credential_capabilities_;
+  std::string launch_executable_identity_;
+  std::string launch_config_identity_;
 };
 
 } // namespace history

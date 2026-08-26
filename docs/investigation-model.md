@@ -54,7 +54,7 @@ observed.
 
 ## Raw tool operations
 
-Use `repotraverse tool OPERATION --endpoint URL --input request.json`. The
+Use `repotraverse OPERATION --config catalog.json --input request.json`. The
 input is an operation-specific JSON object. Responses keep `facts` and
 `inference` separate.
 

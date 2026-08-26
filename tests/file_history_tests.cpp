@@ -90,7 +90,7 @@ int main() {
     require(result.at("path_segments").size() == 1, "rename segment missing");
     require(!result.at("change_units").back().at("changed_ranges").empty(),
             "zero-context changed ranges missing");
-    require(result.at("scheduled_tasks") == 3,
+    require(result.at("enqueued_work_items") == 3,
             "equivalent configurations or endpoints were not deduplicated");
     require(result.at("coverage").at("status") == "partial" &&
                 result.at("coverage").at("gaps").empty(),

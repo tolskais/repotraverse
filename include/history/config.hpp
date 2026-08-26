@@ -4,12 +4,38 @@
 #include <filesystem>
 #include <set>
 #include <string>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
 namespace history {
 
-struct ServiceConfig {
+struct ConnectorConfig {
+  std::string name;
+  std::string type;
+  std::string base_url;
+  std::string repository_id;
+  std::string project;
+  std::string repository;
+  std::vector<std::string> project_keys;
+  std::string authentication;
+  std::string jira_connector;
+  std::filesystem::path ca_bundle;
+  std::uint32_t page_size{100};
+  std::uint64_t maximum_response_bytes{16ULL * 1024ULL * 1024ULL};
+  std::uint32_t connect_timeout_seconds{10};
+  std::uint32_t request_timeout_seconds{60};
+};
+
+struct CredentialConfig {
+  std::string name;
+  std::string mode{"bearer"};
+  std::string environment;
+  std::filesystem::path file;
+  std::string windows_target;
+};
+
+struct CatalogConfig {
   std::uint32_t schema_version{1};
   std::string repository_id;
   std::filesystem::path catalog;
@@ -19,12 +45,9 @@ struct ServiceConfig {
   std::filesystem::path scratch_root;
   std::string remote{"origin"};
   std::string knowledge_ref{"refs/heads/repotraverse/v1/knowledge/accepted"};
-  std::string listen_address{"127.0.0.1"};
-  std::uint16_t port{7341};
-  std::uint32_t sync_seconds{30};
+  std::uint32_t analysis_sync_freshness_seconds{30};
   std::int64_t lease_seconds{900};
   std::int64_t grace_seconds{120};
-  std::uint32_t worker_concurrency{2};
   std::uint32_t max_task_attempts{10};
   std::uint32_t git_timeout_seconds{300};
   std::uint32_t extractor_timeout_seconds{1800};
@@ -39,8 +62,10 @@ struct ServiceConfig {
   std::set<std::string> trusted_producers;
   std::string otlp_endpoint;
   std::string otel_service_name{"repotraverse"};
+  std::vector<CredentialConfig> credentials;
+  std::vector<ConnectorConfig> connectors;
 };
 
-ServiceConfig parse_service_config(const nlohmann::json &value);
+CatalogConfig parse_catalog_config(const nlohmann::json &value);
 
 } // namespace history

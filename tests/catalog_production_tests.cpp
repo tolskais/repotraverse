@@ -26,25 +26,15 @@ TEST_CASE("production catalog operations remain durable and consistent") {
     }
   } cleanup{root};
   history::Catalog catalog(root);
-    const nlohmann::json request = {{"schema_version", history::kSchemaVersion},
-                                    {"query", "analysis.coverage"},
-                                    {"params", {{"bundle", "fixture.json"}}}};
-    const auto first = catalog.create_request(request);
-    require(first == catalog.create_request(request),
-            "request creation is not idempotent");
-    catalog.update_request(first, "partial", {{"pending_work", 2}});
-    const auto job = catalog.request_job(first);
-    require(job && job->at("state") == "partial",
-            "durable request state was not stored");
-
+    const auto first = std::string{"invocation-1"};
     catalog.schedule_task("0123456789abcdef0123456789abcdef",
                           {{"request_id", first}, {"identity", {}}});
     const auto retried =
         catalog.fail_task("0123456789abcdef0123456789abcdef", "diagnostic", 1);
-    require(retried.at("state") == "quarantined",
-            "permanent task was not quarantined");
+    require(retried.at("state") == "failed",
+            "permanent task was not marked failed");
     require(!catalog.next_pending_task(),
-            "quarantined task remained executable");
+            "failed task remained executable");
 
     history::LineageRelation relation;
     relation.relation_id = "relation-1";
@@ -110,16 +100,25 @@ TEST_CASE("production catalog operations remain durable and consistent") {
     manifest.manifest_id = history::stable_hash(identity.dump());
     catalog.store_fact("semantic-fact", "semantic-task",
                        {{"result", nlohmann::json(manifest)}}, "commit");
+    auto second_manifest = manifest;
+    second_manifest.context_id = "context-2";
+    second_manifest.manifest_id = history::stable_hash(manifest.manifest_id + "\ncontext-2");
+    catalog.store_fact("semantic-fact-2", "semantic-task-2",
+                       {{"result", nlohmann::json(second_manifest)}}, "commit-2");
     const auto dependents =
         catalog.semantic_dependents("main", "revision", {target.element_id});
-    require(dependents.at("dependents").size() == 1 &&
+    require(dependents.at("dependents").size() == 2 &&
                 dependents.at("dependents").front().at("element_id") ==
                     source.element_id,
-            "reverse semantic dependency was not indexed");
+            "reverse semantic dependency lost a context edge");
     const auto symbols = catalog.symbol_search(
         "main", "revision", {{"name", "fixture::"}, {"match", "prefix"}});
-    require(symbols.at("symbols").size() == 2,
+    require(symbols.at("symbols").size() == 4,
             "compiler symbols were not indexed for investigation");
+    const auto exact = catalog.symbol_search(
+        "main", "revision", {{"qualified_name", "fixture::target"}, {"match", "exact"}});
+    require(exact.at("symbols").size() == 2,
+            "exact indexed symbol lookup returned the wrong contexts");
 
     history::EvidenceReceipt receipt;
     receipt.repository_id = "main";
@@ -159,7 +158,83 @@ TEST_CASE("production catalog operations remain durable and consistent") {
                 .size() == 1);
 }
 
-TEST_CASE("v1 catalog reopens with its identity and request state intact") {
+TEST_CASE("on-demand work queue deduplicates and serializes runner lifecycle") {
+  const auto root = std::filesystem::temp_directory_path() /
+                    ("repotraverse-work-queue-" + std::to_string(
+                         std::chrono::steady_clock::now().time_since_epoch().count()));
+  struct Cleanup {
+    std::filesystem::path path;
+    ~Cleanup() {
+      std::error_code ignored;
+      std::filesystem::remove_all(path, ignored);
+    }
+  } cleanup{root};
+  history::Catalog catalog(root);
+  catalog.configure_launch({}, "executable", "config");
+  REQUIRE_THROWS_AS(catalog.enqueue_work("test", {{"token", "secret"}}),
+                    std::invalid_argument);
+  const auto first = catalog.enqueue_work("test", {{"value", 1}}, "invocation");
+  const auto duplicate = catalog.enqueue_work("test", {{"value", 1}}, "invocation-2");
+  const auto second = catalog.enqueue_work("test", {{"value", 2}}, "invocation");
+  REQUIRE(first.inserted);
+  REQUIRE_FALSE(duplicate.inserted);
+  REQUIRE(first.work_id == duplicate.work_id);
+
+  const auto token = catalog.pending_launch_token();
+  REQUIRE(token);
+  REQUIRE_FALSE(catalog.claim_runner_launch({}, "executable", "config"));
+  REQUIRE_FALSE(catalog.adopt_runner("wrong", "owner", 7, "start",
+                                     "executable", "config", {}));
+  REQUIRE(catalog.adopt_runner(*token, "owner", 7, "start", "executable",
+                               "config", {}));
+  const auto claimed_first = catalog.claim_next_work("owner", {});
+  REQUIRE(claimed_first);
+  REQUIRE(claimed_first->at("work_id") == first.work_id);
+  catalog.complete_work(first.work_id, "owner");
+  const auto claimed_second = catalog.claim_next_work("owner", {});
+  REQUIRE(claimed_second);
+  REQUIRE(claimed_second->at("work_id") == second.work_id);
+  catalog.complete_work(second.work_id, "owner");
+  const auto prerequisite = catalog.enqueue_work("test", {{"value", 3}});
+  const auto dependent = catalog.enqueue_work(
+      "test", {{"value", 4}}, "dependency-invocation", {}, false,
+      {prerequisite.work_id});
+  REQUIRE(catalog.cancel_work(prerequisite.work_id));
+  REQUIRE_FALSE(catalog.claim_next_work("owner", {}));
+  REQUIRE(catalog.work_status(dependent.work_id).front().at("state") == "failed");
+  REQUIRE(catalog.release_runner_if_empty("owner"));
+  REQUIRE(catalog.invocation_settled("invocation"));
+}
+
+TEST_CASE("credential-blocked work is resumed by a compatible invocation") {
+  const auto root = std::filesystem::temp_directory_path() /
+                    ("repotraverse-credential-queue-" + std::to_string(
+                         std::chrono::steady_clock::now().time_since_epoch().count()));
+  struct Cleanup {
+    std::filesystem::path path;
+    ~Cleanup() {
+      std::error_code ignored;
+      std::filesystem::remove_all(path, ignored);
+    }
+  } cleanup{root};
+  history::Catalog catalog(root);
+  const auto work = catalog.enqueue_work("connector_sync", {{"cursor", "one"}},
+                                         "invocation", "credential-a");
+  REQUIRE_FALSE(catalog.claim_runner_launch({}, "executable", "config"));
+  const auto token = catalog.claim_runner_launch({"credential-a"}, "executable",
+                                                  "config");
+  REQUIRE(token);
+  REQUIRE(catalog.adopt_runner(*token, "owner", 8, "start", "executable",
+                               "config", {"credential-a"}));
+  REQUIRE(catalog.claim_next_work("owner", {"credential-a"})->at("work_id") ==
+          work.work_id);
+  REQUIRE(catalog.cancel_work(work.work_id));
+  catalog.complete_work(work.work_id, "owner");
+  REQUIRE(catalog.release_runner_if_empty("owner"));
+  REQUIRE(catalog.work_status(work.work_id).front().at("state") == "cancelled");
+}
+
+TEST_CASE("v1 catalog reopens with its identity and work state intact") {
   const auto root =
       std::filesystem::temp_directory_path() /
       ("repotraverse-catalog-reopen-" +
@@ -173,24 +248,19 @@ TEST_CASE("v1 catalog reopens with its identity and request state intact") {
     }
   } cleanup{root};
 
-  const nlohmann::json request = {{"schema_version", history::kSchemaVersion},
-                                  {"query", "analysis.coverage"},
-                                  {"params", nlohmann::json::object()}};
   std::string producer_id;
-  std::string request_id;
+  std::string work_id;
   {
     history::Catalog catalog(root);
     producer_id = catalog.producer_id();
-    request_id = catalog.create_request(request);
-    catalog.update_request(request_id, "partial", {{"pending_work", 1}});
+    work_id = catalog.enqueue_work("test", {{"value", 1}}, "invocation").work_id;
   }
 
   history::Catalog reopened(root);
   REQUIRE(reopened.producer_id() == producer_id);
-  const auto job = reopened.request_job(request_id);
-  REQUIRE(job.has_value());
-  REQUIRE(job->at("state") == "partial");
-  REQUIRE(job->at("progress").at("pending_work") == 1);
+  const auto work = reopened.work_status(work_id);
+  REQUIRE(work.size() == 1);
+  REQUIRE(work.front().at("state") == "pending");
 }
 
 TEST_CASE("reimporting a compile context removes stale file mappings") {

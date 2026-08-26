@@ -14,6 +14,7 @@ option(REPOTRAVERSE_NATIVE_OPTIMIZATION
 
 include(cmake/Windows.cmake)
 include(cmake/LLVMDependency.cmake)
+include(cmake/CurlDependency.cmake)
 
 if(REPOTRAVERSE_NATIVE_OPTIMIZATION)
     set(REPOTRAVERSE_BUILD_MODE "native")
@@ -110,12 +111,13 @@ add_library(history-core
     src/catalog.cpp
     src/change_evidence.cpp
     src/config.cpp
+    src/connectors.cpp
+    src/outbound_http.cpp
     src/encoding.cpp
     src/experiment.cpp
     src/file_history.cpp
     src/git_coordination.cpp
     src/history_plan.cpp
-    src/http.cpp
     src/ir.cpp
     src/lineage.cpp
     src/process.cpp
@@ -129,7 +131,7 @@ target_include_directories(history-core PUBLIC
 target_link_libraries(history-core
     PUBLIC nlohmann_json::nlohmann_json
     PRIVATE repotraverse-sqlite repotraverse-xxhash repotraverse-tree-sitter
-        Threads::Threads
+        Threads::Threads CURL::libcurl
     PRIVATE repotraverse-build-options)
 if(WIN32)
     target_link_libraries(history-core PRIVATE ws2_32 winhttp)
@@ -197,11 +199,10 @@ install(FILES README.md THIRD_PARTY.md docs/lineage-architecture.md
     docs/v1-experiment.md
     DESTINATION docs)
 install(FILES LICENSE DESTINATION .)
-install(FILES config/service.example.json config/experiment.example.json
+install(FILES config/catalog.example.json config/experiment.example.json
     DESTINATION config)
 if(WIN32)
-    install(FILES tools/install-service.ps1 tools/uninstall-service.ps1
-        tools/package-windows.ps1
+    install(FILES tools/package-windows.ps1
         DESTINATION tools)
 endif()
 

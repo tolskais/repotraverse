@@ -38,6 +38,12 @@ public:
   nlohmann::json publish_inference_claim(const InferenceClaim &claim);
   nlohmann::json publish_knowledge_decision(const KnowledgeDecision &decision);
   nlohmann::json publish_pr_import(const nlohmann::json &record);
+  nlohmann::json publish_external_fact(const std::string &connector,
+                                       const std::string &kind,
+                                       const std::string &external_id,
+                                       const std::string &content_id,
+                                       std::int64_t source_updated_at,
+                                       const nlohmann::json &fact);
   nlohmann::json status(const std::string &task_id) const;
   std::chrono::seconds heartbeat_interval() const;
 
@@ -59,6 +65,7 @@ private:
                                           const std::string &record_id,
                                           const std::string &ref);
   bool trusted_producer(const std::string &producer_id) const;
+  void refresh_claim(const std::string &task_id);
 
   Catalog &catalog_;
   CoordinationOptions options_;

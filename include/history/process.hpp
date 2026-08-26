@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <functional>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -17,6 +18,7 @@ struct ProcessOutput {
   std::string error;
   bool timed_out{};
   bool output_truncated{};
+  bool cancelled{};
   std::uint64_t cpu_time_ms{};
 };
 
@@ -26,6 +28,7 @@ struct ProcessOptions {
   std::string_view input;
   std::chrono::milliseconds timeout{std::chrono::minutes(5)};
   std::size_t max_output_bytes{256ULL * 1024ULL * 1024ULL};
+  std::function<bool()> cancellation_requested;
 };
 
 ProcessOutput run_process(const std::vector<std::string> &arguments,

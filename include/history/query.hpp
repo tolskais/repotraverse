@@ -10,6 +10,7 @@ namespace history {
 class Catalog;
 class GitCoordinator;
 class BackgroundWorker;
+class ConnectorService;
 
 class FactStore {
 public:
@@ -28,15 +29,9 @@ public:
   QueryService(std::shared_ptr<const FactStore> store,
                std::shared_ptr<Catalog> catalog,
                std::shared_ptr<GitCoordinator> coordinator,
-               std::shared_ptr<BackgroundWorker> worker = {});
+               std::shared_ptr<BackgroundWorker> worker = {},
+               std::shared_ptr<ConnectorService> connectors = {});
   nlohmann::json execute(const nlohmann::json &request) const;
-  nlohmann::json enqueue(const nlohmann::json &request) const;
-  nlohmann::json submit(const nlohmann::json &request) const;
-  nlohmann::json request_status(const std::string &request_id,
-                                bool refresh = true) const;
-  nlohmann::json cancel_request(const std::string &request_id) const;
-  nlohmann::json fail_request(const std::string &request_id,
-                              const std::string &code) const;
 
 private:
   nlohmann::json execute_impl(const nlohmann::json &request) const;
@@ -44,6 +39,7 @@ private:
   std::shared_ptr<Catalog> catalog_;
   std::shared_ptr<GitCoordinator> coordinator_;
   std::shared_ptr<BackgroundWorker> worker_;
+  std::shared_ptr<ConnectorService> connectors_;
 };
 
 } // namespace history

@@ -3,7 +3,7 @@
 Repotraverse captures compiler-derived evidence for C/C++ source elements across Git
 revisions. Git remains the source of exact changed code; artifacts contain compact
 fingerprints, locations, lineage candidates, transition facts, and factual history
-statistics. The service and capture infrastructure are implemented in v1.
+statistics. The on-demand catalog runner and capture infrastructure are implemented in v1.
 Reviewed interpretations are stored separately from facts.
 
 ## Windows VM build
@@ -27,6 +27,10 @@ The SDK must contain:
 <llvm-root>/lib/clang/<major>/include/
 ```
 
+Connector-enabled builds also require the pinned libcurl 8.21.0 SDK. On
+Windows it must be a static Schannel/SSPI build exporting
+`lib/cmake/CURL/CURLConfig.cmake`.
+
 The official `clang+llvm-<version>-x86_64-pc-windows-msvc` archive is the
 reference Windows SDK. Its CMake packages export component targets;
 Repotraverse links `clangTooling` and `clangIndex` through those imported
@@ -44,13 +48,15 @@ does not depend on the build SDK after installation.
 For a portable executable:
 
 ```powershell
-.\tools\build-windows.ps1 -Mode Generic -LlvmRoot C:\llvm-sdk
+.\tools\build-windows.ps1 -Mode Generic -LlvmRoot C:\llvm-sdk `
+  -CurlRoot C:\curl-8.21.0-sdk
 ```
 
 For an executable that remains on the VM where it was built:
 
 ```powershell
-.\tools\build-windows.ps1 -Mode Native -LlvmRoot C:\llvm-sdk
+.\tools\build-windows.ps1 -Mode Native -LlvmRoot C:\llvm-sdk `
+  -CurlRoot C:\curl-8.21.0-sdk
 ```
 
 Native mode passes `-march=native` through clang-cl. Its executable must not be
@@ -81,6 +87,8 @@ ctest --test-dir build --output-on-failure
 
 Without `REPOTRAVERSE_LLVM_ROOT`, CMake uses normal package discovery and
 requires a compatible Clang package.
+Set `REPOTRAVERSE_CURL_ROOT` to an externally provisioned libcurl 8.21.0 SDK;
+Linux development builds may use an exactly matching installed package.
 
 ## Extract snapshots
 
@@ -193,18 +201,20 @@ still validated against the ref by Git.
 - `element.history_stats`: summarize ordered snapshots without stability inference.
 - `analysis.coverage`: return extraction capabilities and gaps.
 
-The preferred public surface is `repotraverse tool OPERATION --endpoint URL`.
-It exposes repository/integration-unit, file/symbol, relation, evidence-receipt,
-and reviewed-inference operations. See
+The public surface consists of named commands such as
+`repotraverse file-history --config catalog.json --path source/device.cpp`.
+Complex records and batches use `--input request.json`. See
 [`docs/investigation-model.md`](docs/investigation-model.md).
 
 Requests and responses are one-shot JSON. See
 [`docs/lineage-architecture.md`](docs/lineage-architecture.md) for the resource contract.
 
-## Federated local service
+## On-demand catalog runner
 
-Each analysis VM can run a local service while using a Git repository as the
-shared fact and coordination transport. VMs never connect to one another.
+Each command opens its catalog directly, returns the current snapshot, queues
+missing work, and starts at most one detached runner for that catalog. The runner
+executes one item at a time and exits after an atomic empty-queue check. Analysis
+Git remains the shared fact transport; VMs never connect to one another.
 
 ```json
 {
@@ -214,12 +224,9 @@ shared fact and coordination transport. VMs never connect to one another.
   "analysis_repository": "C:/repotraverse/analysis",
   "knowledge_ref": "refs/heads/repotraverse/v1/knowledge/accepted",
   "remote": "origin",
-  "listen_address": "127.0.0.1",
-  "port": 7341,
-  "sync_seconds": 30,
+  "analysis_sync_freshness_seconds": 30,
   "lease_seconds": 900,
   "grace_seconds": 120,
-  "worker_concurrency": 2,
   "max_task_attempts": 10,
   "git_timeout_seconds": 300,
   "extractor_timeout_seconds": 1800,
@@ -236,22 +243,22 @@ shared fact and coordination transport. VMs never connect to one another.
 ```
 
 ```powershell
-repotraverse serve --config C:\repotraverse\service.json
-repotraverse status --endpoint http://127.0.0.1:7341
-repotraverse query --endpoint http://127.0.0.1:7341 --request request.json
+repotraverse file-history --config C:\repotraverse\catalog.json `
+  --repository C:\source\product --path source/device.cpp
+repotraverse work-status --config C:\repotraverse\catalog.json
 ```
 
-The service creates its producer identity on first startup; do not include the
+The catalog creates its producer identity on first use; do not include the
 local catalog directory in a VM image. Git is authoritative for shared immutable
 facts, accepted or rejected reviews, tasks, and leases. SQLite is never committed:
 it provides rebuildable indexes plus the local transactional work queue and durable
-request state. Imported compile contexts remain local input and must be reimported if
-the catalog is replaced. The service worker owns task acquisition, heartbeat,
+queue, cursors, and runner lease. Imported compile contexts remain local input and
+must be reimported if the catalog is replaced. The runner owns task acquisition, heartbeat,
 disk-bounded revision workspace reuse, extraction, and publication. A complete
 dependency closure uses an exact-path sparse checkout. Missing closure evidence uses a
 temporary full checkout and removes it when its final lease ends.
 
-An LLM normally issues only a high-level query:
+Complex command parameters may be supplied as JSON:
 
 ```json
 {
@@ -268,32 +275,24 @@ An LLM normally issues only a high-level query:
 }
 ```
 
-Remote queries create durable request jobs. `POST /v1/requests` queues planning
-and immediately returns a stable request ID, `GET /v1/requests/<id>` reads
-status without running planning on the HTTP thread, and
-`GET /v1/requests/<id>/results` returns the current result. Reposting the same
-request resumes a partial or interrupted plan under the same ID. Jobs and
-review decisions survive process restarts. The service rejects non-loopback
-bind addresses and bounds request size and idle time.
-
-The first job result can be `partial`: it includes Git/PR change units,
+The first command result can be `partial`: it includes Git/PR change units,
 zero-context changed-line ranges, the materialized `snapshot_id`, coverage gaps,
-and pending work. Repeating the same query after workers finish returns
+and pending work. Repeating the same command after the runner finishes returns
 compiler-derived element snapshots and per-change-unit semantic transition
 facts. Pagination uses a continuation pinned to the resolved source head. No full project
 snapshot is created.
 
-Low-level `work.*` and `catalog.sync` queries exist for diagnostics and service
-coordination. `work.complete` accepts only a schema-v1 `tu_manifest` or
-`tu_failure`.
+Use `--wait` to watch only work associated with the current invocation. Ctrl-C
+stops waiting without cancelling it. `work-status` exposes redacted state and
+`work-cancel --work-id ID` requests cancellation; rerun the originating command
+to retry failed work.
 
 The analysis Git server must allow branch creation and deletion plus
 compare-and-swap force pushes below `repotraverse/v1/coordination/claims/`.
 A VM does not start
 an expensive task when the remote is unavailable.
 
-Although history is ordered, extraction is parallel: VMs may claim any
-revision/TU/context endpoint. Equivalent named configurations share one task;
+Equivalent named configurations share one content-addressed task;
 different semantic contexts remain distinct. A cheap ordered reduction runs
 from compact manifests when both endpoints are available.
 
@@ -338,15 +337,15 @@ are emitted as review-required relations; they never join historical lineage
 automatically. Submodules use separate repository identities and explicit
 parent-revision to child-revision mappings.
 
-## Production-oriented service operation
+## Production operation
 
 Configuration uses schema v1 and requires an explicit
 `repository_id`. Non-v1 catalogs and artifacts are intentionally unsupported;
 remove and rebuild an old prototype catalog.
-Use `config/service.example.json` as the configuration template. On Windows,
-the unsigned ZIP can be registered with the Service Control Manager using
-`tools/install-service.ps1` and removed using `tools/uninstall-service.ps1`.
-The service exposes loopback-only `/v1/status` and `/v1/metrics` diagnostics.
+Use `config/catalog.example.json` as the configuration template. No permanent
+service, listener, or inbound HTTP endpoint is installed. Windows launches the
+runner as a detached hidden process; the long-path-aware executable manifest is
+retained.
 Tasks use bounded child processes, adaptive lease heartbeats, exponential retry,
 and quarantine after the configured attempt limit. When `otlp_endpoint` is set,
 redacted logs and cumulative metrics are exported asynchronously using OTLP/HTTP

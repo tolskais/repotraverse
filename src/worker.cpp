@@ -1,4 +1,5 @@
 #include "history/worker.hpp"
+#include <condition_variable>
 #include "history/encoding.hpp"
 #include "history/ir.hpp"
 #include "history/process.hpp"
@@ -52,10 +53,14 @@ BackgroundWorker::BackgroundWorker(Catalog &c, GitCoordinator &g,
   }
 }
 nlohmann::json BackgroundWorker::run_once() {
-  std::scoped_lock worker_lock(mutex_);
   const auto pending = catalog_.next_pending_task();
   if (!pending)
     return {{"state", "idle"}};
+  return run_task(*pending);
+}
+nlohmann::json BackgroundWorker::run_task(const nlohmann::json &task) {
+  std::scoped_lock worker_lock(mutex_);
+  const auto pending = &task;
   const auto task_id = pending->at("task_id").get<std::string>();
   Telemetry::instance().increment("worker.tasks_started");
   try {
@@ -132,17 +137,18 @@ nlohmann::json BackgroundWorker::run_once() {
       command.push_back(value);
     }
     const auto heartbeat_period = coordinator_.heartbeat_interval();
+    std::mutex heartbeat_mutex;
+    std::condition_variable_any heartbeat_changed;
     std::jthread heartbeat([&](std::stop_token stop) {
-      auto elapsed = std::chrono::seconds::zero();
       while (!stop.stop_requested()) {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-        elapsed += std::chrono::seconds(1);
-        if (elapsed >= heartbeat_period) {
-          try {
-            coordinator_.heartbeat(task_id);
-          } catch (...) {
-          }
-          elapsed = std::chrono::seconds::zero();
+        std::unique_lock lock(heartbeat_mutex);
+        heartbeat_changed.wait_for(lock, stop, heartbeat_period,
+                                   [] { return false; });
+        if (stop.stop_requested()) break;
+        lock.unlock();
+        try {
+          coordinator_.heartbeat(task_id);
+        } catch (...) {
         }
       }
     });
@@ -151,9 +157,15 @@ nlohmann::json BackgroundWorker::run_once() {
     process_options.timeout = options_.extractor_timeout;
     process_options.max_output_bytes =
         static_cast<std::size_t>(options_.max_manifest_bytes);
+    process_options.cancellation_requested = [this, task_id] {
+      return catalog_.work_cancellation_requested(task_id);
+    };
     const auto process = run_process(command, process_options);
     heartbeat.request_stop();
+    heartbeat_changed.notify_all();
     heartbeat.join();
+    if (process.cancelled)
+      return {{"state", "cancelled"}, {"task_id", task_id}};
     nlohmann::json result;
     if (process.exit_code == 0 && !process.timed_out &&
         !process.output_truncated) {

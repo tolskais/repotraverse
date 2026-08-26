@@ -19,6 +19,7 @@ class BackgroundWorker {
 public:
   BackgroundWorker(Catalog &, GitCoordinator &, WorkerOptions);
   nlohmann::json run_once();
+  nlohmann::json run_task(const nlohmann::json &task);
   const std::string &extractor_identity() const { return extractor_identity_; }
   const std::string &repository_id() const { return options_.repository_id; }
   const std::filesystem::path &source_repository() const {

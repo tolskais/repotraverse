@@ -200,27 +200,28 @@ void test_schema_hash() {
 }
 
 void test_production_config_validation() {
-  const auto config = history::parse_service_config(
+  const auto config = history::parse_catalog_config(
       {{"schema_version", history::kSchemaVersion},
        {"repository_id", "device-main"},
        {"catalog", "catalog"},
        {"analysis_repository", "analysis"}});
-  require(config.listen_address == "127.0.0.1", "loopback default changed");
+  require(config.analysis_sync_freshness_seconds == 30,
+          "analysis synchronization freshness default changed");
   require(config.workspace_mode == "auto" &&
               config.workspace_max_revisions == 2 &&
               config.workspace_max_bytes == 0,
           "disk-bounded workspace defaults changed");
   bool rejected = false;
   try {
-    history::parse_service_config({{"schema_version", history::kSchemaVersion},
+    history::parse_catalog_config({{"schema_version", history::kSchemaVersion},
                                    {"repository_id", "device-main"},
                                    {"catalog", "catalog"},
                                    {"analysis_repository", "analysis"},
-                                   {"listen_address", "0.0.0.0"}});
+                                   {"port", 7341}});
   } catch (const std::invalid_argument &) {
     rejected = true;
   }
-  require(rejected, "non-loopback production bind was accepted");
+  require(rejected, "removed inbound HTTP option was accepted");
 }
 
 void test_reviewed_extract_candidate() {

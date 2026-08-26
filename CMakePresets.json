@@ -29,6 +29,7 @@
       "binaryDir": "${sourceDir}/out/build/windows-x64-generic",
       "cacheVariables": {
         "REPOTRAVERSE_LLVM_ROOT": "$env{REPOTRAVERSE_LLVM_ROOT}",
+        "REPOTRAVERSE_CURL_ROOT": "$env{REPOTRAVERSE_CURL_ROOT}",
         "REPOTRAVERSE_NATIVE_OPTIMIZATION": false
       }
     },
@@ -39,6 +40,7 @@
       "binaryDir": "${sourceDir}/out/build/windows-x64-native",
       "cacheVariables": {
         "REPOTRAVERSE_LLVM_ROOT": "$env{REPOTRAVERSE_LLVM_ROOT}",
+        "REPOTRAVERSE_CURL_ROOT": "$env{REPOTRAVERSE_CURL_ROOT}",
         "REPOTRAVERSE_NATIVE_OPTIMIZATION": true
       }
     }

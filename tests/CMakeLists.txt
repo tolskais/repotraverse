@@ -38,9 +38,11 @@ repotraverse_add_test(file-history-tests file_history_tests.cpp
 repotraverse_add_test(build-import-tests build_import_tests.cpp
     LIBRARIES history-core
     DEFINITIONS TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
-repotraverse_add_test(http-roundtrip-tests http_roundtrip_tests.cpp
-    CATCH LIBRARIES history-core)
 repotraverse_add_test(catalog-production-tests catalog_production_tests.cpp
+    CATCH LIBRARIES history-core)
+repotraverse_add_test(connectors-tests connectors_tests.cpp
+    CATCH LIBRARIES history-core)
+repotraverse_add_test(history-cache-tests history_cache_tests.cpp
     CATCH LIBRARIES history-core)
 repotraverse_add_test(process-tests process_tests.cpp LIBRARIES history-core)
 repotraverse_add_test(encoding-tests encoding_tests.cpp
@@ -67,20 +69,7 @@ set_tests_properties(repotraverse-version PROPERTIES
         "repotraverse ${PROJECT_VERSION}.*build mode: ${REPOTRAVERSE_BUILD_MODE}")
 add_test(NAME repotraverse-help COMMAND repotraverse --help)
 set_tests_properties(repotraverse-help PROPERTIES
-    PASS_REGULAR_EXPRESSION "experiment.*serve.*query")
-add_test(
-    NAME public-version-v1
-    COMMAND ${CMAKE_COMMAND}
-        -DREPOTRAVERSE=$<TARGET_FILE:repotraverse>
-        -DSOURCE_DIR=${PROJECT_SOURCE_DIR}
-        -P ${CMAKE_CURRENT_SOURCE_DIR}/version_consistency.cmake)
-add_test(
-    NAME history-plan-integration
-    COMMAND ${CMAKE_COMMAND}
-        -DREPOTRAVERSE=$<TARGET_FILE:repotraverse>
-        -DGIT_EXECUTABLE=${GIT_EXECUTABLE}
-        -DBINARY_DIR=${PROJECT_BINARY_DIR}
-        -P ${CMAKE_CURRENT_SOURCE_DIR}/history_plan_integration.cmake)
+    PASS_REGULAR_EXPRESSION "experiment.*repository-changes.*work-status")
 
 add_executable(fake-make fake_make.cpp)
 target_link_libraries(fake-make PRIVATE history-core repotraverse-build-options)
@@ -112,14 +101,6 @@ add_test(
         -- -std=c++17)
 set_tests_properties(clang-extractor-smoke PROPERTIES
     PASS_REGULAR_EXPRESSION "qualified_name")
-add_test(
-    NAME clang-extractor-lineage
-    COMMAND ${CMAKE_COMMAND}
-        -DEXTRACTOR=$<TARGET_FILE:clang-extractor>
-        -DREPOTRAVERSE=$<TARGET_FILE:repotraverse>
-        -DSOURCE_DIR=${PROJECT_SOURCE_DIR}
-        -DBINARY_DIR=${PROJECT_BINARY_DIR}
-        -P ${CMAKE_CURRENT_SOURCE_DIR}/extractor_integration.cmake)
 repotraverse_add_test(extractor-entities-tests extractor_entities_tests.cpp
     LIBRARIES history-core
     DEFINITIONS

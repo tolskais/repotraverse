@@ -314,6 +314,12 @@ ProcessOutput run_process(const std::vector<std::string> &arguments,
       break;
     if (wait == WAIT_FAILED)
       throw std::runtime_error("cannot wait for process");
+    if (options.cancellation_requested && options.cancellation_requested()) {
+      result.cancelled = true;
+      TerminateJobObject(job.get(), 123);
+      WaitForSingleObject(process_handle.get(), 5000);
+      break;
+    }
     if (exceeds_limit(out_handle.get()) || exceeds_limit(err_handle.get())) {
       result.output_truncated = true;
       TerminateJobObject(job.get(), 125);
@@ -396,16 +402,21 @@ ProcessOutput run_process(const std::vector<std::string> &arguments,
                              err_size > options.max_output_bytes));
     const bool expired = options.timeout.count() > 0 &&
                          std::chrono::steady_clock::now() >= deadline;
-    if (expired || exceeded) {
+    const bool cancelled = options.cancellation_requested &&
+                           options.cancellation_requested();
+    if (expired || exceeded || cancelled) {
       kill(-child, SIGKILL);
       while (wait4(child, &status, 0, &usage) < 0 && errno == EINTR) {
       }
       reaped = true;
+      if (cancelled) status = 0;
       break;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
   ProcessOutput result;
+  result.cancelled = options.cancellation_requested &&
+                     options.cancellation_requested();
   result.timed_out = !exceeded && options.timeout.count() > 0 &&
                      std::chrono::steady_clock::now() >= deadline;
   result.output_truncated = exceeded;

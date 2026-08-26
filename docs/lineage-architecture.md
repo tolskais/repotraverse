@@ -66,11 +66,10 @@ Continuity is one of `same`, `renamed`, `moved`, `moved_and_renamed`,
 `implementation`, `both`, or `unverified`. Relocation and content are independent, so a
 pure move never becomes implementation churn.
 
-Matching proceeds conservatively: exact compiler identity first, then a unique exact
-interface/implementation/dependency shape. Multiple exact candidates remain ambiguous.
-In the current transition implementation, a unique exact-shape candidate is resolved
-automatically with `high` confidence; multiple matches are review-only. False merges are
-considered worse than missed refactorings.
+Matching proceeds conservatively: exact compiler identity is factual continuity. A
+unique exact interface/implementation/dependency shape is emitted as a high-confidence
+review candidate, but does not join histories until accepted. Multiple exact candidates
+remain ambiguous. False merges are considered worse than missed refactorings.
 
 ## Managed assertions
 
@@ -82,9 +81,15 @@ managed knowledge but do not alter facts.
 ## History statistics
 
 `element.history_stats` unions resolved identities across explicitly ordered bundles
-and reports observed versions, observable transitions,
+and reports exact observed revisions and optional caller-supplied revision timestamps,
+adjacent observable transitions, normalized factual change-unit rates,
 content/interface/implementation/dependency changes, moves, renames, ambiguities,
-lifetime revisions, and the last content-change revision. Pilot evidence adds
+unresolved transitions, ordered change events, lifetime revisions, and the last
+content-change revision. Aligned `change_units` metadata connects each endpoint pair
+to its PR-derived integration unit; without it the result explicitly uses revision
+transition grouping. `file.history_stats` aggregates the same facts per source path so
+an LLM can select a finer investigation scope. An observation gap is not counted as an
+observable transition. Pilot evidence adds
 revision-level owning-file Git touches when available. The progressive
 screening artifact separately joins changed ranges to provisional syntax sites; those
 touches do not become canonical element changes until Clang confirms the promoted
@@ -143,9 +148,9 @@ History ordering does not serialize compiler work. Snapshot extraction is
 independent for each revision, translation unit, and normalized configuration
 context, so VMs claim those tasks in parallel. The query performs a cheap
 ordered reduction after both endpoints arrive. Exact logical identity produces
-facts; a unique exact semantic-shape match currently produces a high-confidence
-automatic fact and candidate, while ambiguous matches remain reviewable. The LLM or
-developer can record accepted or rejected lineage separately.
+facts; a unique exact semantic-shape match produces a high-confidence review
+candidate, while ambiguous matches remain reviewable. The LLM or developer can record
+accepted or rejected lineage separately.
 
 ## Production catalog boundaries
 

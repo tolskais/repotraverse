@@ -62,9 +62,24 @@ The initial operations are:
 
 - `pr-import`, `repository-changes`, `history-summary`, and `change-unit`;
 - `file-symbols`, `symbol-search`, `symbol-history`, and `symbol-relations`;
+- `file-evidence` for PR/change-unit-aware semantic file profiles used to scope
+  finer analysis;
+- `element-evidence` for ordered, coverage-qualified element history facts;
 - `receipt-put`, `receipt-get`, `claim-propose`, `claim-verify`, and
   `inference-get`; and
 - `request-status`.
 
 Results are bounded and report truncation or continuation. MCP can later wrap
 this surface without changing the evidence model.
+
+Semantic history requests may supply the planner's integration-unit records as
+`change_units`, one per adjacent endpoint pair. The reducer compares each unit's
+base and result, counts at most one occurrence of each change dimension per unit,
+and preserves its constituent commit count as diagnostic evidence. Without those
+records it labels the grouping as `revision_transition`; it never assumes that a
+revision boundary represents a PR.
+
+Repository assessment is progressive. `history-summary` first supplies cheap
+Git-level file activity, `file-evidence` adds semantic and coverage dimensions,
+and an LLM selects files or change units for `element-evidence`. Selection facts
+are not a stability classification.

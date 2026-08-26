@@ -390,7 +390,9 @@ int repotraverse_main(int argc, char **argv) {
   bool wait = false, full = false;
   const std::vector<std::string> operations = {
       "repository-changes", "history-summary", "change-unit",
-      "symbol-search", "symbol-history", "file-symbols", "symbol-relations",
+      "symbol-search", "symbol-history", "element-evidence", "file-evidence",
+      "file-symbols",
+      "symbol-relations",
       "inference-get", "claim-propose", "claim-verify", "receipt-put",
       "receipt-get", "pr-import", "pull-request-get", "issue-get",
       "connector-status", "connector-sync", "file-history", "build-import",
@@ -581,6 +583,10 @@ int repotraverse_main(int argc, char **argv) {
       } else {
         const auto query_name = operation == "file-history" ? "file.history"
                                 : operation == "build-import" ? "build.import"
+                                : operation == "element-evidence"
+                                    ? "element.history_stats"
+                                : operation == "file-evidence"
+                                    ? "file.history_stats"
                                 : operation == "catalog-sync" ? "catalog.sync"
                                                                : "tool." + operation;
         history::QueryService service(std::make_shared<history::MemoryFactStore>(),
@@ -615,6 +621,10 @@ int repotraverse_main(int argc, char **argv) {
                                         runtime.worker, runtime.connectors);
           const auto query_name = operation == "file-history" ? "file.history"
                                   : operation == "build-import" ? "build.import"
+                                  : operation == "element-evidence"
+                                      ? "element.history_stats"
+                                  : operation == "file-evidence"
+                                      ? "file.history_stats"
                                   : operation == "catalog-sync" ? "catalog.sync"
                                                                  : "tool." + operation;
           response = service.execute({{"schema_version", history::kSchemaVersion},
@@ -623,7 +633,14 @@ int repotraverse_main(int argc, char **argv) {
       }
       if (!response.contains("operation")) response["operation"] = operation;
       if (!response.contains("status"))
-        response["status"] = response.value("result_status", std::string{"complete"});
+        response["status"] = response.contains("coverage") &&
+                                     response.at("coverage").is_object() &&
+                                     response.at("coverage").value(
+                                         "status", std::string{"complete"}) !=
+                                         "complete"
+                                 ? "partial"
+                                 : response.value("result_status",
+                                                  std::string{"complete"});
       if (!response.contains("snapshot_id")) response["snapshot_id"] = runtime.catalog->snapshot_id();
       if (!response.contains("facts"))
         response["facts"] = response.contains("result")

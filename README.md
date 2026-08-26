@@ -198,7 +198,11 @@ still validated against the ref by Git.
 - `history.plan`: write a first-parent commit/change-unit plan without checkouts.
 - `lineage.transition`: find automatic continuity candidates and transition facts.
 - `lineage.resolve`: apply accepted `same_element` and `not_same_element` assertions.
-- `element.history_stats`: summarize ordered snapshots without stability inference.
+- `element.history_stats`: summarize ordered snapshots, adjacent observation
+  opportunities, change-unit rates, and ordered change events without stability
+  inference.
+- `file.history_stats`: aggregate the same semantic evidence per file so a caller
+  can choose a bounded element-level investigation scope.
 - `analysis.coverage`: return extraction capabilities and gaps.
 
 The public surface consists of named commands such as
@@ -206,8 +210,26 @@ The public surface consists of named commands such as
 Complex records and batches use `--input request.json`. See
 [`docs/investigation-model.md`](docs/investigation-model.md).
 
+An LLM can request a factual ordered reduction of previously extracted bundles
+with `repotraverse element-evidence --config catalog.json --input request.json`.
+The request contains `bundles` in history order and may include a
+`revision_timestamps` object keyed by revision. It may also contain one
+`change_units` record for each adjacent bundle pair. Each record identifies the
+PR-derived integration unit and its base/result revisions; when omitted, the
+response explicitly uses revision-transition grouping. The response reports
+observation opportunities, change-unit rates, events, lineage gaps, and coverage,
+but never a stable/unstable label.
+
+Use `repotraverse file-evidence` with the same request to obtain per-file counts
+of observed elements and change units with interface, implementation, dependency,
+move, rename, or unresolved evidence. Combine this semantic profile with the
+cheap Git-level `history-summary` file touch counts before requesting detailed
+element evidence.
+
 Requests and responses are one-shot JSON. See
 [`docs/lineage-architecture.md`](docs/lineage-architecture.md) for the resource contract.
+See [`docs/llm-stability-workflow.md`](docs/llm-stability-workflow.md) for the
+expected PR-first, file-to-element investigation and LLM interpretation workflow.
 
 ## On-demand catalog runner
 

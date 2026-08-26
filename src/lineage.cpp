@@ -140,15 +140,17 @@ TransitionResult trace_transition(const EvidenceBundle& before, const EvidenceBu
                 if (!used[it->second] && !rejected.contains(key)) candidates.push_back(it->second);
             }
             if (candidates.size() == 1) {
-                match = candidates.front(); confidence = "high";
-                const auto& next = after.elements[*match];
+                const auto& next = after.elements[candidates.front()];
                 LineageCandidate candidate;
                 candidate.before_element = old_element.compiler_id; candidate.after_element = next.compiler_id;
                 candidate.proposed_continuity = continuity(old_element, next); candidate.confidence = "high";
                 candidate.match_basis = {"interface_shape_equal", "implementation_shape_equal", "dependency_shape_equal"};
-                candidate.automatically_resolved = true;
+                candidate.automatically_resolved = false;
                 candidate.candidate_id = "candidate-" + stable_hash(candidate.before_element + candidate.after_element);
                 result.candidates.push_back(std::move(candidate));
+                result.coverage.status = "partial";
+                result.coverage.gaps.push_back("unreviewed lineage candidate for " +
+                                               old_element.compiler_id);
             } else if (candidates.size() > 1) {
                 result.coverage.status = "partial";
                 result.coverage.gaps.push_back("ambiguous lineage for " + old_element.compiler_id);
@@ -222,27 +224,34 @@ TransitionResult trace_transition(const EvidenceBundle& before, const EvidenceBu
     }
     const auto references = [](const ElementSnapshot& element,
                                const ElementSnapshot& target) {
-        return std::find(element.referenced_compiler_ids.begin(),
-                         element.referenced_compiler_ids.end(),
-                         target.compiler_id) !=
-               element.referenced_compiler_ids.end();
+        return std::binary_search(element.referenced_compiler_ids.begin(),
+                                  element.referenced_compiler_ids.end(),
+                                  target.compiler_id);
     };
+    std::map<std::string, const ElementSnapshot *> before_elements, after_elements;
+    for (const auto &element : before.elements)
+        before_elements.emplace(element.compiler_id, &element);
+    for (const auto &element : after.elements)
+        after_elements.emplace(element.compiler_id, &element);
+    std::vector<const ElementSnapshot *> added, removed;
+    for (const auto &fact : result.facts) {
+        if (fact.before_element.empty() && !fact.after_element.empty())
+            added.push_back(after_elements.at(fact.after_element));
+        if (!fact.before_element.empty() && fact.after_element.empty())
+            removed.push_back(before_elements.at(fact.before_element));
+    }
     for (const auto& fact : result.facts) {
         if (fact.before_element.empty() || fact.after_element.empty()) continue;
-        const auto old_it = std::find_if(before.elements.begin(), before.elements.end(),
-            [&](const auto& item) { return item.compiler_id == fact.before_element; });
-        const auto new_it = std::find_if(after.elements.begin(), after.elements.end(),
-            [&](const auto& item) { return item.compiler_id == fact.after_element; });
-        if (old_it == before.elements.end() || new_it == after.elements.end()) continue;
-        for (std::size_t i = 0; i < after.elements.size(); ++i) {
-            if (used[i]) continue;
-            if (references(*new_it, after.elements[i]) &&
-                !references(*old_it, after.elements[i])) {
+        const auto *old_element = before_elements.at(fact.before_element);
+        const auto *new_element = after_elements.at(fact.after_element);
+        for (const auto *added_element : added) {
+            if (references(*new_element, *added_element) &&
+                !references(*old_element, *added_element)) {
                 LineageRelation relation;
                 relation.kind = "extract";
-                relation.source_element_ids = {old_it->compiler_id};
-                relation.target_element_ids = {new_it->compiler_id,
-                                               after.elements[i].compiler_id};
+                relation.source_element_ids = {old_element->compiler_id};
+                relation.target_element_ids = {new_element->compiler_id,
+                                               added_element->compiler_id};
                 relation.evidence = {"new_dependency_from_surviving_element",
                                      "new_target_added_in_transition"};
                 relation.confidence = 0.8;
@@ -252,19 +261,14 @@ TransitionResult trace_transition(const EvidenceBundle& before, const EvidenceBu
                 result.relation_candidates.push_back(std::move(relation));
             }
         }
-        for (const auto& old_target : before.elements) {
-            const auto removed = std::none_of(result.facts.begin(), result.facts.end(),
-                [&](const auto& candidate) {
-                    return candidate.before_element == old_target.compiler_id &&
-                           !candidate.after_element.empty();
-                });
-            if (removed && references(*old_it, old_target) &&
-                !references(*new_it, old_target)) {
+        for (const auto *removed_element : removed) {
+            if (references(*old_element, *removed_element) &&
+                !references(*new_element, *removed_element)) {
                 LineageRelation relation;
                 relation.kind = "inline";
-                relation.source_element_ids = {old_it->compiler_id,
-                                               old_target.compiler_id};
-                relation.target_element_ids = {new_it->compiler_id};
+                relation.source_element_ids = {old_element->compiler_id,
+                                               removed_element->compiler_id};
+                relation.target_element_ids = {new_element->compiler_id};
                 relation.evidence = {"removed_dependency_from_surviving_element",
                                      "dependency_target_removed_in_transition"};
                 relation.confidence = 0.8;

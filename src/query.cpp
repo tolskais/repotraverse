@@ -856,14 +856,70 @@ nlohmann::json QueryService::execute_impl(const nlohmann::json &request) const {
               {"coverage", result.coverage},
               {"result", result}};
     }
-    if (query == "element.history_stats") {
+    if (query == "element.history_stats" || query == "file.history_stats") {
       if (!params.contains("bundles") || !params.at("bundles").is_array() ||
           params.at("bundles").size() < 2)
         throw std::runtime_error(
-            "element.history_stats requires ordered bundles");
+            query + " requires ordered bundles");
       std::vector<EvidenceBundle> bundles;
       for (const auto &path : params.at("bundles"))
         bundles.push_back(store_->load(path.get<std::string>()));
+      nlohmann::json change_units = nlohmann::json::array();
+      const bool supplied_change_units = params.contains("change_units");
+      if (supplied_change_units &&
+          (!params.at("change_units").is_array() ||
+           params.at("change_units").size() + 1 != bundles.size()))
+        throw std::runtime_error(
+            "change_units must contain one record per adjacent bundle pair");
+      for (std::size_t i = 0; i + 1 < bundles.size(); ++i) {
+        const auto supplied = supplied_change_units
+                                  ? params.at("change_units").at(i)
+                                  : nlohmann::json::object();
+        if (!supplied.is_object())
+          throw std::runtime_error("change unit must be an object");
+        const auto base = supplied.value(
+            "base_revision",
+            supplied.value("base_commit", bundles[i].source_revision));
+        const auto result = supplied.value(
+            "result_revision",
+            supplied.value("result_commit",
+                           supplied.value("head_commit",
+                                          bundles[i + 1].source_revision)));
+        if (base != bundles[i].source_revision ||
+            result != bundles[i + 1].source_revision)
+          throw std::runtime_error(
+              "change unit endpoints do not match adjacent bundles");
+        auto id = supplied.value(
+            "change_unit_id",
+            supplied.value("integration_unit_id", std::string{}));
+        if (id.empty()) {
+          if (supplied_change_units)
+            throw std::runtime_error("change unit identity is required");
+          id = "revision-transition-" + stable_hash(
+                   base + "\n" + result + "\n" + bundles[i].configuration);
+        }
+        nlohmann::json unit = {
+            {"change_unit_id", id},
+            {"base_revision", base},
+            {"result_revision", result},
+            {"unit_kind", supplied_change_units ? "integration_unit"
+                                                 : "revision_transition"},
+            {"association_status",
+             supplied.value("association_status",
+                            supplied_change_units ? std::string{"unknown"}
+                                                  : std::string{"not_supplied"})}};
+        if (supplied.contains("integration_unit_id"))
+          unit["integration_unit_id"] = supplied.at("integration_unit_id");
+        if (supplied.contains("pr_matches"))
+          unit["pr_matches"] = supplied.at("pr_matches");
+        if (supplied.contains("integrated_commits")) {
+          if (!supplied.at("integrated_commits").is_array())
+            throw std::runtime_error("integrated_commits must be an array");
+          unit["integrated_commit_count"] =
+              supplied.at("integrated_commits").size();
+        }
+        change_units.push_back(std::move(unit));
+      }
       const auto assertions = assertions_from(params);
       std::vector<TransitionResult> transitions;
       std::map<std::string, std::string> parent;
@@ -881,8 +937,9 @@ nlohmann::json QueryService::execute_impl(const nlohmann::json &request) const {
           parent[std::max(a, b)] = std::min(a, b);
       };
       for (std::size_t i = 0; i + 1 < bundles.size(); ++i) {
-        transitions.push_back(
-            trace_transition(bundles[i], bundles[i + 1], assertions));
+        transitions.push_back(trace_transition(
+            bundles[i], bundles[i + 1], assertions,
+            change_units.at(i).at("change_unit_id").get<std::string>()));
         for (const auto &fact : transitions.back().facts)
           if (!fact.before_element.empty() && !fact.after_element.empty())
             unite(fact.before_element, fact.after_element);
@@ -890,9 +947,10 @@ nlohmann::json QueryService::execute_impl(const nlohmann::json &request) const {
       struct Stats {
         std::set<std::size_t> versions, changed, interface_changed,
             implementation_changed, dependency_changed, renamed, moved,
-            ambiguous;
-        std::string current_name, added_revision, last_observed_revision,
-            last_changed_revision;
+            ambiguous, unresolved;
+        std::string current_name, current_kind, current_path, added_revision,
+            last_observed_revision, last_changed_revision;
+        nlohmann::json events = nlohmann::json::array();
       };
       std::map<std::string, Stats> stats;
       for (std::size_t version = 0; version < bundles.size(); ++version)
@@ -900,6 +958,8 @@ nlohmann::json QueryService::execute_impl(const nlohmann::json &request) const {
           auto &item = stats[find(find, element.compiler_id)];
           item.versions.insert(version);
           item.current_name = element.qualified_name;
+          item.current_kind = element.kind;
+          item.current_path = element.location.path;
           if (item.added_revision.empty())
             item.added_revision = bundles[version].source_revision;
           item.last_observed_revision = bundles[version].source_revision;
@@ -930,40 +990,299 @@ nlohmann::json QueryService::execute_impl(const nlohmann::json &request) const {
             item.moved.insert(i);
           if (fact.confidence == "ambiguous")
             item.ambiguous.insert(i);
+          if (fact.continuity == "added_or_unresolved" ||
+              fact.continuity == "deleted_or_unresolved")
+            item.unresolved.insert(i);
+          if (fact.content_change != "none" || fact.dependencies_changed ||
+              fact.continuity != "same")
+            item.events.push_back(
+                {{"change_unit_id",
+                  change_units.at(i).at("change_unit_id")},
+                 {"unit_kind", change_units.at(i).at("unit_kind")},
+                 {"association_status",
+                  change_units.at(i).at("association_status")},
+                 {"before_revision", fact.before_revision},
+                 {"after_revision", fact.after_revision},
+                 {"before_element", fact.before_element},
+                 {"after_element", fact.after_element},
+                 {"continuity", fact.continuity},
+                 {"content_change", fact.content_change},
+                 {"dependencies_changed", fact.dependencies_changed},
+                 {"resolution", fact.resolution},
+                 {"confidence", fact.confidence},
+                 {"transition_id", fact.transition_id}});
         }
       nlohmann::json rows = nlohmann::json::array();
-      for (const auto &[root, item] : stats)
+      const auto revision_timestamps =
+          params.value("revision_timestamps", nlohmann::json::object());
+      if (!revision_timestamps.is_object())
+        throw std::runtime_error("revision_timestamps must be an object");
+      for (const auto &[root, item] : stats) {
+        std::size_t observable = 0;
+        for (const auto version : item.versions)
+          if (item.versions.contains(version + 1)) ++observable;
+        nlohmann::json observations = nlohmann::json::array();
+        for (const auto version : item.versions) {
+          nlohmann::json observation = {
+              {"revision", bundles[version].source_revision},
+              {"bundle_index", version}};
+          if (const auto timestamp = revision_timestamps.find(
+                  bundles[version].source_revision);
+              timestamp != revision_timestamps.end()) {
+            if (!timestamp->is_number_integer())
+              throw std::runtime_error(
+                  "revision timestamp must be an integer Unix timestamp");
+            observation["timestamp"] = *timestamp;
+          }
+          observations.push_back(std::move(observation));
+        }
+        const auto rate = [&](std::size_t count) -> nlohmann::json {
+          return observable == 0
+                     ? nlohmann::json(nullptr)
+                     : nlohmann::json(static_cast<double>(count) /
+                                      static_cast<double>(observable));
+        };
+        const auto change_unit_count = [&](std::size_t count) -> nlohmann::json {
+          return supplied_change_units ? nlohmann::json(count)
+                                       : nlohmann::json(nullptr);
+        };
         rows.push_back(
-            {{"historical_element_id", "history-" + stable_hash(root)},
+             {{"historical_element_id", "history-" + stable_hash(root)},
              {"current_name", item.current_name},
+             {"current_kind", item.current_kind},
+             {"current_path", item.current_path},
+             {"present_in_latest_bundle",
+              item.versions.contains(bundles.size() - 1)},
              {"observed_versions", item.versions.size()},
-             {"observable_transitions",
-              item.versions.size() > 0 ? item.versions.size() - 1 : 0},
+             {"observations", std::move(observations)},
+             {"observable_transitions", observable},
+             {"observed_change_units", change_unit_count(observable)},
              {"content_changed_transitions", item.changed.size()},
+             {"change_units_with_content_changes",
+              change_unit_count(item.changed.size())},
+             {"content_change_rate", rate(item.changed.size())},
              {"interface_changed_transitions", item.interface_changed.size()},
+             {"change_units_with_interface_changes",
+              change_unit_count(item.interface_changed.size())},
+             {"interface_change_rate", rate(item.interface_changed.size())},
              {"implementation_changed_transitions",
               item.implementation_changed.size()},
+             {"change_units_with_implementation_changes",
+              change_unit_count(item.implementation_changed.size())},
+             {"implementation_change_rate",
+              rate(item.implementation_changed.size())},
              {"dependency_changed_transitions", item.dependency_changed.size()},
+             {"change_units_with_dependency_changes",
+              change_unit_count(item.dependency_changed.size())},
+             {"dependency_change_rate", rate(item.dependency_changed.size())},
              {"renamed_transitions", item.renamed.size()},
              {"moved_transitions", item.moved.size()},
              {"ambiguous_transitions", item.ambiguous.size()},
+             {"unresolved_transitions", item.unresolved.size()},
              {"added_revision", item.added_revision},
              {"last_observed_revision", item.last_observed_revision},
-             {"last_content_change_revision", item.last_changed_revision}});
+             {"last_content_change_revision", item.last_changed_revision},
+             {"change_events", item.events},
+             {"evidence_status",
+              item.ambiguous.empty() && item.unresolved.empty()
+                  ? "complete"
+                  : "partial"}});
+      }
       Coverage coverage;
-      coverage.capabilities = {"element_lineage", "history_statistics"};
+      coverage.capabilities = {
+          "element_lineage",
+          query == "file.history_stats" ? "file_history_statistics"
+                                         : "element_history_statistics",
+          supplied_change_units ? "change_unit_grouping"
+                                : "revision_transition_grouping"};
       for (const auto &transition : transitions) {
         if (transition.coverage.status != "complete")
           coverage.status = "partial";
         for (const auto &gap : transition.coverage.gaps)
           coverage.gaps.push_back(transition.after_revision + ": " + gap);
       }
+      const auto gap_count = coverage.gaps.size();
+      constexpr std::size_t maximum_reported_gaps = 100;
+      if (coverage.gaps.size() > maximum_reported_gaps) {
+        coverage.gaps.resize(maximum_reported_gaps);
+        coverage.gaps.push_back(std::to_string(gap_count - maximum_reported_gaps) +
+                                " additional coverage gaps omitted");
+      }
+      auto coverage_json = nlohmann::json(coverage);
+      coverage_json["gap_count"] = gap_count;
+      coverage_json["gaps_truncated"] = gap_count > maximum_reported_gaps;
+      nlohmann::json result = {
+          {"bundle_count", bundles.size()},
+          {"grouping_unit", supplied_change_units ? "change_unit"
+                                                   : "revision_transition"},
+          {"change_units", change_units}};
+      if (query == "file.history_stats") {
+        struct FileStats {
+          std::set<std::size_t> versions, observed, changed, content_changed,
+              interface_changed, implementation_changed, dependency_changed,
+              renamed, moved, unresolved;
+          std::set<std::string> elements, changed_elements;
+          std::size_t current_elements{};
+        };
+        struct FileUnitEvent {
+          std::set<std::string> elements;
+          std::size_t content{}, interface{}, implementation{}, dependency{},
+              renamed{}, moved{}, unresolved{};
+        };
+        std::map<std::string, FileStats> files;
+        std::map<std::string, std::map<std::size_t, FileUnitEvent>> events;
+        for (std::size_t version = 0; version < bundles.size(); ++version)
+          for (const auto &element : bundles[version].elements)
+            if (!element.location.path.empty()) {
+              auto &file = files[element.location.path];
+              file.versions.insert(version);
+              file.elements.insert(find(find, element.compiler_id));
+              if (version + 1 == bundles.size())
+                ++file.current_elements;
+            }
+        for (std::size_t i = 0; i < transitions.size(); ++i)
+          for (const auto &fact : transitions[i].facts) {
+            std::set<std::string> paths;
+            if (fact.before_location && !fact.before_location->path.empty())
+              paths.insert(fact.before_location->path);
+            if (fact.after_location && !fact.after_location->path.empty())
+              paths.insert(fact.after_location->path);
+            const auto id = !fact.before_element.empty() ? fact.before_element
+                                                         : fact.after_element;
+            const auto root = find(find, id);
+            for (const auto &path : paths) {
+              auto &file = files[path];
+              auto &event = events[path][i];
+              file.elements.insert(root);
+              if (!fact.before_element.empty() && !fact.after_element.empty())
+                file.observed.insert(i);
+              const bool content = fact.content_change != "none" &&
+                                   fact.content_change != "unverified";
+              if (content) {
+                file.content_changed.insert(i);
+                file.changed_elements.insert(root);
+                ++event.content;
+              }
+              if (fact.content_change == "interface" ||
+                  fact.content_change == "both") {
+                file.interface_changed.insert(i);
+                ++event.interface;
+              }
+              if (fact.content_change == "implementation" ||
+                  fact.content_change == "both") {
+                file.implementation_changed.insert(i);
+                ++event.implementation;
+              }
+              if (fact.dependencies_changed) {
+                file.dependency_changed.insert(i);
+                file.changed_elements.insert(root);
+                ++event.dependency;
+              }
+              if (fact.continuity == "renamed" ||
+                  fact.continuity == "moved_and_renamed") {
+                file.renamed.insert(i);
+                ++event.renamed;
+              }
+              if (fact.continuity == "moved" ||
+                  fact.continuity == "moved_and_renamed") {
+                file.moved.insert(i);
+                ++event.moved;
+              }
+              const bool unresolved_fact =
+                  fact.continuity == "added_or_unresolved" ||
+                  fact.continuity == "deleted_or_unresolved";
+              if (unresolved_fact) {
+                file.unresolved.insert(i);
+                ++event.unresolved;
+              }
+              const bool verified_change =
+                  content || fact.dependencies_changed ||
+                  (!fact.before_element.empty() &&
+                   !fact.after_element.empty() && fact.continuity != "same");
+              if (verified_change)
+                file.changed.insert(i);
+              if (verified_change || unresolved_fact)
+                event.elements.insert(root);
+            }
+          }
+        nlohmann::json file_rows = nlohmann::json::array();
+        for (const auto &[path, file] : files) {
+          nlohmann::json file_events = nlohmann::json::array();
+          if (const auto found = events.find(path); found != events.end())
+            for (const auto &[index, event] : found->second)
+              if (file.changed.contains(index) || event.unresolved != 0)
+                file_events.push_back(
+                    {{"change_unit_id",
+                      change_units.at(index).at("change_unit_id")},
+                     {"unit_kind", change_units.at(index).at("unit_kind")},
+                     {"association_status",
+                      change_units.at(index).at("association_status")},
+                     {"before_revision",
+                      change_units.at(index).at("base_revision")},
+                     {"after_revision",
+                      change_units.at(index).at("result_revision")},
+                     {"affected_elements", event.elements.size()},
+                     {"content_changes", event.content},
+                     {"interface_changes", event.interface},
+                     {"implementation_changes", event.implementation},
+                     {"dependency_changes", event.dependency},
+                     {"renames", event.renamed},
+                     {"moves", event.moved},
+                     {"unresolved", event.unresolved}});
+          const auto rate = [&](std::size_t count) -> nlohmann::json {
+            return file.observed.empty()
+                       ? nlohmann::json(nullptr)
+                       : nlohmann::json(
+                             static_cast<double>(count) /
+                             static_cast<double>(file.observed.size()));
+          };
+          const auto change_unit_count =
+              [&](std::size_t count) -> nlohmann::json {
+            return supplied_change_units ? nlohmann::json(count)
+                                         : nlohmann::json(nullptr);
+          };
+          file_rows.push_back(
+              {{"path", path},
+               {"observed_versions", file.versions.size()},
+               {"observed_elements", file.elements.size()},
+               {"current_elements", file.current_elements},
+               {"observed_transitions", file.observed.size()},
+               {"transitions_with_element_changes", file.changed.size()},
+               {"transition_change_rate", rate(file.changed.size())},
+               {"observed_change_units",
+                change_unit_count(file.observed.size())},
+               {"change_units_with_element_changes",
+                change_unit_count(file.changed.size())},
+               {"change_unit_change_rate",
+                supplied_change_units ? rate(file.changed.size())
+                                      : nlohmann::json(nullptr)},
+               {"change_units_with_content_changes",
+                change_unit_count(file.content_changed.size())},
+               {"change_units_with_interface_changes",
+                change_unit_count(file.interface_changed.size())},
+               {"change_units_with_implementation_changes",
+                change_unit_count(file.implementation_changed.size())},
+               {"change_units_with_dependency_changes",
+                change_unit_count(file.dependency_changed.size())},
+               {"change_units_with_renames",
+                change_unit_count(file.renamed.size())},
+               {"change_units_with_moves", change_unit_count(file.moved.size())},
+               {"unresolved_change_units",
+                change_unit_count(file.unresolved.size())},
+               {"changed_elements", file.changed_elements.size()},
+               {"change_events", std::move(file_events)},
+               {"evidence_status",
+                file.unresolved.empty() ? "complete" : "partial"}});
+        }
+        result["files"] = std::move(file_rows);
+      } else {
+        result["elements"] = std::move(rows);
+      }
       return {
           {"schema_version", kSchemaVersion},
           {"ok", true},
-          {"coverage", coverage},
-          {"result",
-           {{"bundle_count", bundles.size()}, {"elements", std::move(rows)}}}};
+          {"coverage", std::move(coverage_json)},
+          {"result", std::move(result)}};
     }
     if (query == "analysis.coverage") {
       const auto bundle = store_->load(path_parameter(params, "bundle"));

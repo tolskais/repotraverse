@@ -39,18 +39,34 @@ history::EvidenceBundle bundle(std::string revision,
   return result;
 }
 
+class BundleStore final : public history::FactStore {
+public:
+  explicit BundleStore(std::map<std::string, history::EvidenceBundle> bundles)
+      : bundles_(std::move(bundles)) {}
+
+  history::EvidenceBundle
+  load(const std::filesystem::path &path) const override {
+    return bundles_.at(path.string());
+  }
+
+private:
+  std::map<std::string, history::EvidenceBundle> bundles_;
+};
+
 void test_move_and_rename() {
   const auto before = bundle("a", {element("old-id", "oldName", "old.cpp")});
   const auto after = bundle("b", {element("new-id", "newName", "new.cpp")});
   const auto result = history::trace_transition(before, after);
-  require(result.facts.size() == 1, "one lineage fact expected");
-  require(result.facts[0].continuity == "moved_and_renamed",
-          "move/rename not detected");
-  require(result.facts[0].content_change == "none",
-          "pure refactoring counted as content");
+  const auto unresolved = std::find_if(
+      result.facts.begin(), result.facts.end(),
+      [](const auto &fact) { return fact.before_element == "old-id"; });
+  require(unresolved != result.facts.end() &&
+              unresolved->continuity == "deleted_or_unresolved",
+          "unreviewed move/rename was treated as established lineage");
   require(result.candidates.size() == 1 &&
-              result.candidates[0].automatically_resolved,
-          "automatic candidate missing");
+              !result.candidates[0].automatically_resolved &&
+              result.candidates[0].proposed_continuity == "moved_and_renamed",
+          "reviewable move/rename candidate missing");
 }
 
 void test_content_and_local_rename() {
@@ -117,11 +133,7 @@ void test_synthetic_lineage_capability_boundary() {
       {"signature change", element("same", "f", "a.cpp", "old", "b"),
        element("same", "f", "a.cpp", "new", "b"), "same", "interface", "exact"},
       {"dependency change", element("same", "f", "a.cpp", "i", "b", "x"),
-       element("same", "f", "a.cpp", "i", "b", "y"), "same", "none", "exact"},
-      {"pure rename", element("old", "f", "a.cpp"),
-       element("new", "g", "a.cpp"), "renamed", "none", "high"},
-      {"pure move", element("old", "f", "a.cpp"), element("new", "f", "b.cpp"),
-       "moved", "none", "high"}};
+       element("same", "f", "a.cpp", "i", "b", "y"), "same", "none", "exact"}};
   for (const auto &scenario : resolved) {
     const auto result = history::trace_transition(
         bundle("before", {scenario.before}), bundle("after", {scenario.after}));
@@ -238,6 +250,98 @@ void test_reviewed_extract_candidate() {
               result.relation_candidates.front().review_state == "candidate",
           "extract relation was incorrectly auto-accepted");
 }
+
+void test_history_statistics_are_evidence_not_a_label() {
+  auto first = element("same", "target", "target.cpp", "api", "one");
+  auto second = element("same", "target", "target.cpp", "api", "two");
+  auto third = second;
+  const auto store = std::make_shared<BundleStore>(
+      std::map<std::string, history::EvidenceBundle>{
+          {"one", bundle("r1", {first})},
+          {"two", bundle("r2", {second})},
+          {"three", bundle("r3", {third})}});
+  history::QueryService service(store);
+  const auto response = service.execute(
+      {{"schema_version", history::kSchemaVersion},
+       {"query", "element.history_stats"},
+       {"params", {{"bundles", {"one", "two", "three"}},
+                   {"change_units",
+                    {{{"change_unit_id", "pr-1"},
+                      {"base_revision", "r1"},
+                      {"result_revision", "r2"},
+                      {"association_status", "confirmed_pr"},
+                      {"integrated_commits", {"c1", "c2"}}},
+                     {{"change_unit_id", "pr-2"},
+                      {"base_revision", "r2"},
+                      {"result_revision", "r3"},
+                      {"association_status", "confirmed_pr"},
+                      {"integrated_commits", {"c3"}}}}},
+                   {"revision_timestamps", {{"r1", 10}, {"r2", 20},
+                                             {"r3", 30}}}}}});
+  const auto &facts = response.at("result").at("elements").front();
+  require(facts.at("observable_transitions") == 2,
+          "adjacent observation opportunities were counted incorrectly");
+  require(facts.at("implementation_changed_transitions") == 1 &&
+              facts.at("implementation_change_rate") == 0.5,
+          "implementation history evidence is incomplete");
+  require(facts.at("change_events").size() == 1 &&
+              facts.at("observations").size() == 3,
+          "LLM-facing history evidence is missing events or observations");
+  require(response.at("result").at("grouping_unit") == "change_unit" &&
+              facts.at("observed_change_units") == 2 &&
+              facts.at("change_units_with_implementation_changes") == 1 &&
+              facts.at("change_events").front().at("change_unit_id") ==
+                  "pr-1",
+          "element history was not grouped by developer change unit");
+  require(!facts.contains("stability") && !facts.contains("classification"),
+          "factual history unexpectedly emitted a stability judgment");
+
+  const auto file_params = nlohmann::json{
+      {"bundles", {"one", "two", "three"}},
+      {"change_units",
+       {{{"change_unit_id", "pr-1"},
+         {"base_revision", "r1"},
+         {"result_revision", "r2"},
+         {"association_status", "confirmed_pr"}},
+        {{"change_unit_id", "pr-2"},
+         {"base_revision", "r2"},
+         {"result_revision", "r3"},
+         {"association_status", "confirmed_pr"}}}}};
+  const auto file_response = service.execute(
+      {{"schema_version", history::kSchemaVersion},
+       {"query", "file.history_stats"},
+       {"params", file_params}});
+  const auto &file = file_response.at("result").at("files").front();
+  require(file.at("path") == "target.cpp" &&
+              file.at("observed_change_units") == 2 &&
+              file.at("change_units_with_element_changes") == 1 &&
+              file.at("change_units_with_implementation_changes") == 1 &&
+              file.at("change_events").front().at("change_unit_id") ==
+                  "pr-1",
+          "file-level change-unit evidence is incomplete");
+  require(!file.contains("stability") && !file.contains("classification"),
+          "file evidence unexpectedly emitted a stability judgment");
+
+  const auto discontinuous_store = std::make_shared<BundleStore>(
+      std::map<std::string, history::EvidenceBundle>{
+          {"one", bundle("r1", {first})}, {"two", bundle("r2", {})},
+          {"three", bundle("r3", {third})}});
+  history::QueryService discontinuous(discontinuous_store);
+  const auto discontinuous_response = discontinuous.execute(
+      {{"schema_version", history::kSchemaVersion},
+       {"query", "element.history_stats"},
+       {"params", {{"bundles", {"one", "two", "three"}}}}});
+  const auto &discontinuous_facts =
+      discontinuous_response.at("result").at("elements").front();
+  require(discontinuous_facts.at("observable_transitions") == 0,
+          "a gap between observations was treated as an observable transition");
+  require(discontinuous_response.at("result").at("grouping_unit") ==
+                  "revision_transition" &&
+              discontinuous_facts.at("observed_change_units").is_null(),
+          "revision transitions were mislabeled as developer change units");
+  require(discontinuous_facts.at("evidence_status") == "partial",
+          "an unresolved observation gap was not exposed");
+}
 } // namespace
 
 int main() {
@@ -251,6 +355,7 @@ int main() {
     test_schema_hash();
     test_production_config_validation();
     test_reviewed_extract_candidate();
+    test_history_statistics_are_evidence_not_a_label();
     std::cout << "all tests passed\n";
     return 0;
   } catch (const std::exception &error) {

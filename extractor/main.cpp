@@ -71,6 +71,7 @@ std::string usr(const clang::Decl *declaration) {
     const auto root =
         std::filesystem::weakly_canonical(
             history::path_from_utf8(project_root.getValue()), error);
+    if (file.is_relative()) file = root / file;
     const auto canonical = std::filesystem::weakly_canonical(file, error);
     if (!error) {
       const auto relative = canonical.lexically_relative(root);
@@ -87,13 +88,14 @@ std::string normalized_project_path(const std::string &path) {
   if (project_root.empty() || path.empty())
     return history::generic_path_to_utf8(history::path_from_utf8(path));
   std::error_code error;
-  const auto file = std::filesystem::weakly_canonical(
-      history::path_from_utf8(path), error);
-  if (error)
-    return history::generic_path_to_utf8(history::path_from_utf8(path));
   const auto root =
       std::filesystem::weakly_canonical(
           history::path_from_utf8(project_root.getValue()), error);
+  if (error)
+    return history::generic_path_to_utf8(history::path_from_utf8(path));
+  auto input = history::path_from_utf8(path);
+  if (input.is_relative()) input = root / input;
+  const auto file = std::filesystem::weakly_canonical(input, error);
   if (error)
     return history::generic_path_to_utf8(history::path_from_utf8(path));
   const auto relative = file.lexically_relative(root);
@@ -161,6 +163,8 @@ public:
           function->getParamDecl(index)->getCanonicalDecl(), index);
     next_local_id_ = function->getNumParams();
   }
+  explicit BodyModel(std::string translation_unit)
+      : translation_unit_(std::move(translation_unit)) {}
   std::string fingerprint(const clang::Stmt *statement) {
     history::StableHashBuilder hash;
     emit(statement, hash);
@@ -228,9 +232,25 @@ private:
       llvm::SmallString<32> number;
       integer->getValue().toString(number, 10, true);
       value += ":" + std::string(number);
+    } else if (const auto *floating =
+                   llvm::dyn_cast<clang::FloatingLiteral>(statement)) {
+      llvm::SmallString<32> number;
+      floating->getValue().toString(number);
+      value += ":floating:" + std::string(number);
+    } else if (const auto *character =
+                   llvm::dyn_cast<clang::CharacterLiteral>(statement)) {
+      value += ":character:" +
+               std::to_string(static_cast<unsigned>(character->getKind())) +
+               ":" + std::to_string(character->getValue());
+    } else if (const auto *boolean =
+                   llvm::dyn_cast<clang::CXXBoolLiteralExpr>(statement)) {
+      value += boolean->getValue() ? ":boolean:true" : ":boolean:false";
     } else if (const auto *string =
                    llvm::dyn_cast<clang::StringLiteral>(statement)) {
-      value += ":string:" + history::stable_hash(string->getString().str());
+      value += ":string:" +
+               std::to_string(static_cast<unsigned>(string->getKind())) + ":" +
+               std::to_string(string->getCharByteWidth()) + ":" +
+               history::stable_hash(string->getBytes().str());
     }
     hash.append(value);
     hash.append("[");
@@ -271,9 +291,13 @@ bool project_owned(const clang::SourceManager &sources,
     return true;
   const auto filename = sources.getFilename(expanded).str();
   std::error_code error;
-  const auto file = std::filesystem::weakly_canonical(filename, error);
   const auto root =
       std::filesystem::weakly_canonical(project_root.getValue(), error);
+  if (error)
+    return false;
+  auto input = std::filesystem::path(filename);
+  if (input.is_relative()) input = root / input;
+  const auto file = std::filesystem::weakly_canonical(input, error);
   if (error)
     return false;
   const auto relative = file.lexically_relative(root);
@@ -453,23 +477,32 @@ public:
       element.kind =
           declaration->getDescribedTemplate() ? "record_template" : "record";
     element.qualified_name = declaration->getQualifiedNameAsString();
-    element.interface_fingerprint = history::stable_hash(
-        element.kind + "\n" + declaration->getKindName().str() + "\n" +
-        element.qualified_name);
-    std::string members;
+    std::string declaration_shape;
     const auto main_location = context_.getSourceManager().getLocForStartOfFile(
         context_.getSourceManager().getMainFileID());
     const auto translation_unit = normalized_project_path(
         context_.getSourceManager().getFilename(main_location).str());
     for (const auto *field : declaration->fields()) {
-      members += field->getNameAsString() + ":" +
-                 field->getType().getCanonicalType().getAsString() + "\n";
+      declaration_shape +=
+          "field:" + field->getNameAsString() + ":" +
+          field->getType().getCanonicalType().getAsString() + ":access=" +
+          std::to_string(static_cast<unsigned>(field->getAccess())) +
+          ":mutable=" + (field->isMutable() ? "1" : "0");
+      if (field->isBitField())
+        declaration_shape += ":bits=" +
+                             std::to_string(field->getBitWidthValue());
+      declaration_shape += "\n";
       const auto id = type_reference(field->getType(), translation_unit);
       if (!id.empty())
         element.referenced_compiler_ids.push_back(id);
     }
     if (const auto *record = llvm::dyn_cast<clang::CXXRecordDecl>(declaration))
       for (const auto &base : record->bases()) {
+        declaration_shape +=
+            "base:" + base.getType().getCanonicalType().getAsString() +
+            ":access=" +
+            std::to_string(static_cast<unsigned>(base.getAccessSpecifier())) +
+            ":virtual=" + (base.isVirtual() ? "1" : "0") + "\n";
         const auto id = type_reference(base.getType(), translation_unit);
         if (!id.empty())
           element.referenced_compiler_ids.push_back(id);
@@ -480,7 +513,10 @@ public:
         std::unique(element.referenced_compiler_ids.begin(),
                     element.referenced_compiler_ids.end()),
         element.referenced_compiler_ids.end());
-    element.implementation_fingerprint = history::stable_hash(members);
+    element.interface_fingerprint = history::stable_hash(
+        element.kind + "\n" + declaration->getKindName().str() + "\n" +
+        element.qualified_name + "\n" + declaration_shape);
+    element.implementation_fingerprint = history::stable_hash("");
     element.dependency_fingerprint = history::stable_hash(
         nlohmann::json(element.referenced_compiler_ids).dump());
     element.location = anchor(context_, declaration->getSourceRange());
@@ -512,9 +548,14 @@ public:
             context_.getSourceManager().getFilename(main_location).str()));
     if (!id.empty())
       element.referenced_compiler_ids.push_back(id);
-    element.implementation_fingerprint = history::stable_hash(
-        declaration->hasInClassInitializer() ? "has_initializer"
-                                             : "no_initializer");
+    if (declaration->hasInClassInitializer()) {
+      BodyModel initializer(normalized_project_path(
+          context_.getSourceManager().getFilename(main_location).str()));
+      element.implementation_fingerprint =
+          initializer.fingerprint(declaration->getInClassInitializer());
+    } else {
+      element.implementation_fingerprint = history::stable_hash("no_initializer");
+    }
     element.dependency_fingerprint = history::stable_hash(id);
     element.location = anchor(context_, declaration->getSourceRange());
     state_.elements.push_back(std::move(element));
@@ -531,15 +572,16 @@ public:
     element.compiler_id = usr(declaration->getCanonicalDecl());
     element.kind = "enum";
     element.qualified_name = declaration->getQualifiedNameAsString();
-    element.interface_fingerprint = history::stable_hash(
-        declaration->getIntegerType().getCanonicalType().getAsString());
     std::string values;
     for (const auto *constant : declaration->enumerators()) {
       llvm::SmallString<32> number;
       constant->getInitVal().toString(number, 10);
       values += constant->getNameAsString() + "=" + std::string(number) + "\n";
     }
-    element.implementation_fingerprint = history::stable_hash(values);
+    element.interface_fingerprint = history::stable_hash(
+        declaration->getIntegerType().getCanonicalType().getAsString() + "\n" +
+        values);
+    element.implementation_fingerprint = history::stable_hash("");
     element.dependency_fingerprint = history::stable_hash("");
     element.location = anchor(context_, declaration->getSourceRange());
     state_.elements.push_back(std::move(element));

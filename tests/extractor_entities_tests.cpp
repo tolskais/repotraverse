@@ -59,6 +59,28 @@ int main() {
     require(declared_variant->implementation_fingerprint ==
                 "56446a49e36ec7fa690faa8ef99e9fb2",
             "canonical body fingerprint changed");
+    const auto implementation = [&](const std::string &name) {
+      const auto item = std::find_if(
+          manifest.elements.begin(), manifest.elements.end(),
+          [&](const auto &candidate) { return candidate.qualified_name == name; });
+      require(item != manifest.elements.end(), "literal fixture was not extracted");
+      const auto variant = std::find_if(
+          manifest.variants.begin(), manifest.variants.end(),
+          [&](const auto &candidate) {
+            return candidate.element_id == item->element_id;
+          });
+      require(variant != manifest.variants.end(), "literal variant was not extracted");
+      return variant->implementation_fingerprint;
+    };
+    require(implementation("enabled") != implementation("disabled"),
+            "boolean literal values were not fingerprinted");
+    require(implementation("low_ratio") != implementation("high_ratio"),
+            "floating-point literal values were not fingerprinted");
+    require(implementation("first_character") !=
+                implementation("second_character"),
+            "character literal values were not fingerprinted");
+    require(!implementation("wide_text").empty(),
+            "wide string literal was not fingerprinted");
     std::cout << "extractor entity tests passed\n";
     return 0;
   } catch (const std::exception &error) {
